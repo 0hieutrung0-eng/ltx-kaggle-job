@@ -54,22 +54,22 @@ def send_n8n_webhook(status, scene_index, prompt, file_name=None, error_message=
         print(f"❌ Lỗi gửi Webhook về n8n: {str(e)}")
 
 # -------------------------------------------------------------------
-# 2. KHỞI TẠO MODEL LTX-VIDEO (TỐI ƯU VRAM CHO KAGGLE GPU T4)
+# 2. KHỞI TẠO MODEL LTX-VIDEO (TỐI ƯU VRAM TUỆT ĐỐI CHO GPU T4)
 # -------------------------------------------------------------------
-print("🧠 2. ĐANG TẢI MODEL LTX-VIDEO (BFLOAT16 & CPU OFFLOAD)...")
+print("🧠 2. ĐANG TẢI MODEL LTX-VIDEO (BFLOAT16 & SEQUENTIAL OFFLOAD)...")
 
 try:
-    # 1. Chuyển sang bfloat16 để tiết kiệm VRAM hơn float16
+    # Load weights ở dạng bfloat16
     pipe = LTXPipeline.from_pretrained(
         "Lightricks/LTX-Video", 
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True
     )
     
-    # 2. Bật Offload tự động (Không dùng .to("cuda") để tránh tràn VRAM)
-    pipe.enable_model_cpu_offload()
+    # Bật Sequential CPU Offload giúp chuyển từng layer vào GPU đúng lúc tính toán
+    pipe.enable_sequential_cpu_offload()
     
-    # 3. Tối ưu VAE decode theo mảng nhỏ
+    # Bật Tiling & Slicing VAE giải mã theo từng mảng nhỏ
     pipe.vae.enable_tiling()
     pipe.vae.enable_slicing()
     
@@ -123,14 +123,14 @@ for index, row in df.iterrows():
     print(f"   Prompt: {prompt[:80]}...")
 
     try:
-        # Render video cấu hình chuẩn GPU T4: 704x480, 121 frames (~5s)
+        # Cấu hình 640x384, 97 frames, 25 steps an toàn VRAM trên T4
         video_frames = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            width=704,
-            height=480,
-            num_frames=121,         # Mức frames an toàn tránh OOM
-            num_inference_steps=30, # Số bước sinh ảnh tối ưu
+            width=640,
+            height=384,
+            num_frames=97,          # 97 khung hình (~4s) là ngưỡng an toàn tuyệt đối
+            num_inference_steps=25, # 25 bước sinh ảnh tăng tốc thời gian render
             guidance_scale=3.0
         ).frames[0]
 
@@ -155,7 +155,7 @@ for index, row in df.iterrows():
             error_message=str(e)
         )
 
-    # Giải phóng hoàn toàn cache VRAM PyTorch sau từng cảnh
+    # Dọn dẹp bộ nhớ VRAM ngay sau từng cảnh
     gc.collect()
     torch.cuda.empty_cache()
 
