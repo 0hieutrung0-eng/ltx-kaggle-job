@@ -16,10 +16,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Kaggle CLI
-        run: pip install kaggle
+      - name: Install Kaggle & Requests
+        run: pip install kaggle requests
 
-      - name: Configure Credentials & Generate Daily Slug
+      - name: Force Stop & Delete Active Session on Kaggle
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
@@ -27,14 +27,25 @@ jobs:
           mkdir -p ~/.kaggle
           echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
+
+          python -c "
+          import requests
+
+          username = '$KAGGLE_USERNAME'
+          key = '$KAGGLE_KEY'
+          kernel_slug = 'ltx-video-render'
+
+          # Gọi Internal API của Kaggle để hủy phiên đang chạy
+          url = f'https://www.kaggle.com/api/v1/kernels/cancel'
+          auth = (username, key)
+          payload = {'kernelSlug': f'{username}/{kernel_slug}'}
           
-          # Tự động tạo slug kèm Ngày-Giờ-Phút hiện tại để không bao giờ bị đùng trùng ID
-          TIMESTAMP=$(date +'%Y%m%d-%H%M')
-          SLUG="ltx-render-$TIMESTAMP"
-          
-          # Cập nhật ID mới vào kernel-metadata.json
-          echo "--> Tạo Notebook ID mới: $SLUG"
-          sed -i "s/\"id\": \".*\"/\"id\": \"$KAGGLE_USERNAME\/$SLUG\"/g" kernel-metadata.json
+          res = requests.post(url, auth=auth, json=payload)
+          print(f'--> [Kaggle Cleanup] Trạng thái ngắt phiên cũ: {res.status_code}')
+          " || true
+
+          # Chờ 5 giây để Kaggle giải phóng GPU hoàn toàn
+          sleep 5
 
       - name: Push New Code to Kaggle
         run: |
