@@ -3,6 +3,7 @@ name: Trigger Kaggle Render
 on:
   repository_dispatch:
     types: [run-kaggle]
+  workflow_dispatch:
 
 jobs:
   run-kaggle:
@@ -16,37 +17,46 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Kaggle & Requests
+      - name: Install Kaggle CLI & Requests
         run: pip install kaggle requests
 
-      - name: Force Stop & Delete Active Session on Kaggle
+      - name: Configure Credentials & Force Delete Old Notebooks
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
+          # 1. Cấu hình Authenticate cho Kaggle CLI
           mkdir -p ~/.kaggle
           echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
 
+          # 2. Script Python tự động tìm và XOÁ SẠCH các notebook render cũ
           python -c "
-          import requests
+          import os, requests
 
           username = '$KAGGLE_USERNAME'
           key = '$KAGGLE_KEY'
-          kernel_slug = 'ltx-video-render'
-
-          # Gọi Internal API của Kaggle để hủy phiên đang chạy
-          url = f'https://www.kaggle.com/api/v1/kernels/cancel'
           auth = (username, key)
-          payload = {'kernelSlug': f'{username}/{kernel_slug}'}
-          
-          res = requests.post(url, auth=auth, json=payload)
-          print(f'--> [Kaggle Cleanup] Trạng thái ngắt phiên cũ: {res.status_code}')
-          " || true
 
-          # Chờ 5 giây để Kaggle giải phóng GPU hoàn toàn
-          sleep 5
+          # Lấy danh sách các kernels hiện có
+          url = f'https://www.kaggle.com/api/v1/kernels/list?user={username}'
+          res = requests.get(url, auth=auth)
+          
+          if res.status_code == 200:
+              kernels = res.json()
+              for k in kernels:
+                  slug = k.get('ref', '')
+                  # Xoá tất cả notebook có tên liên quan đến ltx-video
+                  if 'ltx' in slug or 'render' in slug:
+                      del_url = f'https://www.kaggle.com/api/v1/kernels/delete?kernel={slug}'
+                      del_res = requests.post(del_url, auth=auth)
+                      print(f'🗑️ Đã tự động XÓA notebook kẹt: {slug} | Status: {del_res.status_code}')
+          "
 
       - name: Push New Code to Kaggle
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
+          # Push code mới lên Kaggle
           kaggle kernels push -p .
