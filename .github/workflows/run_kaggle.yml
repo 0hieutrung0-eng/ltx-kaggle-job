@@ -19,21 +19,23 @@ jobs:
       - name: Install Kaggle CLI
         run: pip install kaggle
 
-      - name: Configure Credentials & Clear Old Session
+      - name: Configure Credentials & Generate Daily Slug
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          # 1. Cấu hình Authen
           mkdir -p ~/.kaggle
           echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
           
-          # 2. Ép hủy/dọn dẹp phiên kẹt cũ trên Kaggle (nếu có)
-          echo "--> Đang kiểm tra và hủy các tiến trình Kaggle cũ..."
-          kaggle kernels output $KAGGLE_USERNAME/ltx-video-render || true
+          # Tự động tạo slug kèm Ngày-Giờ-Phút hiện tại để không bao giờ bị đùng trùng ID
+          TIMESTAMP=$(date +'%Y%m%d-%H%M')
+          SLUG="ltx-render-$TIMESTAMP"
+          
+          # Cập nhật ID mới vào kernel-metadata.json
+          echo "--> Tạo Notebook ID mới: $SLUG"
+          sed -i "s/\"id\": \".*\"/\"id\": \"$KAGGLE_USERNAME\/$SLUG\"/g" kernel-metadata.json
 
       - name: Push New Code to Kaggle
         run: |
-          # 3. Đẩy code mới lên thực thi
           kaggle kernels push -p .
