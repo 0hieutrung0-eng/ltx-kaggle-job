@@ -10,9 +10,12 @@ print("🚀 1. SETUP MÔI TRƯỜNG & TẢI WAN2GP VỀ KAGGLE...")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Clone Wan2GP repo nếu chưa có
-if not os.path.exists("Wan2GP"):
-    os.system("git clone https://github.com/deepbeepmeep/Wan2GP.git")
+# Đường dẫn tuyệt đối chuẩn cho môi trường Kaggle
+WAN2GP_DIR = "/kaggle/working/Wan2GP"
+
+if not os.path.exists(WAN2GP_DIR):
+    print("📥 Đang clone repo Wan2GP...")
+    os.system(f"git clone https://github.com/deepbeepmeep/Wan2GP.git {WAN2GP_DIR}")
 
 def install_requirements():
     packages = [
@@ -40,7 +43,7 @@ from googleapiclient.http import MediaFileUpload
 print("✅ Setup Wan2GP & môi trường thành công!")
 
 # -------------------------------------------------------------------
-# CONFIGURATION & THÔNG TIN DỰ ÁN TỪ N8N
+# CONFIGURATION & PARSE CLIENT_PAYLOAD TỪ N8N
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook-test/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
@@ -57,7 +60,10 @@ project_info = {
 
 if len(sys.argv) > 1:
     try:
-        input_data = json.loads(sys.argv[1])
+        raw_input = json.loads(sys.argv[1])
+        # Bóc tách dữ liệu từ client_payload
+        input_data = raw_input.get("client_payload", raw_input)
+        
         project_info["title"] = input_data.get("title", project_info["title"])
         project_info["genre"] = input_data.get("genre", project_info["genre"])
         project_info["character_design"] = input_data.get("character_design", project_info["character_design"])
@@ -146,6 +152,7 @@ except Exception as e:
 # 3. RENDER BẰNG WAN2GP ENGINE (CLI MODE)
 # -------------------------------------------------------------------
 rendered_files = []
+w2gp_script_path = os.path.join(WAN2GP_DIR, "w2gp.py")
 
 for index, row in df.iterrows():
     scene_index = index + 1
@@ -161,14 +168,13 @@ for index, row in df.iterrows():
         rendered_files.append(filename)
         continue
 
-    # Ghép style/bối cảnh cố định vào prompt nếu có
+    # Ghép style cố định vào prompt
     full_prompt = f"{prompt}. {project_info['visual_style']}".strip()
     print(f"\n🎬 [{scene_index}/{total_scenes}] WAN2GP RENDERING: {full_prompt}")
 
     try:
-        # Gọi Wan2GP CLI (Tối ưu VRAM bằng offload & quantize GGUF)
         cmd = [
-            sys.executable, "Wan2GP/w2gp.py",
+            sys.executable, w2gp_script_path,
             "--mode", "t2v",
             "--prompt", full_prompt,
             "--output", filename,
