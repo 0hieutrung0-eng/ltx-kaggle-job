@@ -39,14 +39,15 @@ print("✅ Cài đặt môi trường thành công!")
 # -------------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------------
-N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
+# Đã cập nhật Test Webhook URL chính xác từ n8n
+N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook-test/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
-# Folder ID Google Drive của anh
+# Folder ID Google Drive chính thức
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# Lấy chuỗi JSON Service Account từ biến môi trường (hoặc dán trực tiếp chuỗi JSON vào đây)
+# Lấy chuỗi JSON Service Account từ GitHub Secrets / Kaggle Environment
 SERVICE_ACCOUNT_JSON_STR = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "")
 
 def get_drive_service():
@@ -82,7 +83,7 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, error_message=
     }
     try:
         res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
-        print(f"📡 [FINAL WEBHOOK {status.upper()}] HTTP {res.status_code}")
+        print(f"📡 [FINAL WEBHOOK TEST {status.upper()}] HTTP {res.status_code}")
     except Exception as e:
         print(f"❌ Lỗi gửi Webhook về n8n: {str(e)}")
 
@@ -101,7 +102,7 @@ except Exception as e:
     sys.exit(1)
 
 # -------------------------------------------------------------------
-# 3. ĐỌC GOOGLE SHEETS & DRIVE API
+# 3. ĐỌC GOOGLE SHEETS & KẾT NỐI DRIVE API
 # -------------------------------------------------------------------
 try:
     df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
@@ -131,7 +132,7 @@ for index, row in df.iterrows():
     if not prompt or prompt == "nan":
         continue
 
-    # Nếu file đã được render và upload từ trước thì dùng lại (Resume)
+    # Nếu cảnh đã render từ trước thì bỏ qua (Resume)
     if os.path.exists(filename) and os.path.getsize(filename) > 0:
         print(f"⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local, bỏ qua...")
         rendered_files.append(filename)
@@ -153,7 +154,7 @@ for index, row in df.iterrows():
         export_to_video(video_frames, filename, fps=24)
         print(f"💾 Đã lưu local: {filename}")
 
-        # Upload ngay lên thư mục Google Drive
+        # Đẩy ngay lập tức lên Google Drive
         if drive_service:
             try:
                 upload_file_to_drive(drive_service, filename, DRIVE_FOLDER_ID)
@@ -165,12 +166,12 @@ for index, row in df.iterrows():
     except Exception as e:
         print(f"❌ Lỗi render cảnh {scene_index}: {str(e)}")
 
-    # Giải phóng VRAM/RAM triệt để sau mỗi cảnh
+    # Giải phóng bộ nhớ RAM/VRAM triệt để sau mỗi cảnh
     gc.collect()
     torch.cuda.empty_cache()
 
 # -------------------------------------------------------------------
-# 5. GỘP CÁC CẢNH THÀNH 1 VIDEO FULL & BẮN WEBHOOK VỀ N8N
+# 5. GỘP CÁC CẢNH THÀNH 1 VIDEO FULL & BẮN WEBHOOK VỀ N8N TEST URL
 # -------------------------------------------------------------------
 print("\n🎞️ 5. BẮT ĐẦU GỘP TẤT CẢ CẢNH THÀNH VIDEO HOÀN CHỈNH...")
 
@@ -184,13 +185,14 @@ if rendered_files:
     subprocess.run(concat_cmd, shell=True, check=True)
     print(f"🎉 GỘP VIDEO THÀNH CÔNG: {final_output}")
 
+    # Upload video full hoàn chỉnh lên Drive
     if drive_service:
         try:
             upload_file_to_drive(drive_service, final_output, DRIVE_FOLDER_ID)
         except Exception as e:
             print(f"⚠️ Lỗi upload video Full lên Drive: {str(e)}")
 
-    # BẮN WEBHOOK VỀ N8N THÔNG BÁO HOÀN THÀNH 1 LẦN DUY NHẤT
+    # BẮN WEBHOOK VỀ N8N TEST URL (1 LẦN DUY NHẤT)
     send_n8n_final_webhook(
         status="completed_all",
         total_scenes=len(rendered_files),
