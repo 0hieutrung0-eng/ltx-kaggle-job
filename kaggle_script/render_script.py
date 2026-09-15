@@ -3,7 +3,6 @@ import sys
 import gc
 import json
 import subprocess
-import traceback
 import requests
 import pandas as pd
 
@@ -37,26 +36,59 @@ from googleapiclient.http import MediaFileUpload
 print("✅ Cài đặt môi trường thành công!")
 
 # -------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION & PARSE THÔNG TIN DỰ ÁN TỪ N8N
 # -------------------------------------------------------------------
-# Đã cập nhật Test Webhook URL chính xác từ n8n
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook-test/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-
-# Folder ID Google Drive chính thức
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# Lấy chuỗi JSON Service Account từ GitHub Secrets / Kaggle Environment
-SERVICE_ACCOUNT_JSON_STR = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "")
+# Đọc thông tin dự án truyền từ n8n (qua tham số truyền vào script)
+project_info = {
+    "title": "Chưa đặt tiêu đề",
+    "genre": "Mặc định",
+    "character_design": "",
+    "world_setting": "",
+    "visual_style": ""
+}
+
+if len(sys.argv) > 1:
+    try:
+        input_data = json.loads(sys.argv[1])
+        project_info["title"] = input_data.get("title", project_info["title"])
+        project_info["genre"] = input_data.get("genre", project_info["genre"])
+        project_info["character_design"] = input_data.get("character_design", project_info["character_design"])
+        project_info["world_setting"] = input_data.get("world_setting", project_info["world_setting"])
+        project_info["visual_style"] = input_data.get("visual_style", project_info["visual_style"])
+    except Exception as e:
+        print(f"⚠️ Không thể đọc tham số đầu vào: {e}")
+
+print("==================================================")
+print(f"🎬 THÔNG TIN DỰ ÁN:")
+print(f"📌 Tiêu đề           : {project_info['title']}")
+print(f"🏷️ Thể loại          : {project_info['genre']}")
+print(f"👤 Thiết kế Nhân vật : {project_info['character_design']}")
+print(f"🏰 Thiết kế Bối cảnh : {project_info['world_setting']}")
+print(f"🎨 Phong cách        : {project_info['visual_style']}")
+print("==================================================")
+
+SERVICE_ACCOUNT_INFO = {
+  "type": "service_account",
+  "project_id": "hieutrung",
+  "private_key_id": "0b555f4f6a3d0d2e4f83bd60e1ce874b8dd01a20",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDKEajn67fIvu2M\nzza5HddfDbHM1ziV70BKLGHtGtnY8ZQLQC0TZs9gLoyDWK5ok/z2H5Pz1we1ITDU\nOhzV76zs8jZhnzeVBFnpdfY5IMkhfJd4RSn0mGrlROm8MadBFq1XHYQ/x00drce/\nj2yqyK9cdLs73aoYJTGgtit0va7xPeHMgwOuxnCDh2W+6xDp6hczr4RSIqjSpYAP\nWE2dkUWzM3ewaAuVlAvsRGhZWAKgb5xlVrZ/isSOBabmSDh79IenTC3xSewWlV4K\nPw3DtgtYHBazj7P9fD8TjpLkbnk8kgxb0hiYKm2ZbxraDovTVjiB/UEHFlqH4GFv\nGu+NDxshAgMBAAECggEAU4wzsxiSF41huLugW6/L8cA+yHwgKFYQ1do97wQQGJPh\n6zjwqjny+kikzlXnXtP5XmY2DTbWN/zuLIGOlKIRdLK862YiXBm9dzrPwFUe9BqI\nojCupTQz1nHE1owNJGtU5lUM7jXgW6oTkc+iVYa+gtK864a+IleWimVn2E/pOlLo\nRzEI3SVRgy/6ILj2wBxeFZHSQObZe4XOW64boJZPAE5bjX+Z5siOIfoxBNuPom2+\nmVb9ijrOAuOY3AyE67G/pWhPODAs7Xv3Nt0d7Yd8r6qXYBnzY0EYzsHfHi89rjZY\njElqQ0uyzrG6OcPmcQoxWgvNzUxpPxPCTNvUkO4y5QKBgQDyfenUqH0WIcgSgUaq\nxlM8i3u2xpRPFbchOGAKko9D1ihQ8icWh4XHW7VJDj9Dj4t2cu5t4XkX74IslsBL\n7g35kmoYldX2yJX6LRyfjN49gAyRyiGo2UNFCX15DW+gaJQx1E9z7trSiSZDn/T6\nGVGJwVExBWnBIgGul839LTsHZwKBgQDVU0p08bBtz4XtqeaTFIw0dN2FK48CG8qJ\nfaONZeTPDud/Znc6xiyuJTaKyXiPBBE7TCwdCKv89sa1dw5OX0LfhwAaDrKJol/m\nSekMUnkeaUHa9BfSFfsE58Z3b6LR3Gi8ZSjPkLz/cKT25l/lEF9Mu21hKPIUqjHJ\nQRLxvlzcNwKBgQDhh9wnrkEQiYDEPToVcPlPcUcxukWLvF2jZwRkMOVQKWk7x8w0\n9vykaxYTiU2rr2D9XG2HAtKWQWsnv1nABPs4aEWG8iybJvneQYDCn8i/GE4Ydg+S\nM+eN2QK6yJVOcpWKNrVi1P7uGyLceHPm/A9K+OJjnm46cz9vO78Yvq2M9wKBgBI3\nFnh92q7FtY3hoAqXCpHAGNoyKffoH5c13y1Hsg3sG+BJA41FNrN4Afw/z8eGdWI2\n0t13zBfBip4cGGCgybkEcgHHl38hGkczsG6Y7DaojjL//Li3n8N/dvbj1WdOBrNv\nf9iZZ0n4eF2Mtkt85mZK6sANGv6gubeRkuiJdKxpAoGAMbZnGb9gTM+NYOUUG/Y2\ngH9BTiHEuXpLdGi47B/2YVzmmxI2UNs5DB56SZAiIoRRWjwq95cDtEOWPm9LUeUb\niYYQ+yuU4+6EG4w6A1jBS8RYAmO0NY4ic9syFkLv9ecmikqH2cJW1MKbhvJ2URm4\nYLz7Qq3TrM5I2qNmnZbm+28=\n-----END PRIVATE KEY-----\n",
+  "client_email": "n8n-youtube@hieutrung.iam.gserviceaccount.com",
+  "client_id": "102538454054650566316",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/n8n-youtube%40hieutrung.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
 
 def get_drive_service():
-    if not SERVICE_ACCOUNT_JSON_STR:
-        print("⚠️ Chưa tìm thấy cấu hình Service Account JSON.")
-        return None
     scopes = ['https://www.googleapis.com/auth/drive']
-    info = json.loads(SERVICE_ACCOUNT_JSON_STR)
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=scopes)
     return build('drive', 'v3', credentials=creds)
 
 def upload_file_to_drive(service, file_path, folder_id):
@@ -71,15 +103,22 @@ def upload_file_to_drive(service, file_path, folder_id):
     uploaded_file = service.files().create(
         body=file_metadata, media_body=media, fields='id'
     ).execute()
-    print(f"☁️ Đã đẩy {file_name} lên Drive (ID: {uploaded_file.get('id')})")
+    print(f"☁️ Đã đẩy thành công {file_name} lên Drive (ID: {uploaded_file.get('id')})")
     return uploaded_file.get('id')
 
-def send_n8n_final_webhook(status, total_scenes, final_file=None, error_message=None):
+def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=None, error_message=None):
     payload = {
         "status": status,
         "total_scenes": total_scenes,
         "final_file": final_file,
-        "error_message": error_message
+        "drive_file_id": drive_file_id,
+        "error_message": error_message,
+        # Đính kèm đầy đủ thông tin cố định dự án bắn về n8n
+        "title": project_info["title"],
+        "genre": project_info["genre"],
+        "character_design": project_info["character_design"],
+        "world_setting": project_info["world_setting"],
+        "visual_style": project_info["visual_style"]
     }
     try:
         res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
@@ -90,7 +129,7 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, error_message=
 # -------------------------------------------------------------------
 # 2. KHỞI TẠO MODEL LTX-VIDEO
 # -------------------------------------------------------------------
-print("🧠 2. TẢI MODEL LTX-VIDEO (TỐI ƯU SIÊU NHẸ)...")
+print("🧠 2. TẢI MODEL LTX-VIDEO...")
 try:
     pipe = LTXPipeline.from_pretrained("Lightricks/LTX-Video", torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
     pipe.enable_sequential_cpu_offload()
@@ -115,11 +154,12 @@ except Exception as e:
 drive_service = None
 try:
     drive_service = get_drive_service()
+    print("🔑 Đã xác thực thành công Service Account với Google Drive!")
 except Exception as e:
-    print(f"⚠️ Không thể kết nối Google Drive API: {str(e)}")
+    print(f"⚠️ Lỗi xác thực Google Drive: {str(e)}")
 
 # -------------------------------------------------------------------
-# 4. RENDER, LƯU TỪNG CẢNH LÊN DRIVE & GIẢI PHÓNG BỘ NHỚ
+# 4. RENDER VÀ LƯU TỪNG CẢNH
 # -------------------------------------------------------------------
 rendered_files = []
 
@@ -132,7 +172,6 @@ for index, row in df.iterrows():
     if not prompt or prompt == "nan":
         continue
 
-    # Nếu cảnh đã render từ trước thì bỏ qua (Resume)
     if os.path.exists(filename) and os.path.getsize(filename) > 0:
         print(f"⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local, bỏ qua...")
         rendered_files.append(filename)
@@ -154,7 +193,6 @@ for index, row in df.iterrows():
         export_to_video(video_frames, filename, fps=24)
         print(f"💾 Đã lưu local: {filename}")
 
-        # Đẩy ngay lập tức lên Google Drive
         if drive_service:
             try:
                 upload_file_to_drive(drive_service, filename, DRIVE_FOLDER_ID)
@@ -166,12 +204,12 @@ for index, row in df.iterrows():
     except Exception as e:
         print(f"❌ Lỗi render cảnh {scene_index}: {str(e)}")
 
-    # Giải phóng bộ nhớ RAM/VRAM triệt để sau mỗi cảnh
+    del video_frames
     gc.collect()
     torch.cuda.empty_cache()
 
 # -------------------------------------------------------------------
-# 5. GỘP CÁC CẢNH THÀNH 1 VIDEO FULL & BẮN WEBHOOK VỀ N8N TEST URL
+# 5. GỘP VIDEO FULL & BẮN THÔNG TIN HOÀN CHỈNH VỀ N8N
 # -------------------------------------------------------------------
 print("\n🎞️ 5. BẮT ĐẦU GỘP TẤT CẢ CẢNH THÀNH VIDEO HOÀN CHỈNH...")
 
@@ -185,18 +223,19 @@ if rendered_files:
     subprocess.run(concat_cmd, shell=True, check=True)
     print(f"🎉 GỘP VIDEO THÀNH CÔNG: {final_output}")
 
-    # Upload video full hoàn chỉnh lên Drive
+    drive_file_id = None
     if drive_service:
         try:
-            upload_file_to_drive(drive_service, final_output, DRIVE_FOLDER_ID)
+            drive_file_id = upload_file_to_drive(drive_service, final_output, DRIVE_FOLDER_ID)
         except Exception as e:
             print(f"⚠️ Lỗi upload video Full lên Drive: {str(e)}")
 
-    # BẮN WEBHOOK VỀ N8N TEST URL (1 LẦN DUY NHẤT)
+    # Gửi tín hiệu hoàn tất về n8n kèm toàn bộ thông tin dự án
     send_n8n_final_webhook(
         status="completed_all",
         total_scenes=len(rendered_files),
-        final_file=final_output
+        final_file=final_output,
+        drive_file_id=drive_file_id
     )
 else:
     send_n8n_final_webhook(
