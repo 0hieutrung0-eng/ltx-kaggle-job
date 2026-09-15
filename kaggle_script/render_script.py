@@ -1,11 +1,14 @@
 import os
 import sys
+import gc
 import subprocess
 import traceback
 
 print("🚀 1. BẮT ĐẦU CÀI ĐẶT THƯ VIỆN CẦN THIẾT...")
 
-# 1. Tự động cài đặt các thư viện cần thiết
+# Cấu hình tránh phân mảnh bộ nhớ VRAM PyTorch
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 def install_requirements():
     packages = [
         "diffusers",
@@ -31,17 +34,14 @@ print("✅ Cài đặt môi trường thành công!")
 # -------------------------------------------------------------------
 # CONFIGURATION (CẤU HÌNH THÔNG TIN)
 # -------------------------------------------------------------------
-# URL Webhook n8n của anh
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 
-# URL CSV xuất bản từ Google Sheets của anh (Chuyển link Share Google Sheet sang định dạng export CSV)
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
-# Hàm hỗ trợ gửi Webhook báo trạng thái về n8n
 def send_n8n_webhook(status, scene_index, prompt, file_name=None, error_message=None):
     payload = {
-        "status": status,  # "success" hoặc "failed"
+        "status": status,
         "scene_index": scene_index,
         "prompt": prompt,
         "file_name": file_name,
@@ -54,18 +54,26 @@ def send_n8n_webhook(status, scene_index, prompt, file_name=None, error_message=
         print(f"❌ Lỗi gửi Webhook về n8n: {str(e)}")
 
 # -------------------------------------------------------------------
-# 2. KHỞI TẠO MODEL LTX-VIDEO (TỐI ƯU CHO KAGGLE GPU T4)
+# 2. KHỞI TẠO MODEL LTX-VIDEO (TỐI ƯU VRAM CHO KAGGLE GPU T4)
 # -------------------------------------------------------------------
-print("🧠 2. ĐANG TẢI MODEL LTX-VIDEO (FLOAT16 TỐI ƯU VRAM)...")
+print("🧠 2. ĐANG TẢI MODEL LTX-VIDEO (BFLOAT16 & CPU OFFLOAD)...")
 
 try:
+    # 1. Chuyển sang bfloat16 để tiết kiệm VRAM hơn float16
     pipe = LTXPipeline.from_pretrained(
         "Lightricks/LTX-Video", 
-        torch_dtype=torch.float16
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True
     )
-    pipe.to("cuda")
+    
+    # 2. Bật Offload tự động (Không dùng .to("cuda") để tránh tràn VRAM)
     pipe.enable_model_cpu_offload()
-    print("✅ Đã load Model LTX-Video vào GPU T4 thành công!")
+    
+    # 3. Tối ưu VAE decode theo mảng nhỏ
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
+    
+    print("✅ Đã load Model LTX-Video thành công!")
 except Exception as e:
     err_str = f"Lỗi khởi tạo Model LTX-Video: {str(e)}"
     print(f"❌ {err_str}")
@@ -115,21 +123,20 @@ for index, row in df.iterrows():
     print(f"   Prompt: {prompt[:80]}...")
 
     try:
-        # Thực hiện render video bằng LTX-Video
+        # Render video cấu hình chuẩn GPU T4: 704x480, 121 frames (~5s)
         video_frames = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=704,
             height=480,
-            num_frames=161,         # ~5 giây video (fps=24)
-            num_inference_steps=30  # Số bước render
+            num_frames=121,         # Mức frames an toàn tránh OOM
+            num_inference_steps=30, # Số bước sinh ảnh tối ưu
+            guidance_scale=3.0
         ).frames[0]
 
-        # Xuất file mp4 ra ổ đĩa local
         export_to_video(video_frames, output_filename, fps=24)
         print(f"🎉 Render hoàn tất: {output_filename}")
 
-        # Bắn Webhook THÀNH CÔNG về n8n
         send_n8n_webhook(
             status="success",
             scene_index=scene_index,
@@ -141,12 +148,15 @@ for index, row in df.iterrows():
         error_detail = traceback.format_exc()
         print(f"❌ [LỖI CẢNH {scene_index}] {str(e)}")
 
-        # Bắn Webhook THẤT BẠI chi tiết lỗi về n8n
         send_n8n_webhook(
             status="failed",
             scene_index=scene_index,
             prompt=prompt,
             error_message=str(e)
         )
+
+    # Giải phóng hoàn toàn cache VRAM PyTorch sau từng cảnh
+    gc.collect()
+    torch.cuda.empty_cache()
 
 print("\n🏁 TẤT CẢ CÁC CẢNH ĐÃ ĐƯỢC XỬ LÝ XONG!")
