@@ -2,26 +2,19 @@ name: Trigger Kaggle Render
 
 on:
   repository_dispatch:
-    types: [trigger_kaggle]
+    types: [run-kaggle]
 
 jobs:
-  push-to-kaggle:
+  run-kaggle:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install Kaggle CLI
-        run: pip install kaggle
-
-      - name: Push Kernel to Kaggle
+      - name: Push to Kaggle
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          kaggle kernels push -p ./kaggle_script/
+          pip install kaggle
+          kaggle kernels push -p .
