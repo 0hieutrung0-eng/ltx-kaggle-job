@@ -3,12 +3,15 @@ import os
 import subprocess
 import sys
 import time
-import pandas as pd
-import requests
+
+# -------------------------------------------------------------------
+# 0. CẤU HÌNH KAGGLEHUB AUTHENTICATION (XÁC THỰC API MỚI)
+# -------------------------------------------------------------------
+os.environ["KAGGLE_USERNAME"] = "ohieutrungo"
+os.environ["KAGGLE_KEY"] = "2d7c3a54e243abde67b26ec162f27243"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 print("🚀 1. CÀI ĐẶT CÁC THƯ VIỆN CẦN THIẾT VÀ ĐỒNG BỘ GIỜ HỆ THỐNG...")
-
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 # Đồng bộ giờ hệ thống Kaggle container tránh lỗi lệch JWT Timestamp của Google API
@@ -50,6 +53,8 @@ def install_requirements():
 install_requirements()
 
 import kagglehub
+import pandas as pd
+import requests
 import torch
 from diffusers import LTXPipeline
 from diffusers.utils import export_to_video
@@ -60,7 +65,7 @@ from googleapiclient.http import MediaFileUpload
 print("✅ Cài đặt môi trường thành công!")
 
 # -------------------------------------------------------------------
-# CONFIGURATION
+# 1. CONFIGURATION
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = (
     "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
@@ -71,7 +76,7 @@ GOOGLE_SHEET_CSV_URL = (
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# Dataset Slug của bạn trên Kaggle
+# Kaggle Dataset Slug & Paths
 KAGGLE_DATASET_SLUG = "ohieutrungo/ltx-video-weights"
 DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
 WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
@@ -218,25 +223,22 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO (SỬ DỤNG KAGGLEHUB)
+# 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO (KAGGLEHUB + API AUTH)
 # -------------------------------------------------------------------
 print("\n🧠 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO...")
 
 try:
-  # 1. Ưu tiên kiểm tra nếu đã đính kèm qua giao diện UI / API Input
+  # 1. Ưu tiên kiểm tra nếu đã đính kèm qua kernel-metadata.json hoặc UI Input
   if os.path.exists(DATASET_MODEL_PATH):
     print(f"⚡ Tìm thấy Model đính kèm sẵn tại: {DATASET_MODEL_PATH}")
     model_source = DATASET_MODEL_PATH
 
-  # 2. Nếu chưa đính kèm, tự động tải/kết nối Dataset bằng kagglehub qua Code
+  # 2. Nếu chưa đính kèm, tự động tải/kết nối Dataset bằng kagglehub qua Code (Có API Key)
   else:
-    print(
-        f"⚡ Đang tự động kết nối Dataset '{KAGGLE_DATASET_SLUG}' qua"
-        " Kagglehub..."
-    )
+    print(f"⚡ Đang kết nối Dataset '{KAGGLE_DATASET_SLUG}' qua Kagglehub...")
     dataset_path = kagglehub.dataset_download(KAGGLE_DATASET_SLUG)
 
-    # Đọc cấu trúc thư mục LTX-Video-Local bên trong Dataset
+    # Kiểm tra thư mục con LTX-Video-Local bên trong Dataset
     possible_path = os.path.join(dataset_path, "LTX-Video-Local")
     if os.path.exists(possible_path):
       model_source = possible_path
