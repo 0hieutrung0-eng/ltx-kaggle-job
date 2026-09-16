@@ -1,5 +1,4 @@
 import gc
-import json
 import os
 import subprocess
 import sys
@@ -59,7 +58,7 @@ from googleapiclient.http import MediaFileUpload
 print("✅ Cài đặt môi trường thành công!")
 
 # -------------------------------------------------------------------
-# CONFIGURATION & PARSE THÔNG TIN DỰ ÁN TỪ N8N
+# CONFIGURATION
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = (
     "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
@@ -69,40 +68,6 @@ GOOGLE_SHEET_CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
-
-project_info = {
-    "title": "Chưa đặt tiêu đề",
-    "genre": "Mặc định",
-    "character_design": "",
-    "world_setting": "",
-    "visual_style": "",
-}
-
-if len(sys.argv) > 1:
-  try:
-    input_data = json.loads(sys.argv[1])
-    project_info["title"] = input_data.get("title", project_info["title"])
-    project_info["genre"] = input_data.get("genre", project_info["genre"])
-    project_info["character_design"] = input_data.get(
-        "character_design", project_info["character_design"]
-    )
-    project_info["world_setting"] = input_data.get(
-        "world_setting", project_info["world_setting"]
-    )
-    project_info["visual_style"] = input_data.get(
-        "visual_style", project_info["visual_style"]
-    )
-  except Exception as e:
-    print(f"⚠️ Không thể đọc tham số đầu vào: {e}")
-
-print("==================================================")
-print("🎬 THÔNG TIN DỰ ÁN:")
-print(f"📌 Tiêu đề           : {project_info['title']}")
-print(f"🏷️ Thể loại          : {project_info['genre']}")
-print(f"👤 Thiết kế Nhân vật : {project_info['character_design']}")
-print(f"🏰 Thiết kế Bối cảnh : {project_info['world_setting']}")
-print(f"🎨 Phong cách        : {project_info['visual_style']}")
-print("==================================================")
 
 SERVICE_ACCOUNT_INFO = {
     "type": "service_account",
@@ -123,6 +88,44 @@ SERVICE_ACCOUNT_INFO = {
     ),
     "universe_domain": "googleapis.com",
 }
+
+# -------------------------------------------------------------------
+# 2. ĐỌC GOOGLE SHEETS & TRÍCH XUẤT THÔNG TIN DỰ ÁN
+# -------------------------------------------------------------------
+print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
+try:
+  df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
+  total_scenes = len(df)
+  print(f"✅ Tìm thấy {total_scenes} cảnh từ Google Sheets.")
+except Exception as e:
+  print(f"❌ Lỗi đọc Google Sheet: {str(e)}")
+  sys.exit(1)
+
+project_info = {
+    "title": "Chưa đặt tiêu đề",
+    "genre": "Mặc định",
+    "character_design": "",
+    "world_setting": "",
+    "visual_style": "",
+}
+
+# Tự động đọc thông tin dự án từ hàng đầu tiên trong Sheet
+if not df.empty:
+  first_row = df.iloc[0]
+  for key in project_info.keys():
+    if key in df.columns:
+      val = str(first_row[key]).strip()
+      if val.lower() != "nan" and val != "":
+        project_info[key] = val
+
+print("==================================================")
+print("🎬 THÔNG TIN DỰ ÁN (Đọc trực tiếp từ Google Sheets):")
+print(f"📌 Tiêu đề           : {project_info['title']}")
+print(f"🏷️ Thể loại          : {project_info['genre']}")
+print(f"👤 Thiết kế Nhân vật : {project_info['character_design']}")
+print(f"🏰 Thiết kế Bối cảnh : {project_info['world_setting']}")
+print(f"🎨 Phong cách        : {project_info['visual_style']}")
+print("==================================================")
 
 
 def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
@@ -178,15 +181,15 @@ def send_n8n_final_webhook(
   }
   try:
     res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
-    print(f"📡 [FINAL WEBHOOK TEST {status.upper()}] HTTP {res.status_code}")
+    print(f"📡 [FINAL WEBHOOK {status.upper()}] HTTP {res.status_code}")
   except Exception as e:
     print(f"❌ Lỗi gửi Webhook về n8n: {str(e)}")
 
 
 # -------------------------------------------------------------------
-# 2. KHỞI TẠO MODEL LTX-VIDEO
+# 3. KHỞI TẠO MODEL LTX-VIDEO
 # -------------------------------------------------------------------
-print("🧠 2. TẢI MODEL LTX-VIDEO...")
+print("\n🧠 3. TẢI MODEL LTX-VIDEO...")
 try:
   pipe = LTXPipeline.from_pretrained(
       "Lightricks/LTX-Video",
@@ -204,25 +207,18 @@ except Exception as e:
   sys.exit(1)
 
 # -------------------------------------------------------------------
-# 3. ĐỌC GOOGLE SHEETS
-# -------------------------------------------------------------------
-try:
-  df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
-  total_scenes = len(df)
-  print(f"📊 Tìm thấy {total_scenes} cảnh từ Google Sheets.")
-except Exception as e:
-  send_n8n_final_webhook(
-      "failed", 0, error_message=f"Lỗi đọc Google Sheet: {str(e)}"
-  )
-  sys.exit(1)
-
-# -------------------------------------------------------------------
 # 4. RENDER VÀ LƯU TỪNG CẢNH
 # -------------------------------------------------------------------
 rendered_files = []
 
 for index, row in df.iterrows():
-  scene_index = index + 1
+  # Ưu tiên lấy scene_index từ cột Sheet, nếu rỗng sẽ tự lấy theo số thứ tự hàng
+  scene_idx_val = row.get("scene_index")
+  if pd.notna(scene_idx_val):
+    scene_index = int(scene_idx_val)
+  else:
+    scene_index = index + 1
+
   prompt = str(row.get("prompt", "")).strip()
   negative_prompt = str(
       row.get("negative_prompt", "worst quality, low quality, blurry")
@@ -234,12 +230,12 @@ for index, row in df.iterrows():
 
   if os.path.exists(filename) and os.path.getsize(filename) > 0:
     print(
-        f"⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local, bỏ qua..."
+        f"\n⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local, bỏ qua..."
     )
     rendered_files.append(filename)
     continue
 
-  print(f"\n🎬 [{scene_index}/{total_scenes}] Đang render...")
+  print(f"\n🎬 [{scene_index}/{total_scenes}] Đang render cảnh {scene_index}...")
 
   try:
     video_frames = pipe(
