@@ -7,7 +7,9 @@
   "is_private": "true",
   "enable_gpu": "true",
   "enable_internet": "true",
-  "dataset_sources": [],
+  "dataset_sources": [
+    "ohieutrungo/ltx-video-weights"
+  ],
   "kernel_sources": [],
   "competition_sources": []
 }
