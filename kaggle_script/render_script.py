@@ -6,16 +6,9 @@ import subprocess
 import requests
 import pandas as pd
 
-print("🚀 1. SETUP MÔI TRƯỜNG & TẢI WAN2GP VỀ KAGGLE...")
+print("🚀 1. CÀI ĐẶT CÁC THƯ VIỆN CẦN THIẾT...")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-# Đường dẫn tuyệt đối chuẩn cho môi trường Kaggle
-WAN2GP_DIR = "/kaggle/working/Wan2GP"
-
-if not os.path.exists(WAN2GP_DIR):
-    print("📥 Đang clone repo Wan2GP...")
-    os.system(f"git clone https://github.com/deepbeepmeep/Wan2GP.git {WAN2GP_DIR}")
 
 def install_requirements():
     packages = [
@@ -27,29 +20,30 @@ def install_requirements():
         "pandas",
         "torch",
         "google-api-python-client",
-        "google-auth",
-        "einops",
-        "sentencepiece"
+        "google-auth"
     ]
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + packages)
 
 install_requirements()
 
 import torch
+from diffusers import LTXPipeline
+from diffusers.utils import export_to_video
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-print("✅ Setup Wan2GP & môi trường thành công!")
+print("✅ Cài đặt môi trường thành công!")
 
 # -------------------------------------------------------------------
-# CONFIGURATION & PARSE CLIENT_PAYLOAD TỪ N8N
+# CONFIGURATION & PARSE THÔNG TIN DỰ ÁN TỪ N8N
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook-test/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
+# Đọc thông tin dự án truyền từ n8n (qua tham số truyền vào script)
 project_info = {
     "title": "Chưa đặt tiêu đề",
     "genre": "Mặc định",
@@ -60,20 +54,17 @@ project_info = {
 
 if len(sys.argv) > 1:
     try:
-        raw_input = json.loads(sys.argv[1])
-        # Bóc tách dữ liệu từ client_payload
-        input_data = raw_input.get("client_payload", raw_input)
-        
+        input_data = json.loads(sys.argv[1])
         project_info["title"] = input_data.get("title", project_info["title"])
         project_info["genre"] = input_data.get("genre", project_info["genre"])
         project_info["character_design"] = input_data.get("character_design", project_info["character_design"])
         project_info["world_setting"] = input_data.get("world_setting", project_info["world_setting"])
         project_info["visual_style"] = input_data.get("visual_style", project_info["visual_style"])
     except Exception as e:
-        print(f"⚠️ Lỗi đọc payload JSON từ n8n: {e}")
+        print(f"⚠️ Không thể đọc tham số đầu vào: {e}")
 
 print("==================================================")
-print(f"🎬 BẮT ĐẦU RENDER VỚI ENGINE WAN2GP:")
+print(f"🎬 THÔNG TIN DỰ ÁN:")
 print(f"📌 Tiêu đề           : {project_info['title']}")
 print(f"🏷️ Thể loại          : {project_info['genre']}")
 print(f"👤 Thiết kế Nhân vật : {project_info['character_design']}")
@@ -104,10 +95,15 @@ def upload_file_to_drive(service, file_path, folder_id):
     if not service:
         return None
     file_name = os.path.basename(file_path)
-    file_metadata = {'name': file_name, 'parents': [folder_id]}
+    file_metadata = {
+        'name': file_name,
+        'parents': [folder_id]
+    }
     media = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
-    uploaded_file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    print(f"☁️ Đã đẩy {file_name} lên Drive (ID: {uploaded_file.get('id')})")
+    uploaded_file = service.files().create(
+        body=file_metadata, media_body=media, fields='id'
+    ).execute()
+    print(f"☁️ Đã đẩy thành công {file_name} lên Drive (ID: {uploaded_file.get('id')})")
     return uploaded_file.get('id')
 
 def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=None, error_message=None):
@@ -117,7 +113,7 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
         "final_file": final_file,
         "drive_file_id": drive_file_id,
         "error_message": error_message,
-        "engine": "Wan2GP",
+        # Đính kèm đầy đủ thông tin cố định dự án bắn về n8n
         "title": project_info["title"],
         "genre": project_info["genre"],
         "character_design": project_info["character_design"],
@@ -131,7 +127,21 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
         print(f"❌ Lỗi gửi Webhook về n8n: {str(e)}")
 
 # -------------------------------------------------------------------
-# 2. ĐỌC GOOGLE SHEETS
+# 2. KHỞI TẠO MODEL LTX-VIDEO
+# -------------------------------------------------------------------
+print("🧠 2. TẢI MODEL LTX-VIDEO...")
+try:
+    pipe = LTXPipeline.from_pretrained("Lightricks/LTX-Video", torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    pipe.enable_sequential_cpu_offload()
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
+    print("✅ Load Model thành công!")
+except Exception as e:
+    send_n8n_final_webhook("failed", 0, error_message=f"Lỗi khởi tạo Model: {str(e)}")
+    sys.exit(1)
+
+# -------------------------------------------------------------------
+# 3. ĐỌC GOOGLE SHEETS & KẾT NỐI DRIVE API
 # -------------------------------------------------------------------
 try:
     df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
@@ -144,67 +154,64 @@ except Exception as e:
 drive_service = None
 try:
     drive_service = get_drive_service()
-    print("🔑 Xác thực thành công Google Drive API!")
+    print("🔑 Đã xác thực thành công Service Account với Google Drive!")
 except Exception as e:
     print(f"⚠️ Lỗi xác thực Google Drive: {str(e)}")
 
 # -------------------------------------------------------------------
-# 3. RENDER BẰNG WAN2GP ENGINE (CLI MODE)
+# 4. RENDER VÀ LƯU TỪNG CẢNH
 # -------------------------------------------------------------------
 rendered_files = []
-w2gp_script_path = os.path.join(WAN2GP_DIR, "w2gp.py")
 
 for index, row in df.iterrows():
     scene_index = index + 1
     prompt = str(row.get("prompt", ""))
+    negative_prompt = str(row.get("negative_prompt", "worst quality, low quality, blurry"))
     filename = f"scene_{scene_index:03d}.mp4"
 
     if not prompt or prompt == "nan":
         continue
 
-    # Resume logic: Bỏ qua nếu đã render từ trước
     if os.path.exists(filename) and os.path.getsize(filename) > 0:
         print(f"⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local, bỏ qua...")
         rendered_files.append(filename)
         continue
 
-    # Ghép style cố định vào prompt
-    full_prompt = f"{prompt}. {project_info['visual_style']}".strip()
-    print(f"\n🎬 [{scene_index}/{total_scenes}] WAN2GP RENDERING: {full_prompt}")
+    print(f"\n🎬 [{scene_index}/{total_scenes}] Đang render...")
 
     try:
-        cmd = [
-            sys.executable, w2gp_script_path,
-            "--mode", "t2v",
-            "--prompt", full_prompt,
-            "--output", filename,
-            "--offload",
-            "--quant", "gguf"
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if os.path.exists(filename) and os.path.getsize(filename) > 0:
-            print(f"💾 Render Wan2GP thành công: {filename}")
-            if drive_service:
-                try:
-                    upload_file_to_drive(drive_service, filename, DRIVE_FOLDER_ID)
-                except Exception as drive_err:
-                    print(f"⚠️ Lỗi upload Drive: {str(drive_err)}")
-            rendered_files.append(filename)
-        else:
-            print(f"❌ Wan2GP báo lỗi tại cảnh {scene_index}: {result.stderr}")
+        video_frames = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=640,
+            height=384,
+            num_frames=65,
+            num_inference_steps=15,
+            guidance_scale=3.0
+        ).frames[0]
+
+        export_to_video(video_frames, filename, fps=24)
+        print(f"💾 Đã lưu local: {filename}")
+
+        if drive_service:
+            try:
+                upload_file_to_drive(drive_service, filename, DRIVE_FOLDER_ID)
+            except Exception as drive_err:
+                print(f"⚠️ Lỗi upload Drive: {str(drive_err)}")
+
+        rendered_files.append(filename)
 
     except Exception as e:
-        print(f"❌ Lỗi thực thi Wan2GP cảnh {scene_index}: {str(e)}")
+        print(f"❌ Lỗi render cảnh {scene_index}: {str(e)}")
 
+    del video_frames
     gc.collect()
     torch.cuda.empty_cache()
 
 # -------------------------------------------------------------------
-# 4. GỘP TOÀN BỘ CẢNH THÀNH VIDEO FULL & BẮN WEBHOOK
+# 5. GỘP VIDEO FULL & BẮN THÔNG TIN HOÀN CHỈNH VỀ N8N
 # -------------------------------------------------------------------
-print("\n🎞️ 4. BẮT ĐẦU GỘP TẤT CẢ CẢNH THÀNH VIDEO HOÀN CHỈNH...")
+print("\n🎞️ 5. BẮT ĐẦU GỘP TẤT CẢ CẢNH THÀNH VIDEO HOÀN CHỈNH...")
 
 if rendered_files:
     with open("file_list.txt", "w") as f:
@@ -214,7 +221,7 @@ if rendered_files:
     final_output = "final_output_full.mp4"
     concat_cmd = f"ffmpeg -f concat -safe 0 -i file_list.txt -c copy {final_output} -y"
     subprocess.run(concat_cmd, shell=True, check=True)
-    print(f"🎉 GỘP VIDEO WAN2GP THÀNH CÔNG: {final_output}")
+    print(f"🎉 GỘP VIDEO THÀNH CÔNG: {final_output}")
 
     drive_file_id = None
     if drive_service:
@@ -223,6 +230,7 @@ if rendered_files:
         except Exception as e:
             print(f"⚠️ Lỗi upload video Full lên Drive: {str(e)}")
 
+    # Gửi tín hiệu hoàn tất về n8n kèm toàn bộ thông tin dự án
     send_n8n_final_webhook(
         status="completed_all",
         total_scenes=len(rendered_files),
@@ -233,5 +241,5 @@ else:
     send_n8n_final_webhook(
         status="failed",
         total_scenes=0,
-        error_message="Không render thành công cảnh nào bằng Wan2GP."
+        error_message="Không render thành công cảnh nào."
     )
