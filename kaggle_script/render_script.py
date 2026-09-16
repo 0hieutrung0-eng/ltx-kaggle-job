@@ -11,6 +11,7 @@ print("🚀 1. CÀI ĐẶT CÁC THƯ VIỆN CẦN THIẾT VÀ ĐỒNG BỘ GIỜ
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
+# Đồng bộ giờ hệ thống Kaggle container tránh lỗi lệch JWT Timestamp của Google API
 def sync_system_time():
   try:
     subprocess.run(
@@ -39,6 +40,7 @@ def install_requirements():
       "torch",
       "google-api-python-client",
       "google-auth",
+      "kagglehub",
   ]
   subprocess.check_call(
       [sys.executable, "-m", "pip", "install", "-q"] + packages
@@ -47,6 +49,7 @@ def install_requirements():
 
 install_requirements()
 
+import kagglehub
 import torch
 from diffusers import LTXPipeline
 from diffusers.utils import export_to_video
@@ -68,7 +71,8 @@ GOOGLE_SHEET_CSV_URL = (
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# Đường dẫn Dataset Kaggle (Nếu đính kèm dataset thì sẽ nằm trong /kaggle/input/)
+# Dataset Slug của bạn trên Kaggle
+KAGGLE_DATASET_SLUG = "hieutrung/ltx-video-weights"
 DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
 WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
 
@@ -214,32 +218,32 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO
+# 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO (SỬ DỤNG KAGGLEHUB)
 # -------------------------------------------------------------------
-print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
+print("\n🧠 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO...")
 
 try:
-  # 1. Kiểm tra từ Dataset
+  # 1. Ưu tiên kiểm tra nếu đã đính kèm qua giao diện UI / API Input
   if os.path.exists(DATASET_MODEL_PATH):
-    print(
-        f"⚡ Tìm thấy Model từ Kaggle Dataset ({DATASET_MODEL_PATH}). Đang"
-        " load siêu tốc..."
-    )
+    print(f"⚡ Tìm thấy Model đính kèm sẵn tại: {DATASET_MODEL_PATH}")
     model_source = DATASET_MODEL_PATH
-  # 2. Kiểm tra từ Working Folder
-  elif os.path.exists(WORKING_MODEL_PATH):
-    print(
-        f"⚡ Tìm thấy Model từ thư mục local ({WORKING_MODEL_PATH}). Đang"
-        " load..."
-    )
-    model_source = WORKING_MODEL_PATH
-  # 3. Nếu chưa có thì tải trực tiếp từ HuggingFace
+
+  # 2. Nếu chưa đính kèm, tự động tải/kết nối Dataset bằng kagglehub qua Code
   else:
     print(
-        "⏳ Chưa thấy Dataset hay Model Local. Đang tải từ HuggingFace"
-        " (Lightricks/LTX-Video)..."
+        f"⚡ Đang tự động kết nối Dataset '{KAGGLE_DATASET_SLUG}' qua"
+        " Kagglehub..."
     )
-    model_source = "Lightricks/LTX-Video"
+    dataset_path = kagglehub.dataset_download(KAGGLE_DATASET_SLUG)
+
+    # Đọc cấu trúc thư mục LTX-Video-Local bên trong Dataset
+    possible_path = os.path.join(dataset_path, "LTX-Video-Local")
+    if os.path.exists(possible_path):
+      model_source = possible_path
+    else:
+      model_source = dataset_path
+
+    print(f"✅ Tự động kết nối Dataset thành công từ: {model_source}")
 
   pipe = LTXPipeline.from_pretrained(
       model_source,
@@ -247,23 +251,22 @@ try:
       low_cpu_mem_usage=True,
   )
 
-  # Nếu tải từ HF lần đầu, tự động lưu lại working dir phòng trường hợp chạy tiếp trong cùng session
-  if model_source == "Lightricks/LTX-Video":
-    print(
-        f"💾 Đang lưu bản backup vào '{WORKING_MODEL_PATH}' cho các lần chạy"
-        " cùng session..."
-    )
-    pipe.save_pretrained(WORKING_MODEL_PATH)
-
   pipe.enable_sequential_cpu_offload()
   pipe.vae.enable_tiling()
   pipe.vae.enable_slicing()
-  print("✅ Load Model thành công!")
+  print("✅ Load Model LTX-Video thành công!")
+
 except Exception as e:
-  send_n8n_final_webhook(
-      "failed", 0, error_message=f"Lỗi khởi tạo Model: {str(e)}"
+  print(f"⚠️ Lỗi kết nối Dataset local ({str(e)}). Tải dự phòng từ HuggingFace...")
+  pipe = LTXPipeline.from_pretrained(
+      "Lightricks/LTX-Video",
+      torch_dtype=torch.bfloat16,
+      low_cpu_mem_usage=True,
   )
-  sys.exit(1)
+  pipe.enable_sequential_cpu_offload()
+  pipe.vae.enable_tiling()
+  pipe.vae.enable_slicing()
+  print("✅ Load Model dự phòng từ HuggingFace thành công!")
 
 # -------------------------------------------------------------------
 # 4. RENDER VÀ LƯU TỪNG CẢNH
