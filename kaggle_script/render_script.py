@@ -3,15 +3,12 @@ import os
 import subprocess
 import sys
 import time
-
-# -------------------------------------------------------------------
-# 0. CẤU HÌNH KAGGLEHUB AUTHENTICATION (XÁC THỰC API MỚI)
-# -------------------------------------------------------------------
-os.environ["KAGGLE_USERNAME"] = "ohieutrungo"
-os.environ["KAGGLE_KEY"] = "2d7c3a54e243abde67b26ec162f27243"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import pandas as pd
+import requests
 
 print("🚀 1. CÀI ĐẶT CÁC THƯ VIỆN CẦN THIẾT VÀ ĐỒNG BỘ GIỜ HỆ THỐNG...")
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 # Đồng bộ giờ hệ thống Kaggle container tránh lỗi lệch JWT Timestamp của Google API
@@ -43,7 +40,6 @@ def install_requirements():
       "torch",
       "google-api-python-client",
       "google-auth",
-      "kagglehub",
   ]
   subprocess.check_call(
       [sys.executable, "-m", "pip", "install", "-q"] + packages
@@ -52,9 +48,6 @@ def install_requirements():
 
 install_requirements()
 
-import kagglehub
-import pandas as pd
-import requests
 import torch
 from diffusers import LTXPipeline
 from diffusers.utils import export_to_video
@@ -65,7 +58,7 @@ from googleapiclient.http import MediaFileUpload
 print("✅ Cài đặt môi trường thành công!")
 
 # -------------------------------------------------------------------
-# 1. CONFIGURATION
+# CONFIGURATION
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = (
     "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
@@ -76,8 +69,7 @@ GOOGLE_SHEET_CSV_URL = (
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# Kaggle Dataset Slug & Paths
-KAGGLE_DATASET_SLUG = "ohieutrungo/ltx-video-weights"
+# Đường dẫn Dataset local nếu được mount qua kernel-metadata.json
 DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
 WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
 
@@ -223,29 +215,32 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO (KAGGLEHUB + API AUTH)
+# 3. KHỞI TẠO MODEL LTX-VIDEO (TẢI TRỰC TIẾP)
 # -------------------------------------------------------------------
-print("\n🧠 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO...")
+print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 
 try:
-  # 1. Ưu tiên kiểm tra nếu đã đính kèm qua kernel-metadata.json hoặc UI Input
+  # 1. Kiểm tra từ Dataset mount sẵn
   if os.path.exists(DATASET_MODEL_PATH):
-    print(f"⚡ Tìm thấy Model đính kèm sẵn tại: {DATASET_MODEL_PATH}")
+    print(
+        f"⚡ Tìm thấy Model từ Kaggle Dataset ({DATASET_MODEL_PATH}). Đang"
+        " load siêu tốc..."
+    )
     model_source = DATASET_MODEL_PATH
-
-  # 2. Nếu chưa đính kèm, tự động tải/kết nối Dataset bằng kagglehub qua Code (Có API Key)
+  # 2. Kiểm tra từ Working Folder
+  elif os.path.exists(WORKING_MODEL_PATH):
+    print(
+        f"⚡ Tìm thấy Model từ thư mục local ({WORKING_MODEL_PATH}). Đang"
+        " load..."
+    )
+    model_source = WORKING_MODEL_PATH
+  # 3. Tải trực tiếp từ HuggingFace
   else:
-    print(f"⚡ Đang kết nối Dataset '{KAGGLE_DATASET_SLUG}' qua Kagglehub...")
-    dataset_path = kagglehub.dataset_download(KAGGLE_DATASET_SLUG)
-
-    # Kiểm tra thư mục con LTX-Video-Local bên trong Dataset
-    possible_path = os.path.join(dataset_path, "LTX-Video-Local")
-    if os.path.exists(possible_path):
-      model_source = possible_path
-    else:
-      model_source = dataset_path
-
-    print(f"✅ Tự động kết nối Dataset thành công từ: {model_source}")
+    print(
+        "⏳ Chưa thấy Dataset đính kèm. Đang tải trực tiếp từ HuggingFace"
+        " (Lightricks/LTX-Video)..."
+    )
+    model_source = "Lightricks/LTX-Video"
 
   pipe = LTXPipeline.from_pretrained(
       model_source,
@@ -253,22 +248,21 @@ try:
       low_cpu_mem_usage=True,
   )
 
+  # Sao lưu local nếu tải từ HF phòng trường hợp tái sử dụng trong phiên
+  if model_source == "Lightricks/LTX-Video":
+    print(f"💾 Đang lưu bản backup vào '{WORKING_MODEL_PATH}'...")
+    pipe.save_pretrained(WORKING_MODEL_PATH)
+
   pipe.enable_sequential_cpu_offload()
   pipe.vae.enable_tiling()
   pipe.vae.enable_slicing()
   print("✅ Load Model LTX-Video thành công!")
 
 except Exception as e:
-  print(f"⚠️ Lỗi kết nối Dataset local ({str(e)}). Tải dự phòng từ HuggingFace...")
-  pipe = LTXPipeline.from_pretrained(
-      "Lightricks/LTX-Video",
-      torch_dtype=torch.bfloat16,
-      low_cpu_mem_usage=True,
+  send_n8n_final_webhook(
+      "failed", 0, error_message=f"Lỗi khởi tạo Model: {str(e)}"
   )
-  pipe.enable_sequential_cpu_offload()
-  pipe.vae.enable_tiling()
-  pipe.vae.enable_slicing()
-  print("✅ Load Model dự phòng từ HuggingFace thành công!")
+  sys.exit(1)
 
 # -------------------------------------------------------------------
 # 4. RENDER VÀ LƯU TỪNG CẢNH
