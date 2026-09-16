@@ -24,12 +24,20 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          # 1. Cấu hình Authen Kaggle
+          # 1. Cấu hình Authen Kaggle an toàn hơn bằng Python
           mkdir -p ~/.kaggle
-          echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
+          python -c "
+          import os, json
+          creds = {
+              'username': os.environ['KAGGLE_USERNAME'],
+              'key': os.environ['KAGGLE_KEY']
+          }
+          with open('/os_home/.kaggle/kaggle.json'.replace('/os_home', os.path.expanduser('~')), 'w') as f:
+              json.dump(creds, f)
+          "
           chmod 600 ~/.kaggle/kaggle.json
 
-          # 2. Tạo Slug mới theo Ngày-Giờ-Phút (Tránh tuyệt đối lỗi 409)
+          # 2. Tạo Slug mới theo Ngày-Giờ-Phút
           TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
           DYNAMIC_SLUG="ltx-render-$TIMESTAMP"
           
@@ -37,18 +45,24 @@ jobs:
           
           # 3. Ghi đè ID mới vào kernel-metadata.json
           python -c "
-          import json
+          import json, os
+          username = os.environ['KAGGLE_USERNAME']
+          timestamp = '$TIMESTAMP'
+          slug = '$DYNAMIC_SLUG'
           
           with open('kernel-metadata.json', 'r') as f:
               data = json.load(f)
               
-          data['id'] = '$KAGGLE_USERNAME/$DYNAMIC_SLUG'
-          data['title'] = 'LTX Render $TIMESTAMP'
+          data['id'] = f'{username}/{slug}'
+          data['title'] = f'LTX Render {timestamp}'
           
           with open('kernel-metadata.json', 'w') as f:
               json.dump(data, f, indent=2)
           "
 
       - name: Push New Code to Kaggle
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
           kaggle kernels push -p .
