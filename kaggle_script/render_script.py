@@ -119,7 +119,7 @@ if not df.empty:
         project_info[key] = val
 
 print("==================================================")
-print("🎬 THÔNG TIN DỰ ÁN (Đọc trực tiếp từ Google Sheets):")
+print("🎬 THÔNG TIN DỰ ÁN (Đọc từ Google Sheets):")
 print(f"📌 Tiêu đề           : {project_info['title']}")
 print(f"🏷️ Thể loại          : {project_info['genre']}")
 print(f"👤 Thiết kế Nhân vật : {project_info['character_design']}")
@@ -133,6 +133,9 @@ def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
 
   for attempt in range(1, retries + 1):
     try:
+      # Ép buộc đồng bộ lại giờ hệ thống trước mỗi lần tạo Service Account Client
+      sync_system_time()
+
       scopes = ["https://www.googleapis.com/auth/drive"]
       creds = Credentials.from_service_account_info(
           SERVICE_ACCOUNT_INFO, scopes=scopes
@@ -230,8 +233,10 @@ for index, row in df.iterrows():
 
   if os.path.exists(filename) and os.path.getsize(filename) > 0:
     print(
-        f"\n⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local, bỏ qua..."
+        f"\n⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local, tiến hành"
+        " upload lại lên Drive..."
     )
+    upload_file_to_drive_fresh(filename, DRIVE_FOLDER_ID)
     rendered_files.append(filename)
     continue
 
