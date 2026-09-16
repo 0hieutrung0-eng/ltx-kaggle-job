@@ -11,7 +11,6 @@ print("🚀 1. CÀI ĐẶT CÁC THƯ VIỆN CẦN THIẾT VÀ ĐỒNG BỘ GIỜ
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
-# Đồng bộ giờ hệ thống Kaggle container tránh lỗi lệch JWT Timestamp của Google API
 def sync_system_time():
   try:
     subprocess.run(
@@ -69,15 +68,42 @@ GOOGLE_SHEET_CSV_URL = (
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
+# Đường dẫn Dataset Kaggle (Nếu đính kèm dataset thì sẽ nằm trong /kaggle/input/)
+DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
+WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
+
 SERVICE_ACCOUNT_INFO = {
     "type": "service_account",
     "project_id": "hieutrung",
     "private_key_id": "0b555f4f6a3d0d2e4f83bd60e1ce874b8dd01a20",
-    "private_key": (
-        "-----BEGIN PRIVATE"
-        " KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDKEajn67fIvu2M\nzza5HddfDbHM1ziV70BKLGHtGtnY8ZQLQC0TZs9gLoyDWK5ok/z2H5Pz1we1ITDU\nOhzV76zs8jZhnzeVBFnpdfY5IMkhfJd4RSn0mGrlROm8MadBFq1XHYQ/x00drce/\nj2yqyK9cdLs73aoYJTGgtit0va7xPeHMgwOuxnCDh2W+6xDp6hczr4RSIqjSpYAP\nWE2dkUWzM3ewaAuVlAvsRGhZWAKgb5xlVrZ/isSOBabmSDh79IenTC3xSewWlV4K\nPw3DtgtYHBazj7P9fD8TjpLkbnk8kgxb0hiYKm2ZbxraDovTVjiB/UEHFlqH4GFv\nGu+NDxshAgMBAAECggEAU4wzsxiSF41huLugW6/L8cA+yHwgKFYQ1do97wQQGJPh\n6zjwqjny+kikzlXnXtP5XmY2DTbWN/zuLIGOlKIRdLK862YiXBm9dzrPwFUe9BqI\nojCupTQz1nHE1owNJGtU5lUM7jXgW6oTkc+iVYa+gtK864a+IleWimVn2E/pOlLo\nRzEI3SVRgy/6ILj2wBxeFZHSQObZe4XOW64boJZPAE5bjX+Z5siOIfoxBNuPom2+\nmVb9ijrOAuOY3AyE67G/pWhPODAs7Xv3Nt0d7Yd8r6qXYBnzY0EYzsHfHi89rjZY\njElqQ0uyzrG6OcPmcQoxWgvNzUxpPxPCTNvUkO4y5QKBgQDyfenUqH0WIcgSgUaq\nxlM8i3u2xpRPFbchOGAKko9D1ihQ8icWh4XHW7VJDj9Dj4t2cu5t4XkX74IslsBL\n7g35kmoYldX2yJX6LRyfjN49gAyRyiGo2UNFCX15DW+gaJQx1E9z7trSiSZDn/T6\nGVGJwVExBWnBIgGul839LTsHZwKBgQDVU0p08bBtz4XtqeaTFIw0dN2FK48CG8qJ\nfaONZeTPDud/Znc6xiyuJTaKyXiPBBE7TCwdCKv89sa1dw5OX0LfhwAaDrKJol/m\nSekMUnkeaUHa9BfSFfsE58Z3b6LR3Gi8ZSjPkLz/cKT25l/lEF9Mu21hKPIUqjHJ\nQRLxvlzcNwKBgQDhh9wnrkEQiYDEPToVcPlPcUcxukWLvF2jZwRkMOVQKWk7x8w0\n9vykaxYTiU2rr2D9XG2HAtKWQWsnv1nABPs4aEWG8iybJvneQYDCn8i/GE4Ydg+S\nM+eN2QK6yJVOcpWKNrVi1P7uGyLceHPm/A9K+OJjnm46cz9vO78Yvq2M9wKBgBI3\nFnh92q7FtY3hoAqXCpHAGNoyKffoH5c13y1Hsg3sG+BJA41FNrN4Afw/z8eGdWI2\n0t13zBfBip4cGGCgybkEcgHHl38hGkczsG6Y7DaojjL//Li3n8N/dvbj1WdOBrNv\nf9iZZ0n4eF2Mtkt85mZK6sANGv6gubeRkuiJdKxpAoGAMbZnGb9gTM+NYOUUG/Y2\ngH9BTiHEuXpLdGi47B/2YVzmmxI2UNs5DB56SZAiIoRRWjwq95cDtEOWPm9LUeUb\niYYQ+yuU4+6EG4w6A1jBS8RYAmO0NY4ic9syFkLv9ecmikqH2cJW1MKbhvJ2URm4\nYLz7Qq3TrM5I2qNmnZbm+28=\n-----END"
-        " PRIVATE KEY-----\n"
-    ),
+    "private_key": r"""-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDKEajn67fIvu2M
+zza5HddfDbHM1ziV70BKLGHtGtnY8ZQLQC0TZs9gLoyDWK5ok/z2H5Pz1we1ITDU
+OhzV76zs8jZhnzeVBFnpdfY5IMkhfJd4RSn0mGrlROm8MadBFq1XHYQ/x00drce/
+j2yqyK9cdLs73aoYJTGgtit0va7xPeHMgwOuxnCDh2W+6xDp6hczr4RSIqjSpYAP
+WE2dkUWzM3ewaAuVlAvsRGhZWAKgb5xlVrZ/isSOBabmSDh79IenTC3xSewWlV4K
+Pw3DtgtYHBazj7P9fD8TjpLkbnk8kgxb0hiYKm2ZbxraDovTVjiB/UEHFlqH4GFv
+Gu+NDxshAgMBAAECggEAU4wzsxiSF41huLugW6/L8cA+yHwgKFYQ1do97wQQGJPh
+6zjwqjny+kikzlXnXtP5XmY2DTbWN/zuLIGOlKIRdLK862YiXBm9dzrPwFUe9BqI
+ojCupTQz1nHE1owNJGtU5lUM7jXgW6oTkc+iVYa+gtK864a+IleWimVn2E/pOlLo
+RzEI3SVRgy/6ILj2wBxeFZHSQObZe4XOW64boJZPAE5bjX+Z5siOIfoxBNuPom2+
+mVb9ijrOAuOY3AyE67G/pWhPODAs7Xv3Nt0d7Yd8r6qXYBnzY0EYzsHfHi89rjZY
+jElqQ0uyzrG6OcPmcQoxWgvNzUxpPxPCTNvUkO4y5QKBgQDyfenUqH0WIcgSgUaq
+xlM8i3u2xpRPFbchOGAKko9D1ihQ8icWh4XHW7VJDj9Dj4t2cu5t4XkX74IslsBL
+7g35kmoYldX2yJX6LRyfjN49gAyRyiGo2UNFCX15DW+gaJQx1E9z7trSiSZDn/T6
+GVGJwVExBWnBIgGul839LTsHZwKBgQDVU0p08bBtz4XtqeaTFIw0dN2FalconZeT
+PDud/Znc6xiyuJTaKyXiPBBE7TCwdCKv89sa1dw5OX0LfhwAaDrKJol/mSekMUnk
+eaUHa9BfSFfsE58Z3b6LR3Gi8ZSjPkLz/cKT25l/lEF9Mu21hKPIUqjHJQRLxvlzc
+NwKBgQDhh9wnrkEQiYDEPToVcPlPcUcxukWLvF2jZwRkMOVQKWk7x8w09vykaxYT
+iU2rr2D9XG2HAtKWQWsnv1nABPs4aEWG8iybJvneQYDCn8i/GE4Ydg+SM+eN2QK6
+yJVOcpWKNrVi1P7uGyLceHPm/A9K+OJjnm46cz9vO78Yvq2M9wKBgBI3Fnh92q7F
+tY3hoAqXCpHAGNoyKffoH5c13y1Hsg3sG+BJA41FNrN4Afw/z8eGdWI20t13zBfB
+ip4cGGCgybkEcgHHl38hGkczsG6Y7DaojjL//Li3n8N/dvbj1WdOBrNvf9iZZ0n4
+eF2Mtkt85mZK6sANGv6gubeRkuiJdKxpAoGAMbZnGb9gTM+NYOUUG/Y2gH9BTiHE
+uXpLdGi47B/2YVzmmxI2UNs5DB56SZAiIoRRWjwq95cDtEOWPm9LUeUbiYYQ+yuU
+4+6EG4w6A1jBS8RYAmO0NY4ic9syFkLv9ecmikqH2cJW1MKbhvJ2URm4YLz7Qq3T
+rM5I2qNmnZbm+28=
+-----END PRIVATE KEY-----""",
     "client_email": "n8n-youtube@hieutrung.iam.gserviceaccount.com",
     "client_id": "102538454054650566316",
     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
@@ -109,7 +135,6 @@ project_info = {
     "visual_style": "",
 }
 
-# Tự động đọc thông tin dự án từ hàng đầu tiên trong Sheet
 if not df.empty:
   first_row = df.iloc[0]
   for key in project_info.keys():
@@ -133,7 +158,6 @@ def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
 
   for attempt in range(1, retries + 1):
     try:
-      # Ép buộc đồng bộ lại giờ hệ thống trước mỗi lần tạo Service Account Client
       sync_system_time()
 
       scopes = ["https://www.googleapis.com/auth/drive"]
@@ -190,15 +214,47 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. KHỞI TẠO MODEL LTX-VIDEO
+# 3. KHỞI TẠO TỰ ĐỘNG MODEL LTX-VIDEO
 # -------------------------------------------------------------------
-print("\n🧠 3. TẢI MODEL LTX-VIDEO...")
+print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
+
 try:
+  # 1. Kiểm tra từ Dataset
+  if os.path.exists(DATASET_MODEL_PATH):
+    print(
+        f"⚡ Tìm thấy Model từ Kaggle Dataset ({DATASET_MODEL_PATH}). Đang"
+        " load siêu tốc..."
+    )
+    model_source = DATASET_MODEL_PATH
+  # 2. Kiểm tra từ Working Folder
+  elif os.path.exists(WORKING_MODEL_PATH):
+    print(
+        f"⚡ Tìm thấy Model từ thư mục local ({WORKING_MODEL_PATH}). Đang"
+        " load..."
+    )
+    model_source = WORKING_MODEL_PATH
+  # 3. Nếu chưa có thì tải trực tiếp từ HuggingFace
+  else:
+    print(
+        "⏳ Chưa thấy Dataset hay Model Local. Đang tải từ HuggingFace"
+        " (Lightricks/LTX-Video)..."
+    )
+    model_source = "Lightricks/LTX-Video"
+
   pipe = LTXPipeline.from_pretrained(
-      "Lightricks/LTX-Video",
+      model_source,
       torch_dtype=torch.bfloat16,
       low_cpu_mem_usage=True,
   )
+
+  # Nếu tải từ HF lần đầu, tự động lưu lại working dir phòng trường hợp chạy tiếp trong cùng session
+  if model_source == "Lightricks/LTX-Video":
+    print(
+        f"💾 Đang lưu bản backup vào '{WORKING_MODEL_PATH}' cho các lần chạy"
+        " cùng session..."
+    )
+    pipe.save_pretrained(WORKING_MODEL_PATH)
+
   pipe.enable_sequential_cpu_offload()
   pipe.vae.enable_tiling()
   pipe.vae.enable_slicing()
@@ -215,7 +271,6 @@ except Exception as e:
 rendered_files = []
 
 for index, row in df.iterrows():
-  # Ưu tiên lấy scene_index từ cột Sheet, nếu rỗng sẽ tự lấy theo số thứ tự hàng
   scene_idx_val = row.get("scene_index")
   if pd.notna(scene_idx_val):
     scene_index = int(scene_idx_val)
