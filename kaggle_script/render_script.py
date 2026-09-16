@@ -72,7 +72,7 @@ GOOGLE_SHEET_CSV_URL = (
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
 # Dataset Slug của bạn trên Kaggle
-KAGGLE_DATASET_SLUG = "hieutrung/ltx-video-weights"
+KAGGLE_DATASET_SLUG = "ohieutrungo/ltx-video-weights"
 DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
 WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
 
