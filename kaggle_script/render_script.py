@@ -62,7 +62,7 @@ print("✅ Cài đặt môi trường thành công!")
 # CONFIGURATION & PARSE THÔNG TIN DỰ ÁN TỪ N8N
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = (
-    "https://n8n-latest-namx.onrender.com/webhook-test/kaggle-video-done"
+    "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 )
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = (
