@@ -37,10 +37,12 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         run: |
-          echo "$GOOGLE_SERVICE_ACCOUNT" > service_account.json
-          echo "✅ Đã tạo file service_account.json"
+          mkdir -p kaggle_script
+          echo "$GOOGLE_SERVICE_ACCOUNT" > kaggle_script/service_account.json
+          echo "✅ Đã tạo file kaggle_script/service_account.json"
+          ls -la kaggle_script/
 
-      - name: Generate Dynamic Slug (tuỳ chọn)
+      - name: Generate Dynamic Slug
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
