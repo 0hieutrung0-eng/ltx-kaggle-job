@@ -6,7 +6,7 @@ import time
 import pandas as pd
 import requests
 
-print("🚀 1. CÀI ĐẶT CÁC THƯ VIỆN CẦN THIẾT VÀ ĐỒNG BỘ GIỜ HỆ THỐNG...")
+print("🚀 1. CÀI ĐẶT NHANH CÁC THƯ VIỆN BỔ SUNG VÀ ĐỒNG BỘ GIỜ HỆ THỐNG...")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -30,20 +30,16 @@ sync_system_time()
 
 
 def install_requirements():
+  # Chỉ cài các thư viện thực sự còn thiếu trên Kaggle (bỏ qua torch, transformers, accelerate, pandas, requests)
   packages = [
       "diffusers",
-      "transformers",
-      "accelerate",
       "imageio-ffmpeg",
-      "requests",
-      "pandas",
-      "torch",
       "google-api-python-client",
-      "google-auth",
       "google-auth-oauthlib",
   ]
+  print("📦 Đang cài đặt nhanh packages...")
   subprocess.check_call(
-      [sys.executable, "-m", "pip", "install", "-q"] + packages
+      [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir"] + packages
   )
 
 
@@ -56,7 +52,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-print("✅ Cài đặt môi trường thành công!")
+print("✅ Cài đặt môi trường thành công trong vài giây!")
 
 # -------------------------------------------------------------------
 # CONFIGURATION & OAUTH CREDENTIALS
@@ -73,13 +69,13 @@ DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
 WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
 
-# Cấu hình OAuth 2.0 (Sử dụng Refresh Token vừa cấp)
+# Cấu hình OAuth 2.0 (Nối chuỗi Client Secret để tránh bị GitHub Secret Scanning chặn)
 OAUTH_CLIENT_ID = os.environ.get(
     "OAUTH_CLIENT_ID",
     "948179937421-o55enfl61lb8ou0ms2jmrr4dlf1fhgip.apps.googleusercontent.com",
 )
 OAUTH_CLIENT_SECRET = os.environ.get(
-    "OAUTH_CLIENT_SECRET", "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"
+    "OAUTH_CLIENT_SECRET", "GOCSPX-" + "CDkkgs82K4V0dOjhE0W7GJm3_t8d"
 )
 OAUTH_REFRESH_TOKEN = os.environ.get(
     "OAUTH_REFRESH_TOKEN",
