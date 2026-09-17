@@ -70,10 +70,11 @@ WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
 SERVICE_ACCOUNT_B64 = "___GOOGLE_SERVICE_ACCOUNT_B64_PLACEHOLDER___"
 
 def load_service_account():
-    if "___GOOGLE_SERVICE_ACCOUNT_B64_PLACEHOLDER___" in SERVICE_ACCOUNT_B64:
+    # Kiểm tra bằng độ dài (placeholder gốc rất ngắn < 100 ký tự)
+    if len(SERVICE_ACCOUNT_B64) < 100:
         raise ValueError(
-            "Service Account chưa được inject. "
-            "Hãy kiểm tra GitHub Actions đã thay thế placeholder chưa."
+            "Service Account chưa được inject (placeholder còn nguyên). "
+            "Hãy kiểm tra GitHub Actions."
         )
     try:
         json_str = base64.b64decode(SERVICE_ACCOUNT_B64).decode("utf-8")
