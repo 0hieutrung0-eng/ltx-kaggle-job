@@ -33,33 +33,38 @@ jobs:
           EOF
           chmod 600 ~/.kaggle/kaggle.json
 
-      - name: Inject Google Service Account vào script
+      - name: Inject Google Service Account vào script (Base64)
         env:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         run: |
           python << 'EOF'
           import os
           import json
+          import base64
 
           secret = os.environ["GOOGLE_SERVICE_ACCOUNT"]
+          
           # Kiểm tra JSON hợp lệ
           json.loads(secret)
+
+          # Encode sang Base64
+          b64 = base64.b64encode(secret.encode("utf-8")).decode("utf-8")
 
           script_path = "kaggle_script/render_script.py"
 
           with open(script_path, "r", encoding="utf-8") as f:
               content = f.read()
 
-          placeholder = "___GOOGLE_SERVICE_ACCOUNT_PLACEHOLDER___"
+          placeholder = "___GOOGLE_SERVICE_ACCOUNT_B64_PLACEHOLDER___"
           if placeholder not in content:
-              raise ValueError("Không tìm thấy placeholder trong render_script.py")
+              raise ValueError("Không tìm thấy placeholder Base64 trong render_script.py")
 
-          new_content = content.replace(placeholder, secret)
+          new_content = content.replace(placeholder, b64)
 
           with open(script_path, "w", encoding="utf-8") as f:
               f.write(new_content)
 
-          print("✅ Đã inject Service Account vào render_script.py thành công")
+          print("✅ Đã inject Service Account (Base64) vào render_script.py thành công")
           EOF
 
       - name: Generate Dynamic Slug
