@@ -3,10 +3,17 @@ import os
 import subprocess
 import sys
 import time
+
+# Khởi tạo Date Stamp dùng chung cho toàn bộ phiên chạy này (Chỉ bao gồm Ngày Tháng Năm: YYYYMMDD)
+RUN_DATE = time.strftime("%Y%m%d")
+
 import pandas as pd
 import requests
 
-print("🚀 1. CÀI ĐẶT NHANH CÁC THƯ VIỆN BỔ SUNG VÀ ĐỒNG BỘ GIỜ HỆ THỐNG...")
+print(
+    f"🚀 1. KHỞI TẠO PHIÊN RENDER NGÀY [{RUN_DATE}] - CÀI ĐẶT THƯ VIỆN & ĐỒNG BỘ"
+    " GIỜ..."
+)
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -30,12 +37,13 @@ sync_system_time()
 
 
 def install_requirements():
-  # Chỉ cài các thư viện thực sự còn thiếu trên Kaggle (bỏ qua torch, transformers, accelerate, pandas, requests)
+  # Chỉ cài các thư viện thực sự còn thiếu trên Kaggle
   packages = [
       "diffusers",
       "imageio-ffmpeg",
       "google-api-python-client",
       "google-auth-oauthlib",
+      "huggingface_hub",
   ]
   print("📦 Đang cài đặt nhanh packages...")
   subprocess.check_call(
@@ -52,10 +60,10 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-print("✅ Cài đặt môi trường thành công trong vài giây!")
+print("✅ Cài đặt môi trường thành công!")
 
 # -------------------------------------------------------------------
-# CONFIGURATION & OAUTH CREDENTIALS
+# CONFIGURATION & CREDENTIALS
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = (
     "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
@@ -68,6 +76,8 @@ DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
 DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
 WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
+
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 # Cấu hình OAuth 2.0 (Nối chuỗi Client Secret để tránh bị GitHub Secret Scanning chặn)
 OAUTH_CLIENT_ID = os.environ.get(
@@ -192,35 +202,39 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. KHỞI TẠO MODEL LTX-VIDEO (TẢI TRỰC TIẾP HUGGINGFACE)
+# 3. KHỞI TẠO MODEL LTX-VIDEO (CHỈ CHẠY 1 LẦN DUY NHẤT)
 # -------------------------------------------------------------------
 print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 
 try:
-  if os.path.exists(DATASET_MODEL_PATH):
+  if os.path.exists(WORKING_MODEL_PATH):
+    print(f"⚡ Đã có Model sao chép trên ổ NVMe local ({WORKING_MODEL_PATH})...")
+    model_source = WORKING_MODEL_PATH
+    token_param = None
+  elif os.path.exists(DATASET_MODEL_PATH):
     print(f"⚡ Tìm thấy Model từ Kaggle Dataset ({DATASET_MODEL_PATH})...")
     model_source = DATASET_MODEL_PATH
-  elif os.path.exists(WORKING_MODEL_PATH):
-    print(f"⚡ Tìm thấy Model từ thư mục local ({WORKING_MODEL_PATH})...")
-    model_source = WORKING_MODEL_PATH
+    token_param = None
   else:
     print("⏳ Tải trực tiếp từ HuggingFace (Lightricks/LTX-Video)...")
     model_source = "Lightricks/LTX-Video"
+    token_param = HF_TOKEN if HF_TOKEN.startswith("hf_") else None
 
   pipe = LTXPipeline.from_pretrained(
       model_source,
       torch_dtype=torch.bfloat16,
       low_cpu_mem_usage=True,
+      token=token_param,
   )
 
   if model_source == "Lightricks/LTX-Video":
-    print(f"💾 Đang lưu bản backup vào '{WORKING_MODEL_PATH}'...")
+    print(f"💾 Đang lưu bản backup local vào '{WORKING_MODEL_PATH}'...")
     pipe.save_pretrained(WORKING_MODEL_PATH)
 
   pipe.enable_sequential_cpu_offload()
   pipe.vae.enable_tiling()
   pipe.vae.enable_slicing()
-  print("✅ Load Model LTX-Video thành công!")
+  print("✅ Load Model LTX-Video thành công! Chuẩn bị render toàn bộ cảnh...")
 
 except Exception as e:
   send_n8n_final_webhook(
@@ -229,7 +243,7 @@ except Exception as e:
   sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. RENDER VÀ LƯU TỪNG CẢNH
+# 4. RENDER VÀ LƯU TỪNG CẢNH (CHỈ KÈM NGÀY THÁNG)
 # -------------------------------------------------------------------
 rendered_files = []
 
@@ -244,21 +258,26 @@ for index, row in df.iterrows():
   negative_prompt = str(
       row.get("negative_prompt", "worst quality, low quality, blurry")
   ).strip()
-  filename = f"scene_{scene_index:03d}.mp4"
+
+  # Đặt tên file chỉ kèm theo ngày: scene_001_20260917.mp4
+  filename = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
   if not prompt or prompt.lower() == "nan":
     continue
 
   if os.path.exists(filename) and os.path.getsize(filename) > 0:
     print(
-        f"\n⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local, tiến hành"
-        " upload lại..."
+        f"\n⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local ({filename}),"
+        " tiến hành upload lại..."
     )
     upload_file_to_drive_fresh(filename, DRIVE_FOLDER_ID)
     rendered_files.append(filename)
     continue
 
-  print(f"\n🎬 [{scene_index}/{total_scenes}] Đang render cảnh {scene_index}...")
+  print(
+      f"\n🎬 [{scene_index}/{total_scenes}] Đang render cảnh {scene_index}"
+      f" ({filename})..."
+  )
 
   try:
     video_frames = pipe(
@@ -287,7 +306,7 @@ for index, row in df.iterrows():
     torch.cuda.empty_cache()
 
 # -------------------------------------------------------------------
-# 5. GỘP VIDEO FULL & BẮN THÔNG TIN HOÀN CHỈNH VỀ N8N
+# 5. GỘP VIDEO FULL (KÈM NGÀY THÁNG) & BẮN WEBHOOK N8N
 # -------------------------------------------------------------------
 print("\n🎞️ 5. BẮT ĐẦU GỘP TẤT CẢ CẢNH THÀNH VIDEO HOÀN CHỈNH...")
 
@@ -296,7 +315,8 @@ if rendered_files:
     for file in rendered_files:
       f.write(f"file '{file}'\n")
 
-  final_output = "final_output_full.mp4"
+  # File tổng đính kèm ngày chạy
+  final_output = f"final_output_full_{RUN_DATE}.mp4"
   concat_cmd = (
       f"ffmpeg -f concat -safe 0 -i file_list.txt -c copy {final_output} -y"
   )
