@@ -64,34 +64,22 @@ DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
 WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
 
 # -------------------------------------------------------------------
-# LOAD SERVICE ACCOUNT
+# LOAD SERVICE ACCOUNT (được inject bởi GitHub Actions)
 # -------------------------------------------------------------------
+SERVICE_ACCOUNT_JSON_STR = """___GOOGLE_SERVICE_ACCOUNT_PLACEHOLDER___"""
+
 def load_service_account():
-    possible_paths = [
-        "service_account.json",
-        "kaggle_script/service_account.json",
-        "/kaggle/working/service_account.json",
-        "/kaggle/working/kaggle_script/service_account.json",
-        "./service_account.json",
-        "/kaggle/src/service_account.json",
-    ]
-    
-    for path in possible_paths:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                data = json.load(f)
-            print(f"✅ Đã load Service Account từ: {path}")
-            return data
-    
-    print("📂 Các file hiện có trong thư mục hiện tại:")
-    for root, dirs, files in os.walk("."):
-        for file in files:
-            print(f"   - {os.path.join(root, file)}")
-    
-    raise FileNotFoundError(
-        "Không tìm thấy file service_account.json. "
-        "Hãy kiểm tra GitHub Actions đã inject secret vào thư mục kaggle_script chưa."
-    )
+    if "___GOOGLE_SERVICE_ACCOUNT_PLACEHOLDER___" in SERVICE_ACCOUNT_JSON_STR:
+        raise ValueError(
+            "Service Account chưa được inject. "
+            "Hãy kiểm tra GitHub Actions đã thay thế placeholder chưa."
+        )
+    try:
+        data = json.loads(SERVICE_ACCOUNT_JSON_STR)
+        print("✅ Đã load Service Account từ placeholder (injected bởi GitHub Actions)")
+        return data
+    except Exception as e:
+        raise ValueError(f"Lỗi parse Service Account JSON: {e}")
 
 SERVICE_ACCOUNT_INFO = load_service_account()
 
