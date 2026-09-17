@@ -64,13 +64,16 @@ DATASET_MODEL_PATH = "/kaggle/input/ltx-video-weights/LTX-Video-Local"
 WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
 
 # -------------------------------------------------------------------
-# LOAD SERVICE ACCOUNT TỪ FILE (được inject bởi GitHub Actions)
+# LOAD SERVICE ACCOUNT
 # -------------------------------------------------------------------
 def load_service_account():
     possible_paths = [
         "service_account.json",
+        "kaggle_script/service_account.json",
         "/kaggle/working/service_account.json",
+        "/kaggle/working/kaggle_script/service_account.json",
         "./service_account.json",
+        "/kaggle/src/service_account.json",
     ]
     
     for path in possible_paths:
@@ -80,9 +83,14 @@ def load_service_account():
             print(f"✅ Đã load Service Account từ: {path}")
             return data
     
+    print("📂 Các file hiện có trong thư mục hiện tại:")
+    for root, dirs, files in os.walk("."):
+        for file in files:
+            print(f"   - {os.path.join(root, file)}")
+    
     raise FileNotFoundError(
         "Không tìm thấy file service_account.json. "
-        "Hãy kiểm tra GitHub Actions đã inject secret chưa."
+        "Hãy kiểm tra GitHub Actions đã inject secret vào thư mục kaggle_script chưa."
     )
 
 SERVICE_ACCOUNT_INFO = load_service_account()
