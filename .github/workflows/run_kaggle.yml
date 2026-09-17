@@ -19,63 +19,31 @@ jobs:
       - name: Install Kaggle CLI
         run: pip install kaggle
 
-      - name: Configure Kaggle Credentials
+      - name: Configure Credentials & Generate Dynamic Slug
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
+          # 1. Tạo file xác thực Kaggle API
           mkdir -p ~/.kaggle
-          cat > ~/.kaggle/kaggle.json << EOF
-          {
-            "username": "$KAGGLE_USERNAME",
-            "key": "$KAGGLE_KEY"
+          python -c "
+          import os, json
+          creds = {
+              'username': os.environ['KAGGLE_USERNAME'],
+              'key': os.environ['KAGGLE_KEY']
           }
-          EOF
+          with open('/os_home/.kaggle/kaggle.json'.replace('/os_home', os.path.expanduser('~')), 'w') as f:
+              json.dump(creds, f)
+          "
           chmod 600 ~/.kaggle/kaggle.json
 
-      - name: Inject Google Service Account vào script (Base64)
-        env:
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-        run: |
-          python << 'EOF'
-          import os
-          import json
-          import base64
-
-          secret = os.environ["GOOGLE_SERVICE_ACCOUNT"]
-          
-          # Kiểm tra JSON hợp lệ
-          json.loads(secret)
-
-          # Encode sang Base64
-          b64 = base64.b64encode(secret.encode("utf-8")).decode("utf-8")
-
-          script_path = "kaggle_script/render_script.py"
-
-          with open(script_path, "r", encoding="utf-8") as f:
-              content = f.read()
-
-          placeholder = "___GOOGLE_SERVICE_ACCOUNT_B64_PLACEHOLDER___"
-          if placeholder not in content:
-              raise ValueError("Không tìm thấy placeholder Base64 trong render_script.py")
-
-          new_content = content.replace(placeholder, b64)
-
-          with open(script_path, "w", encoding="utf-8") as f:
-              f.write(new_content)
-
-          print("✅ Đã inject Service Account (Base64) vào render_script.py thành công")
-          EOF
-
-      - name: Generate Dynamic Slug
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-        run: |
+          # 2. Tạo Slug mới theo Ngày-Giờ-Phút
           TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
           DYNAMIC_SLUG="ltx-render-$TIMESTAMP"
           
           echo "--> Generating new notebook ID: $KAGGLE_USERNAME/$DYNAMIC_SLUG"
           
+          # 3. Ghi đè ID mới vào kernel-metadata.json
           python -c "
           import json, os
           username = os.environ['KAGGLE_USERNAME']
