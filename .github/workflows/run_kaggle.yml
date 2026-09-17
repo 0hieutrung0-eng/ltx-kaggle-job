@@ -33,14 +33,34 @@ jobs:
           EOF
           chmod 600 ~/.kaggle/kaggle.json
 
-      - name: Inject Google Service Account
+      - name: Inject Google Service Account vào script
         env:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         run: |
-          mkdir -p kaggle_script
-          echo "$GOOGLE_SERVICE_ACCOUNT" > kaggle_script/service_account.json
-          echo "✅ Đã tạo file kaggle_script/service_account.json"
-          ls -la kaggle_script/
+          python << 'EOF'
+          import os
+          import json
+
+          secret = os.environ["GOOGLE_SERVICE_ACCOUNT"]
+          # Kiểm tra JSON hợp lệ
+          json.loads(secret)
+
+          script_path = "kaggle_script/render_script.py"
+
+          with open(script_path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          placeholder = "___GOOGLE_SERVICE_ACCOUNT_PLACEHOLDER___"
+          if placeholder not in content:
+              raise ValueError("Không tìm thấy placeholder trong render_script.py")
+
+          new_content = content.replace(placeholder, secret)
+
+          with open(script_path, "w", encoding="utf-8") as f:
+              f.write(new_content)
+
+          print("✅ Đã inject Service Account vào render_script.py thành công")
+          EOF
 
       - name: Generate Dynamic Slug
         env:
