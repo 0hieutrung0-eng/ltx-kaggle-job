@@ -283,11 +283,11 @@ for index, row in df.iterrows():
     video_frames = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
-        width=640,
-        height=384,
+        width=768,
+        height=512,
         num_frames=65,
-        num_inference_steps=15,
-        guidance_scale=3.0,
+        num_inference_steps=20,
+        guidance_scale=3.5,
     ).frames[0]
 
     export_to_video(video_frames, filename, fps=24)
