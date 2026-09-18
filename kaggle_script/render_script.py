@@ -4,7 +4,7 @@ import subprocess
 import sys
 import time
 
-# Khởi tạo Date Stamp dùng chung cho toàn bộ phiên chạy này (Chỉ bao gồm Ngày Tháng Năm: YYYYMMDD)
+# Khởi tạo Date Stamp (YYYYMMDD)
 RUN_DATE = time.strftime("%Y%m%d")
 
 import pandas as pd
@@ -37,7 +37,6 @@ sync_system_time()
 
 
 def install_requirements():
-  # Chỉ cài các thư viện thực sự còn thiếu trên Kaggle
   packages = [
       "diffusers",
       "imageio-ffmpeg",
@@ -143,15 +142,6 @@ print(f"🏰 Thiết kế Bối cảnh : {project_info['world_setting']}")
 print(f"🎨 Phong cách        : {project_info['visual_style']}")
 print("==================================================")
 
-# 🛠️ NÂNG CẤP 1: TỰ ĐỘNG TẠO CONTEXT NỀN CHO CẢNH (CỐ ĐỊNH NHÂN VẬT & BỐI CẢNH)
-context_prefix = ""
-if project_info["character_design"]:
-    context_prefix += f"Character: {project_info['character_design']}. "
-if project_info["world_setting"]:
-    context_prefix += f"Setting: {project_info['world_setting']}. "
-if project_info["visual_style"]:
-    context_prefix += f"Style: {project_info['visual_style']}. "
-
 
 def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
   file_name = os.path.basename(file_path)
@@ -252,7 +242,7 @@ except Exception as e:
   sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. RENDER VÀ LƯU TỪNG CẢNH (CHỈ KÈM NGÀY THÁNG)
+# 4. RENDER VÀ LƯU TỪNG CẢNH (DÙNG PROMPT GỐC & SEED ĐỘNG)
 # -------------------------------------------------------------------
 rendered_files = []
 
@@ -263,14 +253,15 @@ for index, row in df.iterrows():
   else:
     scene_index = index + 1
 
-  raw_prompt = str(row.get("prompt", "")).strip()
+  # Dùng trực tiếp prompt từ Google Sheet (Không ghép context_prefix để không bị phình token)
+  prompt = str(row.get("prompt", "")).strip()
   negative_prompt = str(
       row.get("negative_prompt", "worst quality, low quality, blurry")
   ).strip()
 
   filename = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
-  if not raw_prompt or raw_prompt.lower() == "nan":
+  if not prompt or prompt.lower() == "nan":
     continue
 
   if os.path.exists(filename) and os.path.getsize(filename) > 0:
@@ -282,10 +273,7 @@ for index, row in df.iterrows():
     rendered_files.append(filename)
     continue
 
-  # 🛠️ NÂNG CẤP 2: GHẾP PROMPT CẢNH + THÔNG TIN NHÂN VẬT CỐ ĐỊNH (Hành động đặt lên đầu)
-  full_prompt = f"{raw_prompt}. {context_prefix}"
-
-  # 🛠️ NÂNG CẤP 3: TẠO SEED BIẾN THIÊN THEO CẢNH
+  # Tạo seed động thay đổi theo từng cảnh để tránh lặp hình ảnh
   scene_seed = 42 + scene_index
   generator = torch.Generator(device="cuda").manual_seed(scene_seed)
 
@@ -293,19 +281,18 @@ for index, row in df.iterrows():
       f"\n🎬 [{scene_index}/{total_scenes}] Đang render cảnh {scene_index}"
       f" ({filename})..."
   )
-  print(f"🌱 Seed: {scene_seed} | 📝 Prompt: {full_prompt[:100]}...")
+  print(f"🌱 Seed: {scene_seed} | 📝 Prompt: {prompt[:100]}...")
 
   try:
     video_frames = pipe(
-        prompt=full_prompt,
+        prompt=prompt,
         negative_prompt=negative_prompt,
         width=768,
         height=512,
         num_frames=70,
         num_inference_steps=18,
-        max_sequence_length=256,  # 🛠️ NÂNG CẤP 4: Tránh cắt ngắn prompt dài
         guidance_scale=3.5,
-        generator=generator,     # 🛠️ NÂNG CẤP 5: Gắn Seed riêng biệt
+        generator=generator,
     ).frames[0]
 
     export_to_video(video_frames, filename, fps=24)
@@ -324,7 +311,7 @@ for index, row in df.iterrows():
     torch.cuda.empty_cache()
 
 # -------------------------------------------------------------------
-# 5. GỘP VIDEO FULL (KÈM NGÀY THÁNG) & BẮN WEBHOOK N8N
+# 5. GỘP VIDEO FULL & BẮN WEBHOOK N8N
 # -------------------------------------------------------------------
 print("\n🎞️ 5. BẮT ĐẦU GỘP TẤT CẢ CẢNH THÀNH VIDEO HOÀN CHỈNH...")
 
