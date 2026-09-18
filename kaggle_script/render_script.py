@@ -4,7 +4,7 @@ import subprocess
 import sys
 import time
 
-# Khởi tạo Date Stamp dùng chung cho toàn bộ phiên chạy này (Định dạng: YYYYMMDD)
+# Khởi tạo Date Stamp dùng chung cho toàn bộ phiên chạy này (Chỉ bao gồm Ngày Tháng Năm: YYYYMMDD)
 RUN_DATE = time.strftime("%Y%m%d")
 
 import pandas as pd
@@ -68,10 +68,6 @@ print("✅ Cài đặt môi trường thành công!")
 N8N_WEBHOOK_URL = (
     "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 )
-N8N_TEST_WEBHOOK_URL = (
-    "https://n8n-latest-namx.onrender.com/webhook-test/kaggle-video-done"
-)
-
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
@@ -83,7 +79,7 @@ WORKING_MODEL_PATH = "/kaggle/working/LTX-Video-Local"
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-# Cấu hình OAuth 2.0 (Nối chuỗi Client Secret để tránh bị GitHub Secret Scanning chặn)
+# Cấu hình OAuth 2.0
 OAUTH_CLIENT_ID = os.environ.get(
     "OAUTH_CLIENT_ID",
     "948179937421-o55enfl61lb8ou0ms2jmrr4dlf1fhgip.apps.googleusercontent.com",
@@ -140,12 +136,21 @@ if not df.empty:
 
 print("==================================================")
 print("🎬 THÔNG TIN DỰ ÁN (Đọc từ Google Sheets):")
-print(f"📌 Tiêu đề           : {project_info['title']}")
-print(f"🏷️ Thể loại          : {project_info['genre']}")
+print(f"📌 Tiêu đề             : {project_info['title']}")
+print(f"🏷️ Thể loại           : {project_info['genre']}")
 print(f"👤 Thiết kế Nhân vật : {project_info['character_design']}")
 print(f"🏰 Thiết kế Bối cảnh : {project_info['world_setting']}")
 print(f"🎨 Phong cách        : {project_info['visual_style']}")
 print("==================================================")
+
+# 🛠️ NÂNG CẤP 1: TỰ ĐỘNG TẠO CONTEXT NỀN CHO CẢNH (CỐ ĐỊNH NHÂN VẬT & BỐI CẢNH)
+context_prefix = ""
+if project_info["character_design"]:
+    context_prefix += f"Character: {project_info['character_design']}. "
+if project_info["world_setting"]:
+    context_prefix += f"Setting: {project_info['world_setting']}. "
+if project_info["visual_style"]:
+    context_prefix += f"Style: {project_info['visual_style']}. "
 
 
 def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
@@ -198,29 +203,15 @@ def send_n8n_final_webhook(
       "world_setting": project_info["world_setting"],
       "visual_style": project_info["visual_style"],
   }
-
-  # Gửi tới Webhook Production
   try:
     res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
-    print(
-        f"📡 [FINAL WEBHOOK PRODUCTION {status.upper()}] HTTP {res.status_code}"
-    )
+    print(f"📡 [FINAL WEBHOOK {status.upper()}] HTTP {res.status_code}")
   except Exception as e:
-    print(f"❌ Lỗi gửi Webhook Production về n8n: {str(e)}")
-
-  # Gửi tới Webhook Test (Đoạn Node test trên n8n)
-  try:
-    res_test = requests.post(N8N_TEST_WEBHOOK_URL, json=payload, timeout=60)
-    print(
-        f"🧪 [FINAL WEBHOOK TEST NODE {status.upper()}] HTTP"
-        f" {res_test.status_code}"
-    )
-  except Exception as e:
-    print(f"⚠️ Lỗi gửi Webhook Test về n8n: {str(e)}")
+    print(f"❌ Lỗi gửi Webhook về n8n: {str(e)}")
 
 
 # -------------------------------------------------------------------
-# 3. KHỞI TẠO MODEL LTX-VIDEO (CHUYỂN SANG MODEL CPU OFFLOAD DẠNG KHỐI)
+# 3. KHỞI TẠO MODEL LTX-VIDEO (CHỈ CHẠY 1 LẦN DUY NHẤT)
 # -------------------------------------------------------------------
 print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 
@@ -249,8 +240,7 @@ try:
     print(f"💾 Đang lưu bản backup local vào '{WORKING_MODEL_PATH}'...")
     pipe.save_pretrained(WORKING_MODEL_PATH)
 
-  # Dùng enable_model_cpu_offload() giúp nạp model nhanh gấp 10 lần (~30s thay vì 400s)
-  pipe.enable_model_cpu_offload()
+  pipe.enable_sequential_cpu_offload()
   pipe.vae.enable_tiling()
   pipe.vae.enable_slicing()
   print("✅ Load Model LTX-Video thành công! Chuẩn bị render toàn bộ cảnh...")
@@ -262,12 +252,9 @@ except Exception as e:
   sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. RENDER VÀ LƯU TỪNG CẢNH (NÂNG CẤP HD 720P & GIỮ TÍNH NHẤT QUÁN CÁC CẢNH)
+# 4. RENDER VÀ LƯU TỪNG CẢNH (CHỈ KÈM NGÀY THÁNG)
 # -------------------------------------------------------------------
 rendered_files = []
-
-# Khởi tạo Generator với Seed cố định để giữ nhất quán gương mặt & phong cách
-FIXED_SEED = 42
 
 for index, row in df.iterrows():
   scene_idx_val = row.get("scene_index")
@@ -278,30 +265,13 @@ for index, row in df.iterrows():
 
   raw_prompt = str(row.get("prompt", "")).strip()
   negative_prompt = str(
-      row.get(
-          "negative_prompt",
-          "worst quality, low quality, blurry, deformed, inconsistent"
-          " character",
-      )
+      row.get("negative_prompt", "worst quality, low quality, blurry")
   ).strip()
 
-  # Đặt tên file đính kèm ngày tháng: scene_001_20260918.mp4
   filename = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
   if not raw_prompt or raw_prompt.lower() == "nan":
     continue
-
-  # Tự động kết hợp Thông tin dự án vào Prompt từng cảnh để nhân vật và bối cảnh nhất quán
-  prompt_components = []
-  if project_info["character_design"]:
-    prompt_components.append(f"Character: {project_info['character_design']}")
-  if project_info["world_setting"]:
-    prompt_components.append(f"Setting: {project_info['world_setting']}")
-  prompt_components.append(raw_prompt)
-  if project_info["visual_style"]:
-    prompt_components.append(f"Style: {project_info['visual_style']}")
-
-  full_prompt = ", ".join(prompt_components)
 
   if os.path.exists(filename) and os.path.getsize(filename) > 0:
     print(
@@ -312,25 +282,30 @@ for index, row in df.iterrows():
     rendered_files.append(filename)
     continue
 
+  # 🛠️ NÂNG CẤP 2: GHẾP PROMPT CẢNH + THÔNG TIN NHÂN VẬT CỐ ĐỊNH (Hành động đặt lên đầu)
+  full_prompt = f"{raw_prompt}. {context_prefix}"
+
+  # 🛠️ NÂNG CẤP 3: TẠO SEED BIẾN THIÊN THEO CẢNH
+  scene_seed = 42 + scene_index
+  generator = torch.Generator(device="cuda").manual_seed(scene_seed)
+
   print(
       f"\n🎬 [{scene_index}/{total_scenes}] Đang render cảnh {scene_index}"
       f" ({filename})..."
   )
-  print(f"📝 Prompt tối ưu: {full_prompt}")
+  print(f"🌱 Seed: {scene_seed} | 📝 Prompt: {full_prompt[:100]}...")
 
   try:
-    generator = torch.Generator(device="cuda").manual_seed(FIXED_SEED)
-
-    # Nâng cấp độ phân giải lên 768x512 (Chuẩn HD) & 20 steps khử nhiễu sắc nét
     video_frames = pipe(
         prompt=full_prompt,
         negative_prompt=negative_prompt,
         width=768,
         height=512,
-        num_frames=65,
-        num_inference_steps=20,
+        num_frames=70,
+        num_inference_steps=18,
+        max_sequence_length=256,  # 🛠️ NÂNG CẤP 4: Tránh cắt ngắn prompt dài
         guidance_scale=3.5,
-        generator=generator,
+        generator=generator,     # 🛠️ NÂNG CẤP 5: Gắn Seed riêng biệt
     ).frames[0]
 
     export_to_video(video_frames, filename, fps=24)
@@ -358,7 +333,6 @@ if rendered_files:
     for file in rendered_files:
       f.write(f"file '{file}'\n")
 
-  # File tổng đính kèm ngày chạy
   final_output = f"final_output_full_{RUN_DATE}.mp4"
   concat_cmd = (
       f"ffmpeg -f concat -safe 0 -i file_list.txt -c copy {final_output} -y"
