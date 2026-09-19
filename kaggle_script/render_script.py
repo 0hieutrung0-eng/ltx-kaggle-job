@@ -1,18 +1,58 @@
 import asyncio
 import gc
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
 
-RUN_DATE = time.strftime("%Y%m%d")
-print(
-    f"🚀 1. KHỞI TẠO PHIÊN RENDER LTX-VIDEO (KHỚP ÂM THANH TỪNG CẢNH 2S) -"
-    f" NGÀY [{RUN_DATE}]"
-)
+# -------------------------------------------------------------------
+# 1. CÀI ĐẶT PACKAGE Ở ĐẦU SCRIPT (AN TOÀN TUYỆT ĐỐI)
+# -------------------------------------------------------------------
+def install_requirements():
+  packages = [
+      "nest_asyncio",
+      "diffusers>=0.31.0",
+      "transformers",
+      "imageio-ffmpeg",
+      "google-api-python-client",
+      "google-auth-oauthlib",
+      "huggingface_hub",
+      "soundfile",
+      "av",
+      "edge-tts",
+      "accelerate",
+      "protobuf",
+      "numpy",
+      "pandas",
+  ]
+  print("📦 Đang kiểm tra và đồng bộ Packages...")
+  subprocess.check_call(
+      [sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + packages
+  )
 
-# Tối ưu hóa phân bổ bộ nhớ PyTorch
+
+install_requirements()
+
+import edge_tts
+import nest_asyncio
+
+nest_asyncio.apply()
+
+from diffusers import LTXPipeline
+from diffusers.utils import export_to_video
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import numpy as np
+import pandas as pd
+import requests
+import torch
+
+RUN_DATE = time.strftime("%Y%m%d")
+print(f"🚀 KHỞI TẠO PIPELINE LTX-VIDEO HOÀN CHỈNH - NGÀY [{RUN_DATE}]")
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
@@ -25,53 +65,15 @@ def sync_system_time():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    print("⏰ Đã đồng bộ giờ hệ thống thành công!")
+    print("⏰ Đã đồng bộ giờ hệ thống!")
   except Exception as e:
-    print(f"⚠️ Không thể đồng bộ giờ: {e}")
+    print(f"⚠️ Đồng bộ giờ thất bại: {e}")
 
 
 sync_system_time()
 
-
-def install_requirements():
-  packages = [
-      "diffusers>=0.31.0",
-      "transformers",
-      "imageio-ffmpeg",
-      "google-api-python-client",
-      "google-auth-oauthlib",
-      "google-cloud-bigquery-storage",
-      "huggingface_hub",
-      "soundfile",
-      "av",
-      "edge-tts",
-      "accelerate",
-      "sentencepiece",
-      "protobuf>=5.29.1,<6.0.0",
-  ]
-  print("📦 Đang cài đặt packages...")
-  subprocess.check_call(
-      [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "--no-cache-dir"]
-      + packages
-  )
-
-
-install_requirements()
-
-import edge_tts
-from diffusers import LTXPipeline
-from diffusers.utils import export_to_video
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-import pandas as pd
-import requests
-import torch
-
-print("✅ Cài đặt môi trường thành công!")
-
 # -------------------------------------------------------------------
-# CONFIG
+# CONFIG & AUTH
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = (
     "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
@@ -110,14 +112,26 @@ def get_oauth_credentials():
   )
 
 
+def get_media_duration(file_path):
+  """Đo chính xác thời lượng media (giây) bằng ffprobe."""
+  cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{file_path}"'
+  try:
+    result = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, check=True
+    )
+    return float(result.stdout.strip())
+  except Exception:
+    return 2.0
+
+
 # -------------------------------------------------------------------
-# 2. ĐỌC GOOGLE SHEETS
+# 2. ĐỌC DỮ LIỆU SHEETS
 # -------------------------------------------------------------------
 print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
 try:
   df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
   total_scenes = len(df)
-  print(f"✅ Tìm thấy {total_scenes} cảnh từ Google Sheets.")
+  print(f"✅ Tìm thấy {total_scenes} cảnh.")
 except Exception as e:
   print(f"❌ Lỗi đọc Google Sheet: {str(e)}")
   sys.exit(1)
@@ -141,13 +155,6 @@ if not df.empty:
 
 SELECTED_GENDER = project_info.get("gender", "nam").lower()
 ACTIVE_VOICE = VOICE_MAP.get(SELECTED_GENDER, "vi-VN-NamMinhNeural")
-
-print("==================================================")
-print("🎬 THÔNG TIN DỰ ÁN:")
-print(f"📌 Tiêu đề             : {project_info['title']}")
-print(f"🏷️ Thể loại            : {project_info['genre']}")
-print(f"🎙️ Giọng lồng tiếng     : {ACTIVE_VOICE} ({SELECTED_GENDER.upper()})")
-print("==================================================")
 
 
 def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
@@ -197,14 +204,14 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL LTX-VIDEO
+# 3. LOAD MODEL
 # -------------------------------------------------------------------
 print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 try:
   MODEL_ID = "Lightricks/LTX-Video"
   pipe = LTXPipeline.from_pretrained(
       MODEL_ID,
-      dtype=torch.bfloat16,
+      torch_dtype=torch.bfloat16,
       token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
   )
 
@@ -219,172 +226,208 @@ except Exception as e:
   )
   sys.exit(1)
 
+
 # -------------------------------------------------------------------
-# 4. RENDER VÀ GHÉP AUDIO TỪNG CẢNH (PER-SCENE AUDIO SYNCHRONIZATION)
+# 4. PROCESS PIPELINE
 # -------------------------------------------------------------------
-rendered_files = []
+async def process_video_pipeline():
+  rendered_files = []
 
-STYLE_3D_PREFIX = (
-    "3d chinese donghua animation style, unreal engine 5 render, extremely"
-    " detailed 3d face,"
-)
-DEFAULT_NEGATIVE = (
-    "2d, flat drawing, realistic human, photorealistic, blurry, low quality,"
-    " distorted face, morphing, text, watermark, stiff pose, deformed hands,"
-    " missing fingers, extra limbs"
-)
-
-for index, row in df.iterrows():
-  scene_idx_val = row.get("scene_index")
-  scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
-
-  raw_prompt = str(row.get("prompt", "")).strip()
-  raw_negative = str(row.get("negative_prompt", "")).strip()
-
-  # Lấy thoại riêng của cảnh này (scene_narration_vi hoặc narration_vi)
-  scene_text = str(
-      row.get("scene_narration_vi", row.get("narration_vi", ""))
-  ).strip()
-  if scene_text.lower() == "nan":
-    scene_text = ""
-
-  raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
-  audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
-  final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
-
-  if not raw_prompt or raw_prompt.lower() == "nan":
-    continue
-
-  if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 10000:
-    print(f"⏩ [{scene_index}/{total_scenes}] Đã tồn tại -> bỏ qua")
-    rendered_files.append(final_scene_file)
-    continue
-
-  # 4.1. Sinh Video 2s
-  final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
-  final_negative = (
-      raw_negative
-      if (raw_negative and raw_negative.lower() != "nan")
-      else DEFAULT_NEGATIVE
+  STYLE_3D_PREFIX = (
+      "3d chinese donghua animation style, unreal engine 5 render, extremely"
+      " detailed 3d face,"
+  )
+  DEFAULT_NEGATIVE = (
+      "2d, flat drawing, realistic human, photorealistic, blurry, low quality,"
+      " distorted face, morphing, text, watermark, stiff pose, deformed hands,"
+      " missing fingers, extra limbs"
   )
 
-  scene_seed = 42 + scene_index
-  generator = torch.Generator(device="cpu").manual_seed(scene_seed)
+  for index, row in df.iterrows():
+    scene_idx_val = row.get("scene_index")
+    scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
 
-  print(f"\n🎬 [{scene_index}/{total_scenes}] Render Video 2s -> {raw_video_file}")
-  try:
-    gc.collect()
-    torch.cuda.empty_cache()
+    raw_prompt = str(row.get("prompt", "")).strip()
+    raw_negative = str(row.get("negative_prompt", "")).strip()
 
-    with torch.inference_mode():
-      output = pipe(
-          prompt=final_prompt,
-          negative_prompt=final_negative,
-          width=768,
-          height=448,
-          num_frames=49,  # 49 frames @ 24fps = 2 giây
-          frame_rate=24.0,
-          num_inference_steps=20,
-          guidance_scale=3.5,
-          generator=generator,
-          output_type="pt",
+    scene_text = str(
+        row.get("scene_narration_vi", row.get("narration_vi", ""))
+    ).strip()
+    if scene_text.lower() == "nan":
+      scene_text = ""
+
+    raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
+    audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
+    final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
+
+    if not raw_prompt or raw_prompt.lower() == "nan":
+      continue
+
+    if (
+        os.path.exists(final_scene_file)
+        and os.path.getsize(final_scene_file) > 10000
+    ):
+      print(f"⏩ [{scene_index}/{total_scenes}] Đã tồn tại -> bỏ qua")
+      rendered_files.append(final_scene_file)
+      continue
+
+    # 4.1 Sinh Video
+    final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
+    final_negative = (
+        raw_negative
+        if (raw_negative and raw_negative.lower() != "nan")
+        else DEFAULT_NEGATIVE
+    )
+
+    scene_seed = 42 + scene_index
+    generator = torch.Generator(device="cpu").manual_seed(scene_seed)
+
+    print(f"\n🎬 [{scene_index}/{total_scenes}] Render Video LTX...")
+    try:
+      gc.collect()
+      torch.cuda.empty_cache()
+
+      with torch.inference_mode():
+        output = pipe(
+            prompt=final_prompt,
+            negative_prompt=final_negative,
+            width=768,
+            height=448,
+            num_frames=49,
+            frame_rate=24.0,
+            num_inference_steps=20,
+            guidance_scale=3.5,
+            generator=generator,
+            output_type="np",
+        )
+        video_frames = output.frames[0]
+
+        # Đảm bảo ép đúng định dạng uint8 tránh crash màu sắc
+        if video_frames.dtype != np.uint8:
+          video_frames = (video_frames * 255).astype(np.uint8)
+
+      export_to_video(video_frames, raw_video_file, fps=24)
+
+    except Exception as e:
+      print(f"❌ Lỗi render video cảnh {scene_index}: {str(e)}")
+      continue
+
+    # 4.2 Xử lý Audio & Pad Frame
+    if scene_text:
+      print(f"🎙️ Tạo voice cảnh {scene_index}: '{scene_text}'")
+      communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
+      await communicate.save(audio_scene_file)
+
+      v_dur = get_media_duration(raw_video_file)
+      a_dur = get_media_duration(audio_scene_file)
+      pad_dur = max(0.0, a_dur - v_dur)
+
+      if pad_dur > 0:
+        mix_scene_cmd = (
+            f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
+            f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
+            f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 -c:a aac'
+            f' -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
+        )
+      else:
+        mix_scene_cmd = (
+            f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
+            f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 -c:a aac'
+            f' -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
+        )
+
+      subprocess.run(
+          mix_scene_cmd,
+          shell=True,
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
       )
-      video_frames = output.frames[0]
+    else:
+      silent_cmd = (
+          f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i'
+          " anullsrc=r=44100:cl=stereo -c:v copy -c:a aac -ar 44100 -ac 2"
+          f' -shortest "{final_scene_file}"'
+      )
+      subprocess.run(
+          silent_cmd,
+          shell=True,
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
+      )
 
-    export_to_video(video_frames, raw_video_file, fps=24)
+    # Dọn dẹp file tạm
+    if os.path.exists(raw_video_file):
+      os.remove(raw_video_file)
+    if os.path.exists(audio_scene_file):
+      os.remove(audio_scene_file)
 
-  except Exception as e:
-    print(f"❌ Lỗi render video cảnh {scene_index}: {str(e)}")
-    continue
-
-  # 4.2. Sinh Voice Lồng Tiếng cho Cảnh này
-  if scene_text:
-    print(f"🎙️ Tạo voice cảnh {scene_index}: '{scene_text}'")
-    communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
-    await communicate.save(audio_scene_file)
-
-    # Ghép Voice vào Video 2s của cảnh (Pad âm thanh vừa khít 2s video)
-    mix_scene_cmd = (
-        f"ffmpeg -y -i {raw_video_file} -i {audio_scene_file} -map 0:v:0 -map"
-        " 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest"
-        f" {final_scene_file}"
+    print(
+        f"💾 Hoàn tất Cảnh {scene_index} (Video + Audio): {final_scene_file}"
     )
-    subprocess.run(
-        mix_scene_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
+    rendered_files.append(final_scene_file)
+
+  # -------------------------------------------------------------------
+  # 5. GỘP TOÀN BỘ CẢNH
+  # -------------------------------------------------------------------
+  print("\n🎞️ 5. TIẾN HÀNH GỘP TOÀN BỘ CÁC CẢNH...")
+  if not rendered_files:
+    send_n8n_final_webhook(
+        "failed", 0, error_message="Không render được cảnh nào."
     )
+    sys.exit(1)
+
+  with open("file_list.txt", "w") as f:
+    for file in rendered_files:
+      f.write(f"file '{file}'\n")
+
+  concat_output = f"final_concat_{RUN_DATE}.mp4"
+  final_output = f"final_movie_{RUN_DATE}.mp4"
+
+  subprocess.run(
+      f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}",
+      shell=True,
+      check=True,
+  )
+
+  # -------------------------------------------------------------------
+  # 6. BGM & HOÀN THÀNH
+  # -------------------------------------------------------------------
+  bgm_file = "bgm_xianxia.mp3"
+  if os.path.exists(bgm_file):
+    print("🎵 Đang hòa âm Nhạc nền BGM cho phim...")
+    bgm_cmd = (
+        f'ffmpeg -y -i {concat_output} -stream_loop -1 -i {bgm_file}'
+        ' -filter_complex "[0:a]volume=1.2[v_tts];[1:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]"'
+        ' -map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k'
+        f" {final_output}"
+    )
+    try:
+      subprocess.run(bgm_cmd, shell=True, check=True)
+    except Exception:
+      final_output = concat_output
   else:
-    # Nếu cảnh không có lời thoại, thêm 1 luồng audio im lặng 2s
-    silent_cmd = (
-        f"ffmpeg -y -i {raw_video_file} -f lavfi -i anullsrc=r=24000:cl=mono"
-        f" -c:v copy -c:a aac -shortest {final_scene_file}"
-    )
-    subprocess.run(
-        silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-  # Dọn dẹp file tạm cảnh
-  if os.path.exists(raw_video_file):
-    os.remove(raw_video_file)
-  if os.path.exists(audio_scene_file):
-    os.remove(audio_scene_file)
-
-  print(f"💾 Hoàn tất Cảnh {scene_index} (Video + Audio 2s): {final_scene_file}")
-  upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
-  rendered_files.append(final_scene_file)
-
-# -------------------------------------------------------------------
-# 5. GỘP CÁC CẢNH ĐÃ KHỚP ÂM THANH
-# -------------------------------------------------------------------
-print("\n🎞️ 5. TIẾN HÀNH GỘP TOÀN BỘ CÁC CẢNH...")
-if not rendered_files:
-  send_n8n_final_webhook(
-      "failed", 0, error_message="Không render được cảnh nào."
-  )
-  sys.exit(1)
-
-with open("file_list.txt", "w") as f:
-  for file in rendered_files:
-    f.write(f"file '{file}'\n")
-
-concat_output = f"final_concat_{RUN_DATE}.mp4"
-final_output = f"final_movie_{RUN_DATE}.mp4"
-
-# Gộp nối tiếp cả hình lẫn tiếng từ từng cảnh
-subprocess.run(
-    f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}",
-    shell=True,
-    check=True,
-)
-
-# -------------------------------------------------------------------
-# 6. CHÈN NHẠC NỀN BGM (NẾU CÓ)
-# -------------------------------------------------------------------
-bgm_file = "bgm_xianxia.mp3"
-if os.path.exists(bgm_file):
-  print("🎵 Đang hòa âm Nhạc nền BGM cho phim...")
-  bgm_cmd = (
-      f"ffmpeg -y -i {concat_output} -stream_loop -1 -i {bgm_file}"
-      ' -filter_complex "[0:a]volume=1.2[v_tts];[1:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]"'
-      f' -map 0:v:0 -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
-  )
-  try:
-    subprocess.run(bgm_cmd, shell=True, check=True)
-  except Exception:
     final_output = concat_output
-else:
-  final_output = concat_output
 
-# -------------------------------------------------------------------
-# 7. UPLOAD PHIM HOÀN CHỈNH VÀ GỬI WEBHOOK
-# -------------------------------------------------------------------
-print(f"\n☁️ 7. ĐANG TẢI PHIM HOÀN CHỈNH {final_output} LÊN GOOGLE DRIVE...")
-drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
+  # -------------------------------------------------------------------
+  # 7. UPLOAD & WEBHOOK
+  # -------------------------------------------------------------------
+  print(f"\n☁️ 7. ĐANG TẢI PHIM HOÀN CHỈNH {final_output} LÊN GOOGLE DRIVE...")
+  drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
-send_n8n_final_webhook(
-    status="completed_all",
-    total_scenes=len(rendered_files),
-    final_file=final_output,
-    drive_file_id=drive_file_id,
-)
+  send_n8n_final_webhook(
+      status="completed_all",
+      total_scenes=len(rendered_files),
+      final_file=final_output,
+      drive_file_id=drive_file_id,
+  )
 
-print("\n🎉 HOÀN TẤT DỰ ÁN PHIM ANIME 3D KHỚP ÂM THANH TỪNG CẢNH!")
+  print("\n🎉 HOÀN TẤT TOÀN BỘ TIẾN TRÌNH RENDER!")
+
+
+# Thực thi Async
+try:
+  asyncio.run(process_video_pipeline())
+except RuntimeError:
+  loop = asyncio.get_event_loop()
+  loop.run_until_complete(process_video_pipeline())
