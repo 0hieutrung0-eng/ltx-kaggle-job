@@ -29,7 +29,7 @@ def install_requirements():
     packages = [
         "git+https://github.com/huggingface/diffusers",
         "git+https://github.com/huggingface/transformers",
-        "torchao",                          # Dùng bản PyPI (tránh lỗi build từ source)
+        "torchao",
         "imageio-ffmpeg",
         "google-api-python-client",
         "google-auth-oauthlib",
@@ -189,7 +189,7 @@ try:
     MODEL_ID = "diffusers/LTX-2.3-Distilled-Diffusers"
     pipe = LTX2Pipeline.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
     )
     pipe.enable_model_cpu_offload()
@@ -200,7 +200,7 @@ except Exception as e:
     sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. RENDER 80 CẢNH
+# 4. RENDER 80 CẢNH (đã tối ưu VRAM cho T4)
 # -------------------------------------------------------------------
 rendered_files = []
 
@@ -227,12 +227,17 @@ for index, row in df.iterrows():
     print(f"   Prompt: {prompt[:100]}...")
 
     try:
+        # Xóa cache trước mỗi cảnh
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
         video, audio = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            width=768,
-            height=512,
-            num_frames=97,
+            width=640,               # giảm để vừa T4
+            height=384,              # giảm để vừa T4
+            num_frames=65,           # giảm để vừa T4 (~2.7 giây)
             frame_rate=24.0,
             sigmas=DISTILLED_SIGMA_VALUES,
             guidance_scale=1.0,
@@ -257,8 +262,14 @@ for index, row in df.iterrows():
     except Exception as e:
         print(f"❌ Lỗi cảnh {scene_index}: {str(e)}")
     finally:
+        # Dọn dẹp mạnh sau mỗi cảnh
+        try:
+            del video, audio
+        except:
+            pass
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 # -------------------------------------------------------------------
 # 5. GỘP VIDEO
