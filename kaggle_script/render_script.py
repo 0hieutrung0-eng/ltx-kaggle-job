@@ -8,7 +8,7 @@ import time
 
 RUN_DATE = time.strftime("%Y%m%d")
 print(
-    f"🚀 1. KHỞI TẠO PHIÊN RENDER LTX-VIDEO (ANIME 3D 2S) + TTS TIẾNG VIỆT -"
+    f"🚀 1. KHỞI TẠO PHIÊN RENDER LTX-VIDEO (ANIME 3D 2S + FULL AUDIO) -"
     f" NGÀY [{RUN_DATE}]"
 )
 
@@ -83,7 +83,7 @@ GOOGLE_SHEET_CSV_URL = (
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-# Cấu hình danh sách giọng đọc TTS
+# Cấu hình danh sách giọng đọc TTS (Nam & Nữ)
 VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
 OAUTH_CLIENT_ID = os.environ.get(
@@ -223,7 +223,6 @@ try:
       token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
   )
 
-  # Nếu GPU có VRAM nhỏ (<16GB), đổi enable_model_cpu_offload thành enable_sequential_cpu_offload
   pipe.enable_model_cpu_offload()
   pipe.vae.enable_tiling()
   pipe.vae.enable_slicing()
@@ -363,30 +362,43 @@ asyncio.run(generate_tts())
 print(f"✅ Đã tạo file lồng tiếng: {narration_audio}")
 
 # -------------------------------------------------------------------
-# 7. TRỘN LỒNG TIẾNG + NHẠC NỀN (BGM) VÀO VIDEO
+# 7. TRỘN ÂM THANH ĐẦY ĐỦ (TTS + BGM + SFX ĐÁNH NHAU)
 # -------------------------------------------------------------------
-print("\n🎧 7. TRỘN ÂM THANH VÀO VIDEO...")
+print("\n🎧 7. TRỘN ÂM THANH ĐẦY ĐỦ (TTS + BGM + SFX ĐÁNH NHAU)...")
 final_output = f"final_with_narration_{RUN_DATE}.mp4"
-bgm_file = "bgm_xianxia.mp3"  # Nhạc nền mp3 (nếu có trong thư mục)
 
-if os.path.exists(bgm_file):
-  print("🎵 Tìm thấy bgm_xianxia.mp3 -> Đang trộn Lồng tiếng + Nhạc nền...")
+bgm_file = "bgm_xianxia.mp3"  # File nhạc nền Tiên hiệp (nếu có)
+sfx_sword = "sword_hit.mp3"  # File tiếng va chạm kiếm / đòn đánh (nếu có)
+
+has_bgm = os.path.exists(bgm_file)
+has_sfx = os.path.exists(sfx_sword)
+
+if has_bgm and has_sfx:
+  print("⚔️ Đang hòa âm: Giọng lồng tiếng + Nhạc nền + Tiếng đánh nhau SFX...")
   mix_cmd = (
-      f"ffmpeg -y -i {final_model} -i {narration_audio} -i {bgm_file} "
-      '-filter_complex "[1:a]volume=1.3[v_tts];[2:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]" '
-      f'-map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
+      f"ffmpeg -y -i {final_model} -i {narration_audio} -i {bgm_file} -i"
+      f" {sfx_sword} -filter_complex"
+      ' "[1:a]volume=1.4[v_tts];[2:a]volume=0.12[v_bgm];[3:a]volume=0.7[v_sfx];[v_tts][v_bgm][v_sfx]amix=inputs=3:duration=first[a]"'
+      f' -map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
+  )
+elif has_bgm:
+  print("🎵 Đang hòa âm: Giọng lồng tiếng + Nhạc nền...")
+  mix_cmd = (
+      f"ffmpeg -y -i {final_model} -i {narration_audio} -i {bgm_file}"
+      ' -filter_complex "[1:a]volume=1.4[v_tts];[2:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]"'
+      f' -map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
   )
 else:
-  print("⚠️ Không thấy nhạc nền -> Chỉ chèn giọng lồng tiếng...")
+  print("🎙️ Chỉ chèn giọng lồng tiếng...")
   mix_cmd = (
-      f"ffmpeg -y -i {final_model} -i {narration_audio} "
-      '-filter_complex "[1:a]volume=1.4[a1]" '
-      f'-map 0:v -map "[a1]" -c:v copy -c:a aac -b:a 192k {final_output}'
+      f"ffmpeg -y -i {final_model} -i {narration_audio} -filter_complex"
+      ' "[1:a]volume=1.4[a1]" -map 0:v -map "[a1]" -c:v copy -c:a aac -b:a 192k'
+      f" {final_output}"
   )
 
 subprocess.run(mix_cmd, shell=True, check=True)
 
-print(f"🎉 VIDEO ANIME 3D HOÀN CHỈNH: {final_output}")
+print(f"🎉 VIDEO ANIME 3D HOÀN CHỈNH ĐẦY ĐỦ ÂM THANH: {final_output}")
 
 drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
