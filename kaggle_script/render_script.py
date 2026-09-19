@@ -129,7 +129,7 @@ project_info = {
     "character_design": "",
     "world_setting": "",
     "visual_style": "",
-    "gender": "nam",  # Mặc định là giọng nam nếu thiếu
+    "gender": "nam",  # Mặc định giọng nam nếu thiếu
 }
 
 if not df.empty:
@@ -279,24 +279,22 @@ for index, row in df.iterrows():
   print(f"   Prompt: {final_prompt[:110]}...")
 
   try:
-    # Dọn dẹp bộ nhớ trước khi xử lý cảnh mới
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
 
-    # Khóa Gradient để giải phóng VRAM và ép kiểu xuất sang 'pt' (PyTorch Tensor)
     with torch.inference_mode():
       output = pipe(
           prompt=final_prompt,
           negative_prompt=final_negative,
-          width=768,  # Kích thước 16:9 sắc nét cho 3D
+          width=768,  # Chuẩn 16:9 sắc nét cho 3D
           height=448,
           num_frames=49,  # 49 frames tại 24fps = ~2.04 GIÂY
           frame_rate=24.0,
           num_inference_steps=20,
           guidance_scale=3.5,
           generator=generator,
-          output_type="pt",  # Tránh tràn RAM do lưu PIL Image
+          output_type="pt",  # Tránh tràn RAM do lưu PIL
       )
       video_frames = output.frames[0]
 
@@ -309,7 +307,6 @@ for index, row in df.iterrows():
   except Exception as e:
     print(f"❌ Lỗi cảnh {scene_index}: {str(e)}")
   finally:
-    # Giải phóng hoàn toàn các biến tạm thời
     if "output" in locals():
       del output
     if "video_frames" in locals():
@@ -362,45 +359,50 @@ asyncio.run(generate_tts())
 print(f"✅ Đã tạo file lồng tiếng: {narration_audio}")
 
 # -------------------------------------------------------------------
-# 7. TRỘN ÂM THANH ĐẦY ĐỦ (TTS + BGM + SFX ĐÁNH NHAU)
+# 7. TRỘN ÂM THANH CHUẨN ĐÃ SỬA LỖI + UPLOAD DRIVE & WEBHOOK
 # -------------------------------------------------------------------
-print("\n🎧 7. TRỘN ÂM THANH ĐẦY ĐỦ (TTS + BGM + SFX ĐÁNH NHAU)...")
+print("\n🎧 7. TRỘN ÂM THANH VÀO VIDEO...")
 final_output = f"final_with_narration_{RUN_DATE}.mp4"
 
-bgm_file = "bgm_xianxia.mp3"  # File nhạc nền Tiên hiệp (nếu có)
-sfx_sword = "sword_hit.mp3"  # File tiếng va chạm kiếm / đòn đánh (nếu có)
+bgm_file = "bgm_xianxia.mp3"
+sfx_sword = "sword_hit.mp3"
 
 has_bgm = os.path.exists(bgm_file)
 has_sfx = os.path.exists(sfx_sword)
 
 if has_bgm and has_sfx:
-  print("⚔️ Đang hòa âm: Giọng lồng tiếng + Nhạc nền + Tiếng đánh nhau SFX...")
+  print("⚔️ Đang hòa âm: Giọng lồng tiếng + Nhạc nền + SFX Đánh nhau...")
   mix_cmd = (
       f"ffmpeg -y -i {final_model} -i {narration_audio} -i {bgm_file} -i"
       f" {sfx_sword} -filter_complex"
       ' "[1:a]volume=1.4[v_tts];[2:a]volume=0.12[v_bgm];[3:a]volume=0.7[v_sfx];[v_tts][v_bgm][v_sfx]amix=inputs=3:duration=first[a]"'
-      f' -map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
+      f' -map 0:v:0 -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
   )
 elif has_bgm:
   print("🎵 Đang hòa âm: Giọng lồng tiếng + Nhạc nền...")
   mix_cmd = (
       f"ffmpeg -y -i {final_model} -i {narration_audio} -i {bgm_file}"
       ' -filter_complex "[1:a]volume=1.4[v_tts];[2:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]"'
-      f' -map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
+      f' -map 0:v:0 -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
   )
 else:
-  print("🎙️ Chỉ chèn giọng lồng tiếng...")
+  print("🎙️ Đang ghép: Giọng lồng tiếng (TTS)...")
+  # Sửa cờ map chính xác 0:v:0 (Hình từ Video) và 1:a:0 (Tiếng từ MP3)
   mix_cmd = (
-      f"ffmpeg -y -i {final_model} -i {narration_audio} -filter_complex"
-      ' "[1:a]volume=1.4[a1]" -map 0:v -map "[a1]" -c:v copy -c:a aac -b:a 192k'
-      f" {final_output}"
+      f"ffmpeg -y -i {final_model} -i {narration_audio} -map 0:v:0 -map 1:a:0"
+      f" -c:v copy -c:a aac -b:a 192k -shortest {final_output}"
   )
 
-subprocess.run(mix_cmd, shell=True, check=True)
-
-print(f"🎉 VIDEO ANIME 3D HOÀN CHỈNH ĐẦY ĐỦ ÂM THANH: {final_output}")
-
-drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
+drive_file_id = None
+try:
+  subprocess.run(mix_cmd, shell=True, check=True)
+  print(f"🎉 VIDEO HOÀN CHỈNH ĐÃ XỬ LÝ XONG: {final_output}")
+  drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
+except Exception as e:
+  print(f"⚠️ Lỗi ghép âm thanh: {e}")
+  print("⚠️ Tiến hành đẩy file video gộp (final_model) lên Drive để bảo toàn...")
+  drive_file_id = upload_file_to_drive_fresh(final_model, DRIVE_FOLDER_ID)
+  final_output = final_model
 
 send_n8n_final_webhook(
     status="completed_all",
