@@ -28,7 +28,8 @@ sync_system_time()
 def install_requirements():
     packages = [
         "git+https://github.com/huggingface/diffusers",
-        "git+https://github.com/huggingface/transformers",   # Bắt buộc để có Gemma4ForConditionalGeneration
+        "git+https://github.com/huggingface/transformers",
+        "git+https://github.com/pytorch/ao.git",          # Fix lỗi FqnToConfig
         "imageio-ffmpeg",
         "google-api-python-client",
         "google-auth-oauthlib",
@@ -38,9 +39,9 @@ def install_requirements():
         "edge-tts",
         "accelerate",
         "sentencepiece",
-        "protobuf",
+        "protobuf>=5.29.1,<7.0.0",
     ]
-    print("📦 Đang cài đặt packages (bao gồm transformers mới nhất)...")
+    print("📦 Đang cài đặt packages (đã fix torchao + protobuf + transformers)...")
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade"] + packages
     )
