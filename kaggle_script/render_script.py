@@ -8,7 +8,7 @@ import time
 
 RUN_DATE = time.strftime("%Y%m%d")
 print(
-    f"🚀 1. KHỞI TẠO PHIÊN RENDER LTX-VIDEO (ANIME 3D 2S + FULL AUDIO) -"
+    f"🚀 1. KHỞI TẠO PHIÊN RENDER LTX-VIDEO (KHỚP ÂM THANH TỪNG CẢNH 2S) -"
     f" NGÀY [{RUN_DATE}]"
 )
 
@@ -83,7 +83,6 @@ GOOGLE_SHEET_CSV_URL = (
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-# Cấu hình danh sách giọng đọc TTS (Nam & Nữ)
 VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
 OAUTH_CLIENT_ID = os.environ.get(
@@ -129,7 +128,7 @@ project_info = {
     "character_design": "",
     "world_setting": "",
     "visual_style": "",
-    "gender": "nam",  # Mặc định giọng nam nếu thiếu
+    "gender": "nam",
 }
 
 if not df.empty:
@@ -140,19 +139,6 @@ if not df.empty:
       if val.lower() != "nan" and val != "":
         project_info[key] = val
 
-NARRATION_TEXT = ""
-if "narration_vi" in df.columns:
-  for val in df["narration_vi"]:
-    text = str(val).strip()
-    if text and text.lower() != "nan":
-      NARRATION_TEXT = text
-      break
-
-if not NARRATION_TEXT:
-  NARRATION_TEXT = (
-      f"Đây là câu chuyện thuộc thể loại {project_info.get('genre', '')}."
-  )
-
 SELECTED_GENDER = project_info.get("gender", "nam").lower()
 ACTIVE_VOICE = VOICE_MAP.get(SELECTED_GENDER, "vi-VN-NamMinhNeural")
 
@@ -161,7 +147,6 @@ print("🎬 THÔNG TIN DỰ ÁN:")
 print(f"📌 Tiêu đề             : {project_info['title']}")
 print(f"🏷️ Thể loại            : {project_info['genre']}")
 print(f"🎙️ Giọng lồng tiếng     : {ACTIVE_VOICE} ({SELECTED_GENDER.upper()})")
-print(f"🗣️ Lời kể (narration) : {NARRATION_TEXT[:150]}...")
 print("==================================================")
 
 
@@ -212,7 +197,7 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL LTX-VIDEO (TỐI ƯU BỘ NHỚ VRAM)
+# 3. LOAD MODEL LTX-VIDEO
 # -------------------------------------------------------------------
 print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 try:
@@ -235,7 +220,7 @@ except Exception as e:
   sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. RENDER CÁC CẢNH (ANIME 3D 2S + CHỐNG TRÀN BỘ NHỚ)
+# 4. RENDER VÀ GHÉP AUDIO TỪNG CẢNH (PER-SCENE AUDIO SYNCHRONIZATION)
 # -------------------------------------------------------------------
 rendered_files = []
 
@@ -255,16 +240,27 @@ for index, row in df.iterrows():
 
   raw_prompt = str(row.get("prompt", "")).strip()
   raw_negative = str(row.get("negative_prompt", "")).strip()
-  filename = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
+
+  # Lấy thoại riêng của cảnh này (scene_narration_vi hoặc narration_vi)
+  scene_text = str(
+      row.get("scene_narration_vi", row.get("narration_vi", ""))
+  ).strip()
+  if scene_text.lower() == "nan":
+    scene_text = ""
+
+  raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
+  audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
+  final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
   if not raw_prompt or raw_prompt.lower() == "nan":
     continue
 
-  if os.path.exists(filename) and os.path.getsize(filename) > 10000:
-    print(f"⏩ [{scene_index}/{total_scenes}] Đã tồn tại → bỏ qua")
-    rendered_files.append(filename)
+  if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 10000:
+    print(f"⏩ [{scene_index}/{total_scenes}] Đã tồn tại -> bỏ qua")
+    rendered_files.append(final_scene_file)
     continue
 
+  # 4.1. Sinh Video 2s
   final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
   final_negative = (
       raw_negative
@@ -275,50 +271,71 @@ for index, row in df.iterrows():
   scene_seed = 42 + scene_index
   generator = torch.Generator(device="cpu").manual_seed(scene_seed)
 
-  print(f"\n🎬 [{scene_index}/{total_scenes}] Render Anime 3D (2s) -> {filename}")
-  print(f"   Prompt: {final_prompt[:110]}...")
-
+  print(f"\n🎬 [{scene_index}/{total_scenes}] Render Video 2s -> {raw_video_file}")
   try:
     gc.collect()
     torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
 
     with torch.inference_mode():
       output = pipe(
           prompt=final_prompt,
           negative_prompt=final_negative,
-          width=768,  # Chuẩn 16:9 sắc nét cho 3D
+          width=768,
           height=448,
-          num_frames=49,  # 49 frames tại 24fps = ~2.04 GIÂY
+          num_frames=49,  # 49 frames @ 24fps = 2 giây
           frame_rate=24.0,
           num_inference_steps=20,
           guidance_scale=3.5,
           generator=generator,
-          output_type="pt",  # Tránh tràn RAM do lưu PIL
+          output_type="pt",
       )
       video_frames = output.frames[0]
 
-    export_to_video(video_frames, filename, fps=24)
-
-    print(f"💾 Đã lưu thành công (2s): {filename}")
-    upload_file_to_drive_fresh(filename, DRIVE_FOLDER_ID)
-    rendered_files.append(filename)
+    export_to_video(video_frames, raw_video_file, fps=24)
 
   except Exception as e:
-    print(f"❌ Lỗi cảnh {scene_index}: {str(e)}")
-  finally:
-    if "output" in locals():
-      del output
-    if "video_frames" in locals():
-      del video_frames
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    print(f"❌ Lỗi render video cảnh {scene_index}: {str(e)}")
+    continue
+
+  # 4.2. Sinh Voice Lồng Tiếng cho Cảnh này
+  if scene_text:
+    print(f"🎙️ Tạo voice cảnh {scene_index}: '{scene_text}'")
+    communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
+    await communicate.save(audio_scene_file)
+
+    # Ghép Voice vào Video 2s của cảnh (Pad âm thanh vừa khít 2s video)
+    mix_scene_cmd = (
+        f"ffmpeg -y -i {raw_video_file} -i {audio_scene_file} -map 0:v:0 -map"
+        " 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest"
+        f" {final_scene_file}"
+    )
+    subprocess.run(
+        mix_scene_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+  else:
+    # Nếu cảnh không có lời thoại, thêm 1 luồng audio im lặng 2s
+    silent_cmd = (
+        f"ffmpeg -y -i {raw_video_file} -f lavfi -i anullsrc=r=24000:cl=mono"
+        f" -c:v copy -c:a aac -shortest {final_scene_file}"
+    )
+    subprocess.run(
+        silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+  # Dọn dẹp file tạm cảnh
+  if os.path.exists(raw_video_file):
+    os.remove(raw_video_file)
+  if os.path.exists(audio_scene_file):
+    os.remove(audio_scene_file)
+
+  print(f"💾 Hoàn tất Cảnh {scene_index} (Video + Audio 2s): {final_scene_file}")
+  upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
+  rendered_files.append(final_scene_file)
 
 # -------------------------------------------------------------------
-# 5. GỘP VIDEO
+# 5. GỘP CÁC CẢNH ĐÃ KHỚP ÂM THANH
 # -------------------------------------------------------------------
-print("\n🎞️ 5. GỘP VIDEO...")
+print("\n🎞️ 5. TIẾN HÀNH GỘP TOÀN BỘ CÁC CẢNH...")
 if not rendered_files:
   send_n8n_final_webhook(
       "failed", 0, error_message="Không render được cảnh nào."
@@ -329,80 +346,39 @@ with open("file_list.txt", "w") as f:
   for file in rendered_files:
     f.write(f"file '{file}'\n")
 
-final_model = f"final_model_{RUN_DATE}.mp4"
+concat_output = f"final_concat_{RUN_DATE}.mp4"
+final_output = f"final_movie_{RUN_DATE}.mp4"
+
+# Gộp nối tiếp cả hình lẫn tiếng từ từng cảnh
 subprocess.run(
-    f"ffmpeg -f concat -safe 0 -i file_list.txt -c copy {final_model} -y",
+    f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}",
     shell=True,
     check=True,
 )
-print(f"✅ Đã gộp thành công: {final_model}")
 
 # -------------------------------------------------------------------
-# 6. TẠO LỜI KỂ TIẾNG VIỆT (NAM / NỮ)
+# 6. CHÈN NHẠC NỀN BGM (NẾU CÓ)
 # -------------------------------------------------------------------
-print("\n🗣️ 6. TẠO LỜI KỂ TIẾNG VIỆT...")
-narration_audio = f"narration_{RUN_DATE}.mp3"
-
-
-async def generate_tts():
-  print(f"🎙️ Tạo giọng lồng tiếng: {ACTIVE_VOICE}")
-  communicate = edge_tts.Communicate(
-      text=NARRATION_TEXT.strip(),
-      voice=ACTIVE_VOICE,
-      rate="+0%",
-      volume="+0%",
-  )
-  await communicate.save(narration_audio)
-
-
-asyncio.run(generate_tts())
-print(f"✅ Đã tạo file lồng tiếng: {narration_audio}")
-
-# -------------------------------------------------------------------
-# 7. TRỘN ÂM THANH CHUẨN ĐÃ SỬA LỖI + UPLOAD DRIVE & WEBHOOK
-# -------------------------------------------------------------------
-print("\n🎧 7. TRỘN ÂM THANH VÀO VIDEO...")
-final_output = f"final_with_narration_{RUN_DATE}.mp4"
-
 bgm_file = "bgm_xianxia.mp3"
-sfx_sword = "sword_hit.mp3"
-
-has_bgm = os.path.exists(bgm_file)
-has_sfx = os.path.exists(sfx_sword)
-
-if has_bgm and has_sfx:
-  print("⚔️ Đang hòa âm: Giọng lồng tiếng + Nhạc nền + SFX Đánh nhau...")
-  mix_cmd = (
-      f"ffmpeg -y -i {final_model} -i {narration_audio} -i {bgm_file} -i"
-      f" {sfx_sword} -filter_complex"
-      ' "[1:a]volume=1.4[v_tts];[2:a]volume=0.12[v_bgm];[3:a]volume=0.7[v_sfx];[v_tts][v_bgm][v_sfx]amix=inputs=3:duration=first[a]"'
+if os.path.exists(bgm_file):
+  print("🎵 Đang hòa âm Nhạc nền BGM cho phim...")
+  bgm_cmd = (
+      f"ffmpeg -y -i {concat_output} -stream_loop -1 -i {bgm_file}"
+      ' -filter_complex "[0:a]volume=1.2[v_tts];[1:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]"'
       f' -map 0:v:0 -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
   )
-elif has_bgm:
-  print("🎵 Đang hòa âm: Giọng lồng tiếng + Nhạc nền...")
-  mix_cmd = (
-      f"ffmpeg -y -i {final_model} -i {narration_audio} -i {bgm_file}"
-      ' -filter_complex "[1:a]volume=1.4[v_tts];[2:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]"'
-      f' -map 0:v:0 -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
-  )
+  try:
+    subprocess.run(bgm_cmd, shell=True, check=True)
+  except Exception:
+    final_output = concat_output
 else:
-  print("🎙️ Đang ghép: Giọng lồng tiếng (TTS)...")
-  # Sửa cờ map chính xác 0:v:0 (Hình từ Video) và 1:a:0 (Tiếng từ MP3)
-  mix_cmd = (
-      f"ffmpeg -y -i {final_model} -i {narration_audio} -map 0:v:0 -map 1:a:0"
-      f" -c:v copy -c:a aac -b:a 192k -shortest {final_output}"
-  )
+  final_output = concat_output
 
-drive_file_id = None
-try:
-  subprocess.run(mix_cmd, shell=True, check=True)
-  print(f"🎉 VIDEO HOÀN CHỈNH ĐÃ XỬ LÝ XONG: {final_output}")
-  drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
-except Exception as e:
-  print(f"⚠️ Lỗi ghép âm thanh: {e}")
-  print("⚠️ Tiến hành đẩy file video gộp (final_model) lên Drive để bảo toàn...")
-  drive_file_id = upload_file_to_drive_fresh(final_model, DRIVE_FOLDER_ID)
-  final_output = final_model
+# -------------------------------------------------------------------
+# 7. UPLOAD PHIM HOÀN CHỈNH VÀ GỬI WEBHOOK
+# -------------------------------------------------------------------
+print(f"\n☁️ 7. ĐANG TẢI PHIM HOÀN CHỈNH {final_output} LÊN GOOGLE DRIVE...")
+drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
 send_n8n_final_webhook(
     status="completed_all",
@@ -411,4 +387,4 @@ send_n8n_final_webhook(
     drive_file_id=drive_file_id,
 )
 
-print("\n✅ HOÀN TẤT TOÀN BỘ PHIÊN RENDER!")
+print("\n🎉 HOÀN TẤT DỰ ÁN PHIM ANIME 3D KHỚP ÂM THANH TỪNG CẢNH!")
