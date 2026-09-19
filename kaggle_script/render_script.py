@@ -29,7 +29,7 @@ def install_requirements():
     packages = [
         "git+https://github.com/huggingface/diffusers",
         "git+https://github.com/huggingface/transformers",
-        "git+https://github.com/pytorch/ao.git",          # Fix lỗi FqnToConfig
+        "torchao",                          # Dùng bản PyPI (tránh lỗi build từ source)
         "imageio-ffmpeg",
         "google-api-python-client",
         "google-auth-oauthlib",
@@ -41,7 +41,7 @@ def install_requirements():
         "sentencepiece",
         "protobuf>=5.29.1,<7.0.0",
     ]
-    print("📦 Đang cài đặt packages (đã fix torchao + protobuf + transformers)...")
+    print("📦 Đang cài đặt packages...")
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade"] + packages
     )
