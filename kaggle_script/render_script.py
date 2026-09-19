@@ -8,7 +8,8 @@ import time
 
 RUN_DATE = time.strftime("%Y%m%d")
 print(
-    f"🚀 1. KHỞI TẠO PHIÊN RENDER LTX-VIDEO + TTS TIẾNG VIỆT - NGÀY [{RUN_DATE}]"
+    f"🚀 1. KHỞI TẠO PHIÊN RENDER LTX-VIDEO (ANIME 3D 2S) + TTS TIẾNG VIỆT -"
+    f" NGÀY [{RUN_DATE}]"
 )
 
 # Tối ưu hóa phân bổ bộ nhớ PyTorch
@@ -34,7 +35,7 @@ sync_system_time()
 
 def install_requirements():
   packages = [
-      "diffusers>=0.31.0",  # Dùng phiên bản phát hành ổn định thay vì git master
+      "diffusers>=0.31.0",
       "transformers",
       "imageio-ffmpeg",
       "google-api-python-client",
@@ -153,7 +154,7 @@ if not NARRATION_TEXT:
 print("==================================================")
 print("🎬 THÔNG TIN DỰ ÁN:")
 print(f"📌 Tiêu đề             : {project_info['title']}")
-print(f"🏷️ Thể loại           : {project_info['genre']}")
+print(f"🏷️ Thể loại            : {project_info['genre']}")
 print(f"🗣️ Lời kể (narration) : {NARRATION_TEXT[:150]}...")
 print("==================================================")
 
@@ -228,19 +229,30 @@ except Exception as e:
   sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. RENDER CÁC CẢNH
+# 4. RENDER CÁC CẢNH (Cấu hình Anime 3D & 2 Giây)
 # -------------------------------------------------------------------
 rendered_files = []
+
+# Tự động chèn Style 3D Tiên Hiệp nếu thiếu
+STYLE_3D_PREFIX = (
+    "3d chinese donghua animation style, unreal engine 5 render, extremely"
+    " detailed 3d face,"
+)
+DEFAULT_NEGATIVE = (
+    "2d, flat drawing, realistic human, photorealistic, blurry, low quality,"
+    " distorted face, morphing, text, watermark, stiff pose, deformed hands,"
+    " missing fingers, extra limbs"
+)
 
 for index, row in df.iterrows():
   scene_idx_val = row.get("scene_index")
   scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
 
-  prompt = str(row.get("prompt", "")).strip()
-  negative_prompt = str(row.get("negative_prompt", "")).strip()
+  raw_prompt = str(row.get("prompt", "")).strip()
+  raw_negative = str(row.get("negative_prompt", "")).strip()
   filename = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
-  if not prompt or prompt.lower() == "nan":
+  if not raw_prompt or raw_prompt.lower() == "nan":
     continue
 
   if os.path.exists(filename) and os.path.getsize(filename) > 10000:
@@ -248,11 +260,19 @@ for index, row in df.iterrows():
     rendered_files.append(filename)
     continue
 
+  # Ghép Style 3D vào prompt
+  final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
+  final_negative = (
+      raw_negative
+      if (raw_negative and raw_negative.lower() != "nan")
+      else DEFAULT_NEGATIVE
+  )
+
   scene_seed = 42 + scene_index
   generator = torch.Generator(device="cpu").manual_seed(scene_seed)
 
-  print(f"\n🎬 [{scene_index}/{total_scenes}] {filename}")
-  print(f"   Prompt: {prompt[:100]}...")
+  print(f"\n🎬 [{scene_index}/{total_scenes}] Render Anime 3D (2s) -> {filename}")
+  print(f"   Prompt: {final_prompt[:110]}...")
 
   try:
     gc.collect()
@@ -260,25 +280,21 @@ for index, row in df.iterrows():
     torch.cuda.ipc_collect()
 
     video_frames = pipe(
-        prompt=prompt,
-        negative_prompt=(
-            negative_prompt
-            if negative_prompt
-            else "worst quality, low quality, blurry"
-        ),
-        width=640,
-        height=384,
-        num_frames=30,
+        prompt=final_prompt,
+        negative_prompt=final_negative,
+        width=768,  # Nâng độ phân giải chuẩn 16:9 sắc nét cho 3D
+        height=448,
+        num_frames=49,  # 49 frames tại 24fps = ~2.04 GIÂY VIDEO
         frame_rate=24.0,
-        num_inference_steps=15,
-        guidance_scale=3.0,
+        num_inference_steps=20,  # 20 steps giúp hoạt cảnh 3D mượt hơn
+        guidance_scale=3.5,  # Tăng bám sát Prompt
         generator=generator,
         output_type="pil",
     ).frames[0]
 
     export_to_video(video_frames, filename, fps=24)
 
-    print(f"💾 Đã lưu: {filename}")
+    print(f"💾 Đã lưu thành công (2s): {filename}")
     upload_file_to_drive_fresh(filename, DRIVE_FOLDER_ID)
     rendered_files.append(filename)
 
@@ -311,7 +327,7 @@ subprocess.run(
     shell=True,
     check=True,
 )
-print(f"✅ Đã gộp: {final_model}")
+print(f"✅ Đã gộp thành công: {final_model}")
 
 # -------------------------------------------------------------------
 # 6. TẠO LỜI KỂ TIẾNG VIỆT
@@ -346,7 +362,7 @@ mix_cmd = (
 )
 subprocess.run(mix_cmd, shell=True, check=True)
 
-print(f"🎉 VIDEO HOÀN CHỈNH: {final_output}")
+print(f"🎉 VIDEO HOÀN CHỈNH ANIME 3D: {final_output}")
 
 drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
@@ -357,4 +373,4 @@ send_n8n_final_webhook(
     drive_file_id=drive_file_id,
 )
 
-print("\n✅ HOÀN TẤT TOÀN BỘ!")
+print("\n✅ HOÀN TẤT TOÀN BỘ PHIÊN RENDER!")
