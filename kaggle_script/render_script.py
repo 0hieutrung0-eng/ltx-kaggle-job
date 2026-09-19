@@ -267,7 +267,7 @@ for index, row in df.iterrows():
             else "worst quality, low quality, blurry"
         ),
         width=640,
-        height=348,
+        height=384,
         num_frames=30,
         frame_rate=24.0,
         num_inference_steps=15,
