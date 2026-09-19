@@ -266,11 +266,11 @@ for index, row in df.iterrows():
             if negative_prompt
             else "worst quality, low quality, blurry"
         ),
-        width=512,
-        height=320,
-        num_frames=33,
+        width=640,
+        height=348,
+        num_frames=30,
         frame_rate=24.0,
-        num_inference_steps=20,
+        num_inference_steps=15,
         guidance_scale=3.0,
         generator=generator,
         output_type="pil",
