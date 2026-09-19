@@ -264,12 +264,12 @@ for index, row in df.iterrows():
   if not prompt or prompt.lower() == "nan":
     continue
 
+  # 🛑 ĐÃ SỬA: Bỏ qua render nếu file video cảnh này đã tồn tại
   if os.path.exists(filename) and os.path.getsize(filename) > 0:
     print(
-        f"\n⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại local ({filename}),"
-        " tiến hành upload lại..."
+        f"\n⏩ [Cảnh {scene_index}/{total_scenes}] Đã tồn tại ({filename}), BỎ"
+        " QUA KHÔNG RENDER LẠI..."
     )
-    upload_file_to_drive_fresh(filename, DRIVE_FOLDER_ID)
     rendered_files.append(filename)
     continue
 
