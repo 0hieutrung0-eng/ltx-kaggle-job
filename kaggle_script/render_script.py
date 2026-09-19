@@ -83,7 +83,8 @@ GOOGLE_SHEET_CSV_URL = (
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-TTS_VOICE = "vi-VN-NamMinhNeural"  # Giọng Nam
+# Cấu hình danh sách giọng đọc TTS
+VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
 OAUTH_CLIENT_ID = os.environ.get(
     "OAUTH_CLIENT_ID",
@@ -128,6 +129,7 @@ project_info = {
     "character_design": "",
     "world_setting": "",
     "visual_style": "",
+    "gender": "nam",  # Mặc định là giọng nam nếu thiếu
 }
 
 if not df.empty:
@@ -151,10 +153,14 @@ if not NARRATION_TEXT:
       f"Đây là câu chuyện thuộc thể loại {project_info.get('genre', '')}."
   )
 
+SELECTED_GENDER = project_info.get("gender", "nam").lower()
+ACTIVE_VOICE = VOICE_MAP.get(SELECTED_GENDER, "vi-VN-NamMinhNeural")
+
 print("==================================================")
 print("🎬 THÔNG TIN DỰ ÁN:")
 print(f"📌 Tiêu đề             : {project_info['title']}")
 print(f"🏷️ Thể loại            : {project_info['genre']}")
+print(f"🎙️ Giọng lồng tiếng     : {ACTIVE_VOICE} ({SELECTED_GENDER.upper()})")
 print(f"🗣️ Lời kể (narration) : {NARRATION_TEXT[:150]}...")
 print("==================================================")
 
@@ -206,7 +212,7 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL LTX-VIDEO
+# 3. LOAD MODEL LTX-VIDEO (TỐI ƯU BỘ NHỚ VRAM)
 # -------------------------------------------------------------------
 print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 try:
@@ -217,6 +223,7 @@ try:
       token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
   )
 
+  # Nếu GPU có VRAM nhỏ (<16GB), đổi enable_model_cpu_offload thành enable_sequential_cpu_offload
   pipe.enable_model_cpu_offload()
   pipe.vae.enable_tiling()
   pipe.vae.enable_slicing()
@@ -229,11 +236,10 @@ except Exception as e:
   sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. RENDER CÁC CẢNH (Cấu hình Anime 3D & 2 Giây)
+# 4. RENDER CÁC CẢNH (ANIME 3D 2S + CHỐNG TRÀN BỘ NHỚ)
 # -------------------------------------------------------------------
 rendered_files = []
 
-# Tự động chèn Style 3D Tiên Hiệp nếu thiếu
 STYLE_3D_PREFIX = (
     "3d chinese donghua animation style, unreal engine 5 render, extremely"
     " detailed 3d face,"
@@ -260,7 +266,6 @@ for index, row in df.iterrows():
     rendered_files.append(filename)
     continue
 
-  # Ghép Style 3D vào prompt
   final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
   final_negative = (
       raw_negative
@@ -275,22 +280,26 @@ for index, row in df.iterrows():
   print(f"   Prompt: {final_prompt[:110]}...")
 
   try:
+    # Dọn dẹp bộ nhớ trước khi xử lý cảnh mới
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
 
-    video_frames = pipe(
-        prompt=final_prompt,
-        negative_prompt=final_negative,
-        width=768,  # Nâng độ phân giải chuẩn 16:9 sắc nét cho 3D
-        height=448,
-        num_frames=49,  # 49 frames tại 24fps = ~2.04 GIÂY VIDEO
-        frame_rate=24.0,
-        num_inference_steps=20,  # 20 steps giúp hoạt cảnh 3D mượt hơn
-        guidance_scale=3.5,  # Tăng bám sát Prompt
-        generator=generator,
-        output_type="pil",
-    ).frames[0]
+    # Khóa Gradient để giải phóng VRAM và ép kiểu xuất sang 'pt' (PyTorch Tensor)
+    with torch.inference_mode():
+      output = pipe(
+          prompt=final_prompt,
+          negative_prompt=final_negative,
+          width=768,  # Kích thước 16:9 sắc nét cho 3D
+          height=448,
+          num_frames=49,  # 49 frames tại 24fps = ~2.04 GIÂY
+          frame_rate=24.0,
+          num_inference_steps=20,
+          guidance_scale=3.5,
+          generator=generator,
+          output_type="pt",  # Tránh tràn RAM do lưu PIL Image
+      )
+      video_frames = output.frames[0]
 
     export_to_video(video_frames, filename, fps=24)
 
@@ -301,6 +310,9 @@ for index, row in df.iterrows():
   except Exception as e:
     print(f"❌ Lỗi cảnh {scene_index}: {str(e)}")
   finally:
+    # Giải phóng hoàn toàn các biến tạm thời
+    if "output" in locals():
+      del output
     if "video_frames" in locals():
       del video_frames
     gc.collect()
@@ -330,16 +342,17 @@ subprocess.run(
 print(f"✅ Đã gộp thành công: {final_model}")
 
 # -------------------------------------------------------------------
-# 6. TẠO LỜI KỂ TIẾNG VIỆT
+# 6. TẠO LỜI KỂ TIẾNG VIỆT (NAM / NỮ)
 # -------------------------------------------------------------------
 print("\n🗣️ 6. TẠO LỜI KỂ TIẾNG VIỆT...")
 narration_audio = f"narration_{RUN_DATE}.mp3"
 
 
 async def generate_tts():
+  print(f"🎙️ Tạo giọng lồng tiếng: {ACTIVE_VOICE}")
   communicate = edge_tts.Communicate(
       text=NARRATION_TEXT.strip(),
-      voice=TTS_VOICE,
+      voice=ACTIVE_VOICE,
       rate="+0%",
       volume="+0%",
   )
@@ -347,22 +360,33 @@ async def generate_tts():
 
 
 asyncio.run(generate_tts())
-print(f"✅ Đã tạo giọng kể: {narration_audio}")
+print(f"✅ Đã tạo file lồng tiếng: {narration_audio}")
 
 # -------------------------------------------------------------------
-# 7. GHÉP LỜI KỂ + UPLOAD
+# 7. TRỘN LỒNG TIẾNG + NHẠC NỀN (BGM) VÀO VIDEO
 # -------------------------------------------------------------------
-print("\n🎧 7. GHÉP LỜI KỂ VÀO VIDEO...")
+print("\n🎧 7. TRỘN ÂM THANH VÀO VIDEO...")
 final_output = f"final_with_narration_{RUN_DATE}.mp4"
+bgm_file = "bgm_xianxia.mp3"  # Nhạc nền mp3 (nếu có trong thư mục)
 
-mix_cmd = (
-    f"ffmpeg -y -i {final_model} -i {narration_audio} "
-    '-filter_complex "[0:a]volume=0.25[a0];[1:a]volume=1.4[a1];[a0][a1]amix=inputs=2:duration=first[a]" '
-    f'-map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
-)
+if os.path.exists(bgm_file):
+  print("🎵 Tìm thấy bgm_xianxia.mp3 -> Đang trộn Lồng tiếng + Nhạc nền...")
+  mix_cmd = (
+      f"ffmpeg -y -i {final_model} -i {narration_audio} -i {bgm_file} "
+      '-filter_complex "[1:a]volume=1.3[v_tts];[2:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]" '
+      f'-map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
+  )
+else:
+  print("⚠️ Không thấy nhạc nền -> Chỉ chèn giọng lồng tiếng...")
+  mix_cmd = (
+      f"ffmpeg -y -i {final_model} -i {narration_audio} "
+      '-filter_complex "[1:a]volume=1.4[a1]" '
+      f'-map 0:v -map "[a1]" -c:v copy -c:a aac -b:a 192k {final_output}'
+  )
+
 subprocess.run(mix_cmd, shell=True, check=True)
 
-print(f"🎉 VIDEO HOÀN CHỈNH ANIME 3D: {final_output}")
+print(f"🎉 VIDEO ANIME 3D HOÀN CHỈNH: {final_output}")
 
 drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
