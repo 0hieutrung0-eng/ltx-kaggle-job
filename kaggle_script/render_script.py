@@ -34,9 +34,8 @@ sync_system_time()
 
 def install_requirements():
   packages = [
-      "git+https://github.com/huggingface/diffusers",
-      "git+https://github.com/huggingface/transformers",
-      "torchao",
+      "diffusers>=0.31.0",  # Dùng phiên bản phát hành ổn định thay vì git master
+      "transformers",
       "imageio-ffmpeg",
       "google-api-python-client",
       "google-auth-oauthlib",
@@ -51,7 +50,7 @@ def install_requirements():
   ]
   print("📦 Đang cài đặt packages...")
   subprocess.check_call(
-      [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir"]
+      [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "--no-cache-dir"]
       + packages
   )
 
