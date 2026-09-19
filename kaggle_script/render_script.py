@@ -40,17 +40,18 @@ def install_requirements():
       "imageio-ffmpeg",
       "google-api-python-client",
       "google-auth-oauthlib",
+      "google-cloud-bigquery-storage",
       "huggingface_hub",
       "soundfile",
       "av",
       "edge-tts",
       "accelerate",
       "sentencepiece",
-      "protobuf>=5.29.1,<7.0.0",
+      "protobuf>=5.29.1,<6.0.0",
   ]
   print("📦 Đang cài đặt packages...")
   subprocess.check_call(
-      [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade"]
+      [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir"]
       + packages
   )
 
@@ -205,18 +206,17 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL LTX-VIDEO (Cấu hình chống OOM cho Kaggle T4)
+# 3. LOAD MODEL LTX-VIDEO
 # -------------------------------------------------------------------
 print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 try:
   MODEL_ID = "Lightricks/LTX-Video"
   pipe = LTXPipeline.from_pretrained(
       MODEL_ID,
-      torch_dtype=torch.bfloat16,
+      dtype=torch.bfloat16,
       token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
   )
 
-  # Dùng enable_model_cpu_offload để giải phóng VRAM tối đa khi không làm việc
   pipe.enable_model_cpu_offload()
   pipe.vae.enable_tiling()
   pipe.vae.enable_slicing()
@@ -260,7 +260,6 @@ for index, row in df.iterrows():
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
 
-    # Tham số an toàn VRAM: 512x320 resolution, 33 frames (~1.3 giây)
     video_frames = pipe(
         prompt=prompt,
         negative_prompt=(
@@ -268,14 +267,14 @@ for index, row in df.iterrows():
             if negative_prompt
             else "worst quality, low quality, blurry"
         ),
-        width=640,
-        height=384,
-        num_frames=35,
+        width=512,
+        height=320,
+        num_frames=33,
         frame_rate=24.0,
         num_inference_steps=20,
         guidance_scale=3.0,
         generator=generator,
-        output_type="pt",
+        output_type="pil",
     ).frames[0]
 
     export_to_video(video_frames, filename, fps=24)
