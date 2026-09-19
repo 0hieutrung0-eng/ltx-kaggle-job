@@ -28,6 +28,7 @@ sync_system_time()
 def install_requirements():
     packages = [
         "git+https://github.com/huggingface/diffusers",
+        "git+https://github.com/huggingface/transformers",   # Bắt buộc để có Gemma4ForConditionalGeneration
         "imageio-ffmpeg",
         "google-api-python-client",
         "google-auth-oauthlib",
@@ -35,10 +36,13 @@ def install_requirements():
         "soundfile",
         "av",
         "edge-tts",
+        "accelerate",
+        "sentencepiece",
+        "protobuf",
     ]
-    print("📦 Đang cài đặt packages...")
+    print("📦 Đang cài đặt packages (bao gồm transformers mới nhất)...")
     subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir"] + packages
+        [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--upgrade"] + packages
     )
 
 install_requirements()
@@ -110,6 +114,7 @@ project_info = {
     "world_setting": "",
     "visual_style": "",
 }
+
 if not df.empty:
     first_row = df.iloc[0]
     for key in project_info.keys():
@@ -258,7 +263,6 @@ for index, row in df.iterrows():
 # 5. GỘP VIDEO
 # -------------------------------------------------------------------
 print("\n🎞️ 5. GỘP VIDEO...")
-
 if not rendered_files:
     send_n8n_final_webhook("failed", 0, error_message="Không render được cảnh nào.")
     sys.exit(1)
@@ -275,7 +279,6 @@ print(f"✅ Đã gộp: {final_model}")
 # 6. TẠO LỜI KỂ TIẾNG VIỆT
 # -------------------------------------------------------------------
 print("\n🗣️ 6. TẠO LỜI KỂ TIẾNG VIỆT...")
-
 narration_audio = f"narration_{RUN_DATE}.mp3"
 
 async def generate_tts():
@@ -294,7 +297,6 @@ print(f"✅ Đã tạo giọng kể: {narration_audio}")
 # 7. GHÉP LỜI KỂ + UPLOAD
 # -------------------------------------------------------------------
 print("\n🎧 7. GHÉP LỜI KỂ VÀO VIDEO...")
-
 final_output = f"final_with_narration_{RUN_DATE}.mp4"
 
 mix_cmd = (
@@ -303,6 +305,7 @@ mix_cmd = (
     f'-map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k {final_output}'
 )
 subprocess.run(mix_cmd, shell=True, check=True)
+
 print(f"🎉 VIDEO HOÀN CHỈNH: {final_output}")
 
 drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
