@@ -289,9 +289,9 @@ for index, row in df.iterrows():
         negative_prompt=negative_prompt,
         width=768,
         height=512,
-        num_frames=70,
-        num_inference_steps=18,
-        guidance_scale=3.5,
+        num_frames=65,
+        num_inference_steps=15,
+        guidance_scale=3.0,
         generator=generator,
     ).frames[0]
 
