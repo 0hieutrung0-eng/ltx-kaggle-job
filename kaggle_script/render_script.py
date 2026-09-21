@@ -22,7 +22,7 @@ def install_requirements():
         "edge-tts",
         "accelerate",
         "protobuf<6.0.0,>=3.20.2",
-        "peft",                    # cần cho load LoRA
+        "peft",
     ]
     print("📦 Đang kiểm tra và đồng bộ Packages...")
     subprocess.check_call([
@@ -73,9 +73,8 @@ DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 # ====== CẤU HÌNH ANIME LORA ======
-# Thay đường dẫn LoRA của bạn vào đây (có thể là local path hoặc repo_id)
-ANIME_LORA_PATH = None          # ví dụ: "path/to/anime_style_ltx.safetensors"
-ANIME_LORA_SCALE = 0.8          # độ mạnh LoRA (0.6 ~ 1.0)
+ANIME_LORA_PATH = None          # Đặt đường dẫn LoRA nếu có
+ANIME_LORA_SCALE = 0.75
 
 VOICE_MAP = {
     "nam": "vi-VN-NamMinhNeural",
@@ -184,14 +183,12 @@ try:
         token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
     )
 
-    # Load Anime LoRA nếu có
     if ANIME_LORA_PATH:
         print(f"🎨 Đang load Anime LoRA: {ANIME_LORA_PATH}")
         pipe.load_lora_weights(ANIME_LORA_PATH)
         pipe.fuse_lora(lora_scale=ANIME_LORA_SCALE)
         print(f"✅ Đã fuse Anime LoRA với scale = {ANIME_LORA_SCALE}")
 
-    # Tối ưu VRAM cho T4
     pipe.enable_sequential_cpu_offload()
     pipe.vae.enable_tiling()
     pipe.vae.enable_slicing()
@@ -225,7 +222,6 @@ async def process_video_pipeline():
         raw_prompt = str(row.get("prompt", "")).strip()
         raw_negative = str(row.get("negative_prompt", "")).strip()
 
-        # Lấy thoại
         scene_text = ""
         for col in ["dialogue", "scene_narration_vi", "narration_vi", "narration"]:
             if col in row and pd.notna(row[col]):
@@ -247,7 +243,6 @@ async def process_video_pipeline():
             rendered_files.append(final_scene_file)
             continue
 
-        # 4.1 Sinh Video
         final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
         final_negative = (
             raw_negative
@@ -274,30 +269,20 @@ async def process_video_pipeline():
                     num_inference_steps=25,
                     guidance_scale=2.8,
                     generator=generator,
-                    output_type="pt"
+                    output_type="np",          # ← quan trọng: dùng "np" để tránh lỗi màu
                 )
-                video_tensor = output.frames[0] if hasattr(output, "frames") else output[0]
 
-            # ===== SỬA TRIỆT ĐỂ LỖI MÀU =====
-            video_tensor = video_tensor.to(torch.float32)
+            # Khi output_type="np", pipeline đã trả về frames sẵn sàng
+            video_frames = output.frames[0]
 
-            # Đưa về (F, H, W, C)
-            if video_tensor.ndim == 4:
-                if video_tensor.shape[0] in [3, 4]:          # (C, F, H, W)
-                    video_tensor = video_tensor.permute(1, 2, 3, 0)
-                elif video_tensor.shape[1] in [3, 4]:        # (F, C, H, W)
-                    video_tensor = video_tensor.permute(0, 2, 3, 1)
+            # Nếu vẫn là float thì chuẩn hóa
+            if video_frames.dtype != np.uint8:
+                video_frames = np.clip(video_frames, 0.0, 1.0)
+                video_frames = (video_frames * 255).astype(np.uint8)
 
-            # Cách chuẩn của LTX: [-1, 1] → [0, 1]
-            if video_tensor.min() < -0.1:
-                video_tensor = (video_tensor + 1.0) / 2.0
-
-            video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
-
-            video_frames = (video_tensor * 255.0).cpu().numpy().astype(np.uint8)
             export_to_video(video_frames, raw_video_file, fps=24)
 
-            del output, video_tensor, video_frames
+            del output, video_frames
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -340,7 +325,6 @@ async def process_video_pipeline():
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Dọn file tạm
         if os.path.exists(raw_video_file):
             os.remove(raw_video_file)
         if os.path.exists(audio_scene_file):
