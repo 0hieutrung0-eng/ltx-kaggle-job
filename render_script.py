@@ -101,13 +101,16 @@ def get_media_duration(file_path):
         return 2.0
 
 # -------------------------------------------------------------------
-# 2. ĐỌC SHEETS
+# 2. ĐỌC VÀ CHUẨN HÓA SHEETS
 # -------------------------------------------------------------------
 print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
 try:
     df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
+    # Chuẩn hóa tên cột: xóa khoảng trắng và chuyển thành chữ thường
+    df.columns = df.columns.str.strip().str.lower()
     total_scenes = len(df)
     print(f"✅ Tìm thấy {total_scenes} cảnh.")
+    print(f"📋 Các cột phát hiện được: {df.columns.tolist()}")
 except Exception as e:
     print(f"❌ Lỗi đọc Google Sheet: {e}")
     sys.exit(1)
@@ -138,7 +141,6 @@ def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
         return None
 
     file_name = os.path.basename(file_path)
-    # Tự động nhận diện định dạng MIME dựa trên đuôi file
     mimetype = 'image/png' if file_name.endswith('.png') else 'video/mp4'
 
     for attempt in range(1, retries + 1):
@@ -186,7 +188,7 @@ try:
         token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
     )
     sdxl.enable_model_cpu_offload()
-    sdxl.vae.enable_tiling()  # Cú pháp chuẩn mới thay cho enable_vae_tiling()
+    sdxl.vae.enable_tiling()
     print("✅ Load SDXL thành công!")
 except Exception as e:
     print(f"❌ Lỗi load SDXL: {e}")
@@ -216,25 +218,30 @@ except Exception as e:
 async def process_video_pipeline():
     rendered_files = []
 
-    # STYLE_PREFIX được tối ưu độ dài để không bị tràn 77 tokens của CLIP
-    STYLE_PREFIX = (
-        "3d chinese donghua animation style, unreal engine 5 render, "
-        "extremely detailed 3d face, anime style, cinematic lighting,"
-    )
-    NEGATIVE = (
-        "blurry, low quality, distorted face, deformed hands, extra limbs, "
-        "worst quality, low resolution, watermark, text, overexposed, ugly"
+    DEFAULT_NEGATIVE = (
+        "2d, flat drawing, realistic human, photorealistic, blurry, low quality, "
+        "distorted face, text, watermark, deformed structures"
     )
 
     for index, row in df.iterrows():
         scene_idx_val = row.get("scene_index")
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
 
-        raw_prompt = str(row.get("prompt", "")).strip()
+        # Lấy Prompt ảnh chính xác theo các tên cột có thể có
+        raw_prompt = ""
+        for p_col in ["image_prompt", "prompt", "visual_prompt"]:
+            if p_col in row and pd.notna(row[p_col]):
+                val = str(row[p_col]).strip()
+                if val and val.lower() not in ["nan", "[empty]", "none", "null"]:
+                    raw_prompt = val
+                    break
+
+        # Lấy Negative Prompt
         raw_negative = str(row.get("negative_prompt", "")).strip()
 
+        # Lấy câu đọc thoại (Thuyết minh hoặc Hội thoại)
         scene_text = ""
-        for col in ["dialogue", "scene_narration_vi", "narration_vi", "narration"]:
+        for col in ["narration_vi", "dialogue", "scene_narration_vi", "narration"]:
             if col in row and pd.notna(row[col]):
                 val = str(row[col]).strip()
                 if val and val.lower() not in ["nan", "[empty]", "none", "null"]:
@@ -246,8 +253,8 @@ async def process_video_pipeline():
         audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
-        if not raw_prompt or raw_prompt.lower() in ["nan", "[empty]", "none", "null"]:
-            print(f"⚠️ Bỏ qua cảnh {scene_index}")
+        if not raw_prompt:
+            print(f"⚠️ Bỏ qua cảnh {scene_index} do không tìm thấy prompt ảnh")
             continue
 
         if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 10000:
@@ -255,8 +262,8 @@ async def process_video_pipeline():
             rendered_files.append(final_scene_file)
             continue
 
-        final_prompt = f"{STYLE_PREFIX} {raw_prompt}"
-        final_negative = raw_negative if (raw_negative and raw_negative.lower() not in ["nan", "[empty]", "none"]) else NEGATIVE
+        final_prompt = raw_prompt
+        final_negative = raw_negative if (raw_negative and raw_negative.lower() not in ["nan", "[empty]", "none"]) else DEFAULT_NEGATIVE
 
         scene_seed = 42 + scene_index
         generator = torch.Generator(device="cuda").manual_seed(scene_seed)
@@ -280,7 +287,7 @@ async def process_video_pipeline():
             image.save(image_file)
             print(f"   ✅ Đã lưu ảnh cục bộ: {image_file}")
 
-            # ➕ THÊM: Upload ảnh tĩnh vừa tạo lên Google Drive ngay lập tức
+            # Upload ngay ảnh PNG lên Google Drive
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
 
         except Exception as e:
@@ -313,11 +320,10 @@ async def process_video_pipeline():
 
         except Exception as e:
             print(f"❌ Lỗi tạo video cảnh {scene_index}: {e}")
-            # Xóa file ảnh nếu video lỗi để tránh tồn đọng đĩa
             if os.path.exists(image_file): os.remove(image_file)
             continue
 
-        # ---------- 5.3 Thêm Voice & Ghép Audio ----------
+        # ---------- 5.3 Tạo Voice & Lắp ráp MP4 ----------
         if scene_text:
             print(f"🎙️ Voice cảnh {scene_index}: {scene_text[:50]}...")
             communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
@@ -349,19 +355,19 @@ async def process_video_pipeline():
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Dọn dẹp các tệp trung gian
+        # Dọn dẹp tệp tạm
         for f in [image_file, raw_video_file, audio_scene_file]:
             if os.path.exists(f):
                 os.remove(f)
 
-        print(f"💾 Hoàn tất video cảnh {scene_index}")
+        print(f"💾 Hoàn tất cảnh {scene_index}")
 
-        # Upload video của cảnh hoàn chỉnh lên Google Drive
+        # Upload video MP4 của cảnh lên Google Drive
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
 
     # -------------------------------------------------------------------
-    # 6. GỘP TOÀN BỘ CẢNH + NỀN BGM + UPLOAD PHIM HOÀN CHỈNH
+    # 6. GỘP CẢNH + BGM + HOÀN TẤT
     # -------------------------------------------------------------------
     print("\n🎞️ Gộp tất cả các cảnh thành phim...")
     if not rendered_files:
@@ -401,7 +407,7 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
-    print("\n🎉 HOÀN TẤT TIẾN TRÌNH RENDER SDXL → SVD!")
+    print("\n🎉 HOÀN TẤT PIPELINE!")
 
 try:
     asyncio.run(process_video_pipeline())
