@@ -45,7 +45,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 WAN 2.1 1.3B PIPELINE - [{RUN_DATE}]")
+print(f"🚀 WAN 2.1 1.3B - TỐI ƯU T4 - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -161,11 +161,11 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
         print(f"❌ Lỗi webhook: {e}")
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL WAN 2.1 1.3B
+# 3. LOAD MODEL WAN 2.1 1.3B (TỐI ƯU T4)
 # -------------------------------------------------------------------
 print("\n🧠 3. LOAD MODEL WAN 2.1 1.3B...")
 try:
-    MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"   # bản 1.3B nhẹ, phù hợp T4
+    MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 
     vae = AutoencoderKLWan.from_pretrained(
         MODEL_ID, subfolder="vae", torch_dtype=torch.float32
@@ -177,9 +177,8 @@ try:
         token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
     )
 
-    # Tối ưu VRAM cho T4
-    pipe.enable_model_cpu_offload()
-    # pipe.enable_sequential_cpu_offload()  # dùng nếu vẫn OOM
+    # Sequential offload = tiết kiệm VRAM tối đa trên T4
+    pipe.enable_sequential_cpu_offload()
 
     print("✅ Load Wan 2.1 1.3B thành công!")
 except Exception as e:
@@ -249,16 +248,15 @@ async def process_video_pipeline():
                 output = pipe(
                     prompt=final_prompt,
                     negative_prompt=final_negative,
-                    height=480,
-                    width=832,
-                    num_frames=81,          # ~5 giây ở 16fps
+                    height=384,               # giảm mạnh
+                    width=640,                # giảm mạnh
+                    num_frames=49,            # ~3 giây
                     guidance_scale=5.0,
-                    num_inference_steps=30,
+                    num_inference_steps=25,
                     generator=generator,
                 )
                 frames = output.frames[0]
 
-            # Wan thường trả về list of PIL hoặc np array sẵn sàng
             export_to_video(frames, raw_video_file, fps=16)
 
             del output, frames
