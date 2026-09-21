@@ -60,7 +60,8 @@ print(f"🚀 SDXL → SVD I2V PIPELINE - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
-def sync_system_time():
+# Đồng bộ thời gian hệ thống 1 lần duy nhất ở đầu script
+def sync_system_time_once():
     try:
         subprocess.run(
             "apt-get update -qq && apt-get install -y -qq ntpdate && ntpdate time.google.com",
@@ -69,22 +70,22 @@ def sync_system_time():
     except Exception:
         pass
 
-sync_system_time()
+sync_system_time_once()
 
 # -------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION (LẤY TỪ MÔI TRƯỜNG ĐỂ BẢO MẬT)
 # -------------------------------------------------------------------
-N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
-SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done")
+SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
-OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "948179937421-o55enfl61lb8ou0ms2jmrr4dlf1fhgip.apps.googleusercontent.com")
-OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "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")
-OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "1//06AsOeOfzvnpxCgYIARAAGAYSNwF-L9Ir-Yoj_gfy3CYDrDfXfUkE0z95bPruk8RMjNG3Y0F-SuDd-VFnFfIo0jRZ4T8J4oZzmek")
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
+OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 def get_oauth_credentials():
@@ -106,10 +107,13 @@ def get_media_duration(file_path):
         return 3.0
 
 def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
+    if not OAUTH_REFRESH_TOKEN:
+        print("⚠️ Bỏ qua upload Drive: Chưa cấu hình OAUTH_REFRESH_TOKEN.")
+        return None
+        
     file_name = os.path.basename(file_path)
     for attempt in range(1, retries + 1):
         try:
-            sync_system_time()
             creds = get_oauth_credentials()
             service = build('drive', 'v3', credentials=creds, cache_discovery=False)
             file_metadata = {'name': file_name, 'parents': [folder_id]}
@@ -217,7 +221,6 @@ async def process_video_pipeline():
         "distorted face, morphing, text, watermark, stiff pose, deformed hands, extra limbs"
     )
 
-    # Khởi tạo pipeline sinh ảnh trước
     sdxl = load_sdxl_pipeline()
     generated_images = {}
 
@@ -227,7 +230,6 @@ async def process_video_pipeline():
         scene_idx_val = row.get("scene_index")
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
 
-        # Đọc trường image_prompt (fallback về prompt cũ nếu trống)
         image_prompt_raw = str(row.get("image_prompt", "")).strip()
         if not image_prompt_raw or image_prompt_raw.lower() in ["nan", "[empty]", "none", "null"]:
             image_prompt_raw = str(row.get("prompt", "")).strip()
@@ -270,7 +272,6 @@ async def process_video_pipeline():
         except Exception as e:
             print(f"❌ Lỗi tạo ảnh ở Cảnh {scene_index}: {e}")
 
-    # Giải phóng SDXL khỏi GPU để nhường RAM cho SVD
     del sdxl
     clear_vram()
 
@@ -283,7 +284,6 @@ async def process_video_pipeline():
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
         location_val = str(row.get("location", "Location")).strip()
 
-        # Đọc thoại từ các cột có sẵn
         scene_text = ""
         for col in ["dialogue", "scene_narration_vi", "narration_vi", "narration"]:
             if col in row and pd.notna(row[col]):
@@ -306,14 +306,13 @@ async def process_video_pipeline():
             print(f"⚠️ Không tìm thấy ảnh đầu vào cho Cảnh {scene_index}. Bỏ qua...")
             continue
 
-        # Đọc duration_sec thiết lập từ Gemini (mặc định 3s)
         duration_sec = float(row.get("duration_sec", 3)) if pd.notna(row.get("duration_sec")) else 3.0
-        num_frames = int(max(14, min(30, duration_sec * 7))) # Tính khung hình theo fps=7
+        num_frames = int(max(14, min(30, duration_sec * 7)))
 
         scene_seed = 42 + scene_index
         generator = torch.Generator(device="cuda").manual_seed(scene_seed)
 
-        # ---------- 4.1 Sinh Video bằng SVD ----------
+        # 4.1 Sinh Video bằng SVD
         print(f"📹 [{scene_index}/{total_scenes}] Render video SVD ({location_val}) - Frame count: {num_frames}...")
         try:
             clear_vram()
@@ -337,7 +336,7 @@ async def process_video_pipeline():
             print(f"❌ Lỗi render SVD cảnh {scene_index}: {e}")
             continue
 
-        # ---------- 4.2 Lồng thoại bằng Edge-TTS ----------
+        # 4.2 Lồng thoại Edge-TTS
         if scene_text:
             print(f"🎙️ Tạo thoại cảnh {scene_index}: '{scene_text[:40]}...'")
             communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
@@ -369,7 +368,6 @@ async def process_video_pipeline():
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Xóa bớt các file trung gian
         for f in [raw_video_file, audio_scene_file]:
             if os.path.exists(f):
                 os.remove(f)
@@ -378,13 +376,10 @@ async def process_video_pipeline():
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
 
-    # Giải phóng SVD
     del svd
     clear_vram()
 
-    # -------------------------------------------------------------------
-    # 5. GHÉP TẤT CẢ NGHỆ THUẬT & UPLOAD PHIM HOÀN CHỈNH
-    # -------------------------------------------------------------------
+    # PHASE 3: CONCAT ALL SCENES
     print("\n🎞️ --- GIAI ĐOẠN 3: GHÉP TẤT CẢ CÁC CẢNH THÀNH PHIM HOÀN CHỈNH ---")
     if not rendered_files:
         send_n8n_final_webhook("failed", 0, error_message="Không render được cảnh nào.")
@@ -397,15 +392,15 @@ async def process_video_pipeline():
     concat_output = f"final_concat_{RUN_DATE}.mp4"
     final_output = f"final_movie_{RUN_DATE}.mp4"
 
-    subprocess.run(f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}", shell=True, check=True)
+    subprocess.run(f'ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy "{concat_output}"', shell=True, check=True)
 
     bgm_file = "bgm_xianxia.mp3"
     if os.path.exists(bgm_file):
         bgm_cmd = (
-            f'ffmpeg -y -i {concat_output} -stream_loop -1 -i {bgm_file} '
+            f'ffmpeg -y -i "{concat_output}" -stream_loop -1 -i "{bgm_file}" '
             f'-filter_complex "[0:a]volume=1.2[v_tts];[1:a]volume=0.15[v_bgm];'
             f'[v_tts][v_bgm]amix=inputs=2:duration=first[a]" '
-            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k {final_output}'
+            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k "{final_output}"'
         )
         try:
             subprocess.run(bgm_cmd, shell=True, check=True)
@@ -414,7 +409,7 @@ async def process_video_pipeline():
     else:
         final_output = concat_output
 
-    print(f"\n☁️ Tiến hành Upload Phim Hoàn Chỉnh lên Google Drive...")
+    print("\n☁️ Tiến hành Upload Phim Hoàn Chỉnh lên Google Drive...")
     drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
     send_n8n_final_webhook(
@@ -426,10 +421,11 @@ async def process_video_pipeline():
     print("\n🎉 HOÀN TẤT QUY TRÌNH TỰ ĐỘNG SDXL → SVD I2V!")
 
 # -------------------------------------------------------------------
-# KÍCH HOẠT VÒNG LẶP ASYNCIO
+# KÍCH HOẠT VÒNG LẶP ASYNCIO TRÊN KAGGLE / JUPYTER
 # -------------------------------------------------------------------
-try:
-    asyncio.run(process_video_pipeline())
-except RuntimeError:
+if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(process_video_pipeline())
+    if loop.is_running():
+        asyncio.ensure_future(process_video_pipeline())
+    else:
+        loop.run_until_complete(process_video_pipeline())
