@@ -1,15 +1,12 @@
 import asyncio
 import gc
-import json
 import os
-from pathlib import Path
-import re
 import subprocess
 import sys
 import time
 
 # -------------------------------------------------------------------
-# 1. CÀI ĐẶT PACKAGE (ĐÃ KHẮC PHỤC XUNG ĐỘT DEPENDENCY)
+# 1. CÀI ĐẶT PACKAGE
 # -------------------------------------------------------------------
 def install_requirements():
     packages = [
@@ -25,6 +22,7 @@ def install_requirements():
         "edge-tts",
         "accelerate",
         "protobuf<6.0.0,>=3.20.2",
+        "peft",                    # cần cho load LoRA
     ]
     print("📦 Đang kiểm tra và đồng bộ Packages...")
     subprocess.check_call([
@@ -42,14 +40,14 @@ import numpy as np
 import pandas as pd
 import requests
 import edge_tts
-from diffusers import LTXPipeline, AutoencoderKLX
+from diffusers import LTXPipeline
 from diffusers.utils import export_to_video
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 KHỞI TẠO PIPELINE LTX-VIDEO TỐI ƯU VRAM & MÀU SẮC - PHIÊN RUN [{RUN_DATE}]")
+print(f"🚀 KHỞI TẠO PIPELINE LTX-VIDEO + ANIME LORA - PHIÊN RUN [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -71,6 +69,13 @@ N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-don
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
+
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+# ====== CẤU HÌNH ANIME LORA ======
+# Thay đường dẫn LoRA của bạn vào đây (có thể là local path hoặc repo_id)
+ANIME_LORA_PATH = None          # ví dụ: "path/to/anime_style_ltx.safetensors"
+ANIME_LORA_SCALE = 0.8          # độ mạnh LoRA (0.6 ~ 1.0)
 
 VOICE_MAP = {
     "nam": "vi-VN-NamMinhNeural",
@@ -101,7 +106,7 @@ def get_media_duration(file_path):
         return 2.0
 
 # -------------------------------------------------------------------
-# 2. ĐỌC VÀ XỬ LÝ DỮ LIỆU SHEETS
+# 2. ĐỌC DỮ LIỆU SHEETS
 # -------------------------------------------------------------------
 print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
 try:
@@ -167,19 +172,31 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
         print(f"❌ Lỗi gửi Webhook: {str(e)}")
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL VỚI CÁC TỐI ƯU VRAM & BFLOAT16
+# 3. LOAD MODEL + ANIME LORA
 # -------------------------------------------------------------------
-print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO (TỐI ƯU BỘ NHỚ)...")
+print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO + ANIME LORA...")
 try:
     MODEL_ID = "Lightricks/LTX-Video"
-    vae = AutoencoderKLX.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.bfloat16)
-    pipe = LTXPipeline.from_pretrained(MODEL_ID, vae=vae, torch_dtype=torch.bfloat16)
 
+    pipe = LTXPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
+    )
+
+    # Load Anime LoRA nếu có
+    if ANIME_LORA_PATH:
+        print(f"🎨 Đang load Anime LoRA: {ANIME_LORA_PATH}")
+        pipe.load_lora_weights(ANIME_LORA_PATH)
+        pipe.fuse_lora(lora_scale=ANIME_LORA_SCALE)
+        print(f"✅ Đã fuse Anime LoRA với scale = {ANIME_LORA_SCALE}")
+
+    # Tối ưu VRAM cho T4
     pipe.enable_sequential_cpu_offload()
     pipe.vae.enable_tiling()
     pipe.vae.enable_slicing()
 
-    print("✅ Load Model LTX-Video & Bật Offload VRAM thành công!")
+    print("✅ Load Model + Offload VRAM thành công!")
 except Exception as e:
     send_n8n_final_webhook("failed", 0, error_message=f"Lỗi load model: {str(e)}")
     sys.exit(1)
@@ -190,8 +207,16 @@ except Exception as e:
 async def process_video_pipeline():
     rendered_files = []
 
-    STYLE_3D_PREFIX = "3d chinese donghua animation style, unreal engine 5 render, extremely detailed 3d face,"
-    DEFAULT_NEGATIVE = "2d, flat drawing, realistic human, photorealistic, blurry, low quality, distorted face, morphing, text, watermark, stiff pose, deformed hands, missing fingers, extra limbs, overexposed, oversaturated, burn effects"
+    STYLE_3D_PREFIX = (
+        "3d chinese donghua animation style, unreal engine 5 render, "
+        "extremely detailed 3d face, anime style, "
+    )
+    DEFAULT_NEGATIVE = (
+        "2d, flat drawing, realistic human, photorealistic, blurry, low quality, "
+        "distorted face, morphing, text, watermark, stiff pose, deformed hands, "
+        "missing fingers, extra limbs, overexposed, oversaturated, burn effects, "
+        "rainbow color distortion, glitch"
+    )
 
     for index, row in df.iterrows():
         scene_idx_val = row.get("scene_index")
@@ -200,7 +225,7 @@ async def process_video_pipeline():
         raw_prompt = str(row.get("prompt", "")).strip()
         raw_negative = str(row.get("negative_prompt", "")).strip()
 
-        # Lọc dữ liệu thoại an toàn
+        # Lấy thoại
         scene_text = ""
         for col in ["dialogue", "scene_narration_vi", "narration_vi", "narration"]:
             if col in row and pd.notna(row[col]):
@@ -222,9 +247,13 @@ async def process_video_pipeline():
             rendered_files.append(final_scene_file)
             continue
 
-        # 4.1 Sinh Video LTX
+        # 4.1 Sinh Video
         final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
-        final_negative = raw_negative if (raw_negative and raw_negative.lower() not in ["nan", "[empty]", "none"]) else DEFAULT_NEGATIVE
+        final_negative = (
+            raw_negative
+            if (raw_negative and raw_negative.lower() not in ["nan", "[empty]", "none"])
+            else DEFAULT_NEGATIVE
+        )
 
         scene_seed = 42 + scene_index
         generator = torch.Generator(device="cpu").manual_seed(scene_seed)
@@ -243,30 +272,28 @@ async def process_video_pipeline():
                     num_frames=49,
                     frame_rate=24.0,
                     num_inference_steps=25,
-                    guidance_scale=2.8,          # tăng nhẹ để màu rõ và có độ tương phản tốt hơn
+                    guidance_scale=2.8,
                     generator=generator,
                     output_type="pt"
                 )
                 video_tensor = output.frames[0] if hasattr(output, "frames") else output[0]
 
-            # --- SỬA CẢI THIỆN MÀU SẮC ---
+            # ===== SỬA TRIỆT ĐỂ LỖI MÀU =====
             video_tensor = video_tensor.to(torch.float32)
 
-            # Đưa về đúng thứ tự (F, H, W, C)
+            # Đưa về (F, H, W, C)
             if video_tensor.ndim == 4:
                 if video_tensor.shape[0] in [3, 4]:          # (C, F, H, W)
                     video_tensor = video_tensor.permute(1, 2, 3, 0)
                 elif video_tensor.shape[1] in [3, 4]:        # (F, C, H, W)
                     video_tensor = video_tensor.permute(0, 2, 3, 1)
 
-            # Cách chuẩn của LTX: output thường nằm trong [-1, 1]
+            # Cách chuẩn của LTX: [-1, 1] → [0, 1]
             if video_tensor.min() < -0.1:
                 video_tensor = (video_tensor + 1.0) / 2.0
 
-            # Clamp an toàn
             video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
 
-            # Xuất video
             video_frames = (video_tensor * 255.0).cpu().numpy().astype(np.uint8)
             export_to_video(video_frames, raw_video_file, fps=24)
 
@@ -278,11 +305,11 @@ async def process_video_pipeline():
             print(f"❌ Lỗi render video cảnh {scene_index}: {str(e)}")
             continue
 
-        # 4.2 Xử lý Voice Thuyết Minh & Trộn Âm thanh
+        # 4.2 Xử lý Voice
         if scene_text:
             character_name = str(row.get("character_name", "")).strip()
             char_prefix = f"[{character_name}]: " if character_name and character_name.lower() not in ["nan", "[empty]", "none"] else ""
-            print(f"🎙️ Tạo voice cảnh {scene_index} {char_prefix}'{scene_text}'")
+            print(f"🎙️ Tạo voice cảnh {scene_index} {char_prefix}'{scene_text[:60]}...'")
 
             communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
             await communicate.save(audio_scene_file)
@@ -295,24 +322,25 @@ async def process_video_pipeline():
                 mix_scene_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
                     f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
-                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 -c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
+                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 '
+                    f'-c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
                 )
             else:
                 mix_scene_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
-                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 -c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
+                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 '
+                    f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
                 )
-
             subprocess.run(mix_scene_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            # Dành cho cảnh không có lời thoại -> Tạo audio câm
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
-                f'-c:v libx264 -pix_fmt yuv420p -r 24 -c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
+                f'-c:v libx264 -pix_fmt yuv420p -r 24 -c:a aac -ar 44100 -ac 2 -b:a 192k '
+                f'-shortest "{final_scene_file}"'
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Xóa file tạm
+        # Dọn file tạm
         if os.path.exists(raw_video_file):
             os.remove(raw_video_file)
         if os.path.exists(audio_scene_file):
@@ -323,7 +351,7 @@ async def process_video_pipeline():
         rendered_files.append(final_scene_file)
 
     # -------------------------------------------------------------------
-    # 5. GỘP TOÀN BỘ CẢNH THÀNH PHIM HOÀN CHỈNH
+    # 5. GỘP CẢNH
     # -------------------------------------------------------------------
     print("\n🎞️ 5. TIẾN HÀNH GỘP TOÀN BỘ CÁC CẢNH...")
     if not rendered_files:
@@ -337,18 +365,23 @@ async def process_video_pipeline():
     concat_output = f"final_concat_{RUN_DATE}.mp4"
     final_output = f"final_movie_{RUN_DATE}.mp4"
 
-    subprocess.run(f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}", shell=True, check=True)
+    subprocess.run(
+        f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}",
+        shell=True, check=True
+    )
 
     # -------------------------------------------------------------------
-    # 6. THÊM NHẠC NỀN (BGM)
+    # 6. BGM
     # -------------------------------------------------------------------
     bgm_file = "bgm_xianxia.mp3"
     if os.path.exists(bgm_file):
-        print("🎵 Đang hòa âm Nhạc nền BGM cho phim...")
+        print("🎵 Đang hòa âm Nhạc nền BGM...")
         bgm_cmd = (
             f'ffmpeg -y -i {concat_output} -stream_loop -1 -i {bgm_file} '
-            f'-filter_complex "[0:a]volume=1.2[v_tts];[1:a]volume=0.15[v_bgm];[v_tts][v_bgm]amix=inputs=2:duration=first[a]" '
-            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k {final_output}'
+            f'-filter_complex "[0:a]volume=1.2[v_tts];[1:a]volume=0.15[v_bgm];'
+            f'[v_tts][v_bgm]amix=inputs=2:duration=first[a]" '
+            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k '
+            f"{final_output}"
         )
         try:
             subprocess.run(bgm_cmd, shell=True, check=True)
@@ -358,7 +391,7 @@ async def process_video_pipeline():
         final_output = concat_output
 
     # -------------------------------------------------------------------
-    # 7. UPLOAD PHIM HOÀN CHỈNH & WEBHOOK THÔNG BÁO
+    # 7. UPLOAD & WEBHOOK
     # -------------------------------------------------------------------
     print(f"\n☁️ 7. ĐANG TẢI PHIM HOÀN CHỈNH {final_output} LÊN GOOGLE DRIVE...")
     drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
@@ -369,10 +402,9 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
+    print("\n🎉 HOÀN TẤT TOÀN BỘ TIẾN TRÌNH RENDER!")
 
-    print("\n🎉 HOÀN TẤT TOÀN BỘ TIẾN TRÌNH RENDER PHIM 3D DONGHUA!")
-
-# Thực thi Async
+# Thực thi
 try:
     asyncio.run(process_video_pipeline())
 except RuntimeError:
