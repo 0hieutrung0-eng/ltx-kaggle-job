@@ -44,14 +44,14 @@ import pandas as pd
 import requests
 import edge_tts
 from PIL import Image
-from diffusers import StableDiffusionXLPipeline, StableVideoDiffusionPipeline
+from diffusers import StableDiffusionXLPipeline, LTXImageToVideoPipeline
 from diffusers.utils import export_to_video, load_image
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 SDXL → SVD PIPELINE - [{RUN_DATE}]")
+print(f"🚀 SDXL → LTX-VIDEO PIPELINE - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -106,7 +106,6 @@ def get_media_duration(file_path):
 print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
 try:
     df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
-    # Chuẩn hóa tên cột: xóa khoảng trắng và chuyển thành chữ thường
     df.columns = df.columns.str.strip().str.lower()
     total_scenes = len(df)
     print(f"✅ Tìm thấy {total_scenes} cảnh.")
@@ -195,21 +194,19 @@ except Exception as e:
     sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. LOAD MODEL SVD (Image → Video)
+# 4. LOAD MODEL LTX-VIDEO (Image → Video)
 # -------------------------------------------------------------------
-print("\n🧠 4. LOAD Stable Video Diffusion XT...")
+print("\n🧠 4. LOAD LTX-Video Pipeline...")
 try:
-    svd = StableVideoDiffusionPipeline.from_pretrained(
-        "stabilityai/stable-video-diffusion-img2vid-xt",
-        torch_dtype=torch.float16,
-        variant="fp16",
-        use_safetensors=True,
+    ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
+        "Lightricks/LTX-Video",
+        torch_dtype=torch.bfloat16,
         token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
     )
-    svd.enable_model_cpu_offload()
-    print("✅ Load SVD thành công!")
+    ltx_pipe.enable_model_cpu_offload()
+    print("✅ Load LTX-Video thành công!")
 except Exception as e:
-    print(f"❌ Lỗi load SVD: {e}")
+    print(f"❌ Lỗi load LTX-Video: {e}")
     sys.exit(1)
 
 # -------------------------------------------------------------------
@@ -227,7 +224,6 @@ async def process_video_pipeline():
         scene_idx_val = row.get("scene_index")
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
 
-        # Lấy Prompt ảnh chính xác theo các tên cột có thể có
         raw_prompt = ""
         for p_col in ["image_prompt", "prompt", "visual_prompt"]:
             if p_col in row and pd.notna(row[p_col]):
@@ -236,10 +232,8 @@ async def process_video_pipeline():
                     raw_prompt = val
                     break
 
-        # Lấy Negative Prompt
         raw_negative = str(row.get("negative_prompt", "")).strip()
 
-        # Lấy câu đọc thoại (Thuyết minh hoặc Hội thoại)
         scene_text = ""
         for col in ["narration_vi", "dialogue", "scene_narration_vi", "narration"]:
             if col in row and pd.notna(row[col]):
@@ -287,34 +281,37 @@ async def process_video_pipeline():
             image.save(image_file)
             print(f"   ✅ Đã lưu ảnh cục bộ: {image_file}")
 
-            # Upload ngay ảnh PNG lên Google Drive
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
 
         except Exception as e:
             print(f"❌ Lỗi tạo ảnh cảnh {scene_index}: {e}")
             continue
 
-        # ---------- 5.2 Image → Video (SVD) ----------
-        print(f"🎬 [{scene_index}/{total_scenes}] Tạo video từ ảnh bằng SVD...")
+        # ---------- 5.2 Image → Video (LTX-Video) ----------
+        print(f"🎬 [{scene_index}/{total_scenes}] Tạo video từ ảnh bằng LTX-Video...")
         try:
             gc.collect()
             torch.cuda.empty_cache()
 
             image_input = load_image(image_file).resize((1024, 576))
 
-            frames = svd(
-                image_input,
-                decode_chunk_size=8,
+            # Số khung hình phải có dạng 8N + 1 (ví dụ: 25, 33, 41, 49)
+            video_frames = ltx_pipe(
+                image=image_input,
+                prompt=final_prompt,
+                negative_prompt=final_negative,
+                width=1024,
+                height=576,
+                num_frames=25,
+                num_inference_steps=30,
                 generator=generator,
-                num_frames=20,
-                motion_bucket_id=75,
-                noise_aug_strength=0.01,
             ).frames[0]
 
-            export_to_video(frames, raw_video_file, fps=7)
-            print(f"   ✅ Đã tạo video thô: {raw_video_file}")
+            # Xuất video với chuẩn 25 fps của LTX-Video
+            export_to_video(video_frames, raw_video_file, fps=25)
+            print(f"   ✅ Đã tạo video thô LTX: {raw_video_file}")
 
-            del frames
+            del video_frames
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -337,32 +334,30 @@ async def process_video_pipeline():
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
                     f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
-                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 7 '
+                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 25 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
                 )
             else:
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
-                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 7 '
+                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 25 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
                 )
             subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
-                f'-c:v libx264 -pix_fmt yuv420p -r 7 -c:a aac -ar 44100 -ac 2 -b:a 192k '
+                f'-c:v libx264 -pix_fmt yuv420p -r 25 -c:a aac -ar 44100 -ac 2 -b:a 192k '
                 f'-shortest "{final_scene_file}"'
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Dọn dẹp tệp tạm
         for f in [image_file, raw_video_file, audio_scene_file]:
             if os.path.exists(f):
                 os.remove(f)
 
         print(f"💾 Hoàn tất cảnh {scene_index}")
 
-        # Upload video MP4 của cảnh lên Google Drive
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
 
