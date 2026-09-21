@@ -1,19 +1,42 @@
+import subprocess
+import sys
+
+# ==========================================
+# 0. TỰ ĐỘNG CÀI ĐẶT THƯ VIỆN CÒN THIẾU TRÊN KAGGLE
+# ==========================================
+REQUIRED_PACKAGES = [
+    "edge-tts",
+    "google-api-python-client",
+    "google-auth-httplib2",
+    "google-auth-oauthlib",
+]
+
+for package in REQUIRED_PACKAGES:
+    try:
+        module_name = package.replace("-", "_")
+        __import__(module_name)
+    except ImportError:
+        print(f"📦 Đang tự động cài đặt thư viện: {package}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
+
+# Import đầy đủ các thư viện sau khi đã đảm bảo môi trường đủ package
 import os
 import gc
 import re
 import time
+import asyncio
 import torch
 import pandas as pd
 from PIL import Image
 from diffusers import StableDiffusionXLPipeline, StableVideoDiffusionPipeline
+from diffusers.utils import export_to_video
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 import edge_tts
-import asyncio
 
 # ==========================================
-# CẤU HÌNH BIẾN MÔI TRƯỜNG & TOKEN
+# 1. CẤU HÌNH BIẾN MÔI TRƯỜNG & CONSTANTS
 # ==========================================
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")
@@ -21,12 +44,12 @@ REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "")
 CLIENT_ID = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 
-# Rút ngắn STYLE_PREFIX để đảm bảo tổng số Token < 77 (ngưỡng giới hạn của CLIP)
+# STYLE_PREFIX rút ngắn để không làm tràn 77 tokens của CLIP
 STYLE_PREFIX = "3d chinese donghua animation, unreal engine 5, detailed 3d face, anime, cinematic,"
 NEGATIVE_PROMPT = "deformed, distorted, disfigured, low quality, bad anatomy, bad hands, blurry"
 
 # ==========================================
-# TỰ ĐỘNG UPLOAD LÊN GOOGLE DRIVE
+# 2. XỬ LÝ UPLOAD GOOGLE DRIVE
 # ==========================================
 def get_drive_service():
     creds = Credentials(
@@ -40,7 +63,7 @@ def get_drive_service():
 
 def upload_file_to_drive_fresh(file_path, folder_id):
     if not os.path.exists(file_path) or not folder_id:
-        print(f"⚠️ Bỏ qua upload: Không tìm thấy file {file_path} hoặc chưa cấu hình DRIVE_FOLDER_ID.")
+        print(f"⚠️ Bỏ qua upload: Không tìm thấy file {file_path} hoặc chưa cài DRIVE_FOLDER_ID.")
         return None
     
     filename = os.path.basename(file_path)
@@ -60,7 +83,7 @@ def upload_file_to_drive_fresh(file_path, folder_id):
         return None
 
 # ==========================================
-# CÁC HÀM BỔ TRỢ & TỐI ƯU VRAM
+# 3. HÀM TRỢ GIÚP & TTS
 # ==========================================
 def clear_vram():
     gc.collect()
@@ -73,7 +96,7 @@ async def generate_tts(text, output_audio_path, voice="vi-VN-NamMinhNeural"):
     await communicator.save(output_audio_path)
 
 # ==========================================
-# KHỞI TẠO PIPELINE TỐI ƯU (SỬA CẢNH BÁO)
+# 4. KHỞI TẠO PIPELINE (ĐÃ SỬA DEPRECATION WARNINGS)
 # ==========================================
 def load_sdxl_pipeline():
     print("\n🧠 Load SDXL Pipeline (Text → Image)...")
@@ -86,7 +109,7 @@ def load_sdxl_pipeline():
     )
     sdxl.enable_model_cpu_offload()
     
-    # Cú pháp chuẩn mới thay thế cho enable_vae_tiling() bị deprecated
+    # Sửa cú pháp VAE Tiling chuẩn mới của Diffusers
     sdxl.vae.enable_tiling()
     return sdxl
 
@@ -103,11 +126,11 @@ def load_svd_pipeline():
     return svd
 
 # ==========================================
-# TIẾN TRÌNH CHẠY CHÍNH (MAIN PROCESS)
+# 5. TIẾN TRÌNH THỰC THI CHÍNH
 # ==========================================
 def main():
     if not os.path.exists("prompt.csv"):
-        print("❌ Không tìm thấy tệp prompt.csv trong thư mục!")
+        print("❌ Không tìm thấy tệp prompt.csv!")
         return
 
     df = pd.read_csv("prompt.csv")
@@ -115,7 +138,7 @@ def main():
     generated_images = {}
 
     # -------------------------------------------------------------------
-    # GIAI ĐOẠN 1: TẠO & UPLOAD TOÀN BỘ ẢNH TĨNH (SDXL)
+    # GIAI ĐOẠN 1: TẠO VÀ UPLOAD ẢNH TĨNH TỪNG CẢNH (SDXL)
     # -------------------------------------------------------------------
     print("\n🎨 --- GIAI ĐOẠN 1: TẠO ẢNH TĨNH TỪ IMAGE_PROMPT (SDXL) ---")
     sdxl = load_sdxl_pipeline()
@@ -126,7 +149,7 @@ def main():
         final_prompt = f"{STYLE_PREFIX} {raw_prompt}"
         image_file = f"image_{scene_index:03d}_{timestamp}.png"
 
-        print(f"\n🖼️ [{scene_index}/{len(df)}] Đang tạo ảnh cho Cảnh {scene_index}...")
+        print(f"\n🖼️ [{scene_index}/{len(df)}] Đang tạo ảnh Cảnh {scene_index}...")
         
         try:
             clear_vram()
@@ -142,25 +165,25 @@ def main():
                 generator=generator,
             ).images[0]
 
-            # 1. Lưu cục bộ trên Kaggle
+            # Lưu máy cục bộ
             image.save(image_file)
             generated_images[scene_index] = image_file
             print(f"   ✅ Đã lưu ảnh: {image_file}")
 
-            # 2. Upload ngay ảnh vừa tạo lên Google Drive
+            # Upload ảnh tĩnh ngay lên Google Drive
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
 
         except Exception as e:
-            print(f"❌ Lỗi tạo ảnh ở Cảnh {scene_index}: {e}")
+            print(f"❌ Lỗi tạo ảnh Cảnh {scene_index}: {e}")
 
-    # GIẢI PHÓNG VRAM CỦA SDXL TRƯỚC KHI NẠP SVD
+    # Giải phóng VRAM SDXL trước khi nạp SVD
     del sdxl
     clear_vram()
 
     # -------------------------------------------------------------------
     # GIAI ĐOẠN 2: CHUYỂN ẢNH THÀNH VIDEO & UPLOAD TỪNG CẢNH (SVD + TTS)
     # -------------------------------------------------------------------
-    print("\n🎬 --- GIAI ĐOẠN 2: TẠO VIDEO TỪNG CẢNH & GHÉP LỜI THOẠI (SVD) ---")
+    print("\n🎬 --- GIAI ĐOẠN 2: TẠO VIDEO TỪNG CẢNH & GHÉP LỜI THOẠI ---")
     svd = load_svd_pipeline()
     rendered_scene_videos = []
 
@@ -170,14 +193,14 @@ def main():
         image_file = generated_images.get(scene_index)
 
         if not image_file or not os.path.exists(image_file):
-            print(f"⚠️ Bỏ qua Cảnh {scene_index} vì không tìm thấy ảnh gốc.")
+            print(f"⚠️ Bỏ qua Cảnh {scene_index} vì không tìm thấy ảnh nguồn.")
             continue
 
         raw_video_file = f"raw_video_{scene_index:03d}_{timestamp}.mp4"
         audio_file = f"audio_{scene_index:03d}_{timestamp}.mp3"
         final_scene_file = f"scene_{scene_index:03d}_{timestamp}.mp4"
 
-        print(f"\n🎥 [{scene_index}/{len(df)}] Đang chuyển ảnh thành video Cảnh {scene_index}...")
+        print(f"\n🎥 [{scene_index}/{len(df)}] Đang tạo video cho Cảnh {scene_index}...")
 
         try:
             clear_vram()
@@ -194,11 +217,9 @@ def main():
                 generator=generator
             ).frames[0]
 
-            # Lưu file video thô
-            from diffusers.utils import export_to_video
             export_to_video(frames, raw_video_file, fps=7)
 
-            # Tạo giọng đọc TTS
+            # Tạo giọng đọc TTS tiếng Việt
             asyncio.run(generate_tts(voice_text, audio_file))
 
             # Ghép Video + Audio bằng FFmpeg
@@ -209,18 +230,18 @@ def main():
 
             print(f"   ✅ Đã tạo xong video cảnh: {final_scene_file}")
 
-            # Upload ngay video cảnh vừa ghép lên Google Drive
+            # Upload video cảnh lên Google Drive
             upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
             rendered_scene_videos.append(final_scene_file)
 
-            # Dọn dẹp file tạm không cần thiết để tiết kiệm dung lượng
+            # Xóa các file trung gian để tiết kiệm dung lượng đĩa Kaggle
             if os.path.exists(raw_video_file): os.remove(raw_video_file)
             if os.path.exists(audio_file): os.remove(audio_file)
 
         except Exception as e:
             print(f"❌ Lỗi tạo video Cảnh {scene_index}: {e}")
 
-    # GIẢI PHÓNG VRAM CỦA SVD
+    # Giải phóng VRAM SVD
     del svd
     clear_vram()
 
@@ -228,7 +249,7 @@ def main():
     # GIAI ĐOẠN 3: NỐI TẤT CẢ CÁC CẢNH THÀNH PHIM HOÀN CHỈNH
     # -------------------------------------------------------------------
     if rendered_scene_videos:
-        print("\n🎞️ --- GIAI ĐOẠN 3: GHÉP TOÀN BỘ CÁC CẢNH THÀNH PHIM HOÀN CHỈNH ---")
+        print("\n🎞️ --- GIAI ĐOẠN 3: GHÉP PHIM HOÀN CHỈNH ---")
         concat_list_file = f"concat_list_{timestamp}.txt"
         final_movie_file = f"final_movie_{timestamp}.mp4"
 
@@ -243,7 +264,7 @@ def main():
 
         print(f"🎉 ĐÃ HOÀN THÀNH PHIM: {final_movie_file}")
         
-        # Upload video phim hoàn chỉnh lên Google Drive
+        # Upload phim hoàn chỉnh lên Drive
         upload_file_to_drive_fresh(final_movie_file, DRIVE_FOLDER_ID)
 
         if os.path.exists(concat_list_file): os.remove(concat_list_file)
