@@ -9,7 +9,7 @@ import time
 
 
 # -------------------------------------------------------------------
-# 1. CÀI ĐẶT PACKAGE (ĐÃ KHÓA PHIÊN BẢN TRÁNH XUNG ĐỘT DEPENDENCY)
+# 1. CÀI ĐẶT PACKAGE (ẨN HOÀN TOÀN CẢNH BÁO DEPENDENCY PIP)
 # -------------------------------------------------------------------
 def install_requirements():
   packages = [
@@ -30,7 +30,16 @@ def install_requirements():
   ]
   print("📦 Đang kiểm tra và đồng bộ Packages...")
   subprocess.check_call(
-      [sys.executable, "-m", "pip", "install", "-q"] + packages
+      [
+          sys.executable,
+          "-m",
+          "pip",
+          "install",
+          "-q",
+          "--no-warn-script-location",
+          "--disable-pip-version-check",
+      ]
+      + packages
   )
 
 
@@ -84,9 +93,6 @@ GOOGLE_SHEET_CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
-
-# 🔑 HUGGING FACE TOKEN (ĐÃ CẬP NHẬT TOKEN MỚI)
-HF_TOKEN = "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"
 
 VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
@@ -206,14 +212,13 @@ def send_n8n_final_webhook(
 
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL
+# 3. LOAD MODEL (ĐÃ BỎ HF_TOKEN)
 # -------------------------------------------------------------------
 print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 try:
   MODEL_ID = "Lightricks/LTX-Video"
-  pipe = LTXPipeline.from_pretrained(
-      MODEL_ID, dtype=torch.bfloat16, token=HF_TOKEN
-  )
+  # Tải trực tiếp không cần token
+  pipe = LTXPipeline.from_pretrained(MODEL_ID, dtype=torch.bfloat16)
 
   pipe.enable_model_cpu_offload()
   pipe.vae.enable_tiling()
@@ -302,11 +307,12 @@ async def process_video_pipeline():
         )
         video_tensor = output.frames[0]
 
+      # Chuẩn hóa dải giá trị về [0.0, 1.0]
       if video_tensor.min() < 0:
         video_tensor = (video_tensor + 1.0) / 2.0
       video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
 
-      # Permute kênh màu chuẩn [Frames, Height, Width, Channels] Tránh sai màu / xoay video
+      # XỬ LÝ SHAPE TENSOR: Đưa kênh màu C về cuối [Frames, Height, Width, Channels]
       if video_tensor.ndim == 4 and video_tensor.shape[1] == 3:
         video_tensor = video_tensor.permute(0, 2, 3, 1)
       elif video_tensor.ndim == 4 and video_tensor.shape[0] == 3:
