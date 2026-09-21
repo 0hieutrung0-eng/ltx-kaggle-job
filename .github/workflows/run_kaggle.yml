@@ -39,7 +39,7 @@ jobs:
 
           # 2. Tạo Slug mới theo Ngày-Giờ-Phút
           TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
-          DYNAMIC_SLUG="ltx-render-$TIMESTAMP"
+          DYNAMIC_SLUG="wan-render-$TIMESTAMP"
           
           echo "--> Generating new notebook ID: $KAGGLE_USERNAME/$DYNAMIC_SLUG"
           
