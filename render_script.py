@@ -6,6 +6,9 @@ import sys
 import time
 from pathlib import Path
 
+# -------------------------------------------------------------------
+# 1. CÀI ĐẶT PACKAGES & CẤU HÌNH HỆ THỐNG
+# -------------------------------------------------------------------
 def install_requirements():
     packages = [
         "nest_asyncio",
@@ -26,6 +29,9 @@ def install_requirements():
         "omegaconf",
         "einops",
         "opencv-python",
+        "pandas",
+        "requests",
+        "Pillow"
     ]
     print("📦 Đang kiểm tra và cài đặt packages...")
     subprocess.check_call([
@@ -51,8 +57,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 FLUX.1 + LTX-VIDEO PIPELINE - [{RUN_DATE}]")
+print(f"🚀 FLUX.1 + LTX-VIDEO PIPELINE (RAM SAFE EDITION) - [{RUN_DATE}]")
 
+# Cấu hình PyTorch quản lý bộ nhớ chống phân mảnh VRAM
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
 def sync_system_time():
@@ -67,7 +74,7 @@ def sync_system_time():
 sync_system_time()
 
 # -------------------------------------------------------------------
-# CONFIG
+# CONFIG VÀ THÔNG TIN DỰ ÁN
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
@@ -75,7 +82,10 @@ GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/expor
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
+VOICE_MAP = {
+    "nam": "vi-VN-NamMinhNeural",
+    "nu": "vi-VN-HoaiMyNeural"
+}
 
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "948179937421-o55enfl61lb8ou0ms2jmrr4dlf1fhgip.apps.googleusercontent.com")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "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")
@@ -101,7 +111,7 @@ def get_media_duration(file_path):
         return 2.0
 
 # -------------------------------------------------------------------
-# 2. ĐỌC VÀ CHUẨN HÓA SHEETS
+# 2. ĐỌC DỮ LIỆU TỪ GOOGLE SHEETS
 # -------------------------------------------------------------------
 print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
 try:
@@ -119,8 +129,7 @@ project_info = {
     "genre": "Mặc định",
     "character_design": "",
     "world_setting": "",
-    "visual_style": "",
-    "gender": "nam"
+    "visual_style": ""
 }
 
 if not df.empty:
@@ -130,9 +139,6 @@ if not df.empty:
             val = str(first_row[key]).strip()
             if val.lower() not in ["nan", "[empty]", ""]:
                 project_info[key] = val
-
-SELECTED_GENDER = project_info.get("gender", "nam").lower()
-ACTIVE_VOICE = VOICE_MAP.get(SELECTED_GENDER, "vi-VN-NamMinhNeural")
 
 def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
     if not os.path.exists(file_path) or not folder_id:
@@ -175,97 +181,51 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
         print(f"❌ Lỗi webhook: {e}")
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL FLUX.1 (Text → Image)
-# -------------------------------------------------------------------
-print("\n🧠 3. LOAD FLUX.1 [schnell] (Text → Image)...")
-try:
-    flux_pipe = FluxPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-schnell",
-        torch_dtype=torch.bfloat16,
-        token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
-    )
-    flux_pipe.enable_model_cpu_offload()
-    print("✅ Load FLUX.1 thành công!")
-except Exception as e:
-    print(f"❌ Lỗi load FLUX.1: {e}")
-    sys.exit(1)
-
-# -------------------------------------------------------------------
-# 4. LOAD MODEL LTX-VIDEO (Image → Video)
-# -------------------------------------------------------------------
-print("\n🧠 4. LOAD LTX-Video Pipeline...")
-try:
-    ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
-        "Lightricks/LTX-Video",
-        torch_dtype=torch.bfloat16,
-        token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
-    )
-    ltx_pipe.enable_model_cpu_offload()
-    print("✅ Load LTX-Video thành công!")
-except Exception as e:
-    print(f"❌ Lỗi load LTX-Video: {e}")
-    sys.exit(1)
-
-# -------------------------------------------------------------------
-# 5. PROCESS PIPELINE
+# 3. QUY TRÌNH XỬ LÝ CHÍNH (2-PASS CHỐNG TRÀN RAM/VRAM)
 # -------------------------------------------------------------------
 async def process_video_pipeline():
     rendered_files = []
+    image_paths = {}
 
-    # Từ khóa bổ trợ phong cách 3D Tiên Hiệp cho FLUX
-    FLUX_STYLE_SUFFIX = (
-        ", 3d chinese animation style, donghua style, masterpiece, "
-        "highly detailed face, sharp focus, Unreal Engine 5 render, cinematic lighting"
-    )
+    # ===============================================================
+    # GIAI ĐOẠN 1: TẠO TOÀN BỘ ẢNH TĨNH BẰNG FLUX.1
+    # ===============================================================
+    print("\n🧠 [GIAI ĐOẠN 1] Khởi chạy FLUX.1 (Text → Image)...")
+    try:
+        flux_pipe = FluxPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-schnell",
+            torch_dtype=torch.bfloat16,
+            token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
+        )
+        flux_pipe.enable_sequential_cpu_offload() # Tối ưu hóa RAM/VRAM cấp độ cao nhất
+    except Exception as e:
+        print(f"❌ Lỗi load FLUX.1: {e}")
+        sys.exit(1)
 
     for index, row in df.iterrows():
         scene_idx_val = row.get("scene_index")
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
+        img_prompt = str(row.get("image_prompt", "")).strip()
 
-        raw_prompt = ""
-        for p_col in ["image_prompt", "prompt", "visual_prompt"]:
-            if p_col in row and pd.notna(row[p_col]):
-                val = str(row[p_col]).strip()
-                if val and val.lower() not in ["nan", "[empty]", "none", "null"]:
-                    raw_prompt = val
-                    break
-
-        scene_text = ""
-        for col in ["narration_vi", "dialogue", "scene_narration_vi", "narration"]:
-            if col in row and pd.notna(row[col]):
-                val = str(row[col]).strip()
-                if val and val.lower() not in ["nan", "[empty]", "none", "null"]:
-                    scene_text = val
-                    break
+        if not img_prompt or img_prompt.lower() in ["nan", "none", "null"]:
+            print(f"⚠️ Bỏ qua cảnh {scene_index}: Không tìm thấy image_prompt")
+            continue
 
         image_file = f"image_{scene_index:03d}_{RUN_DATE}.png"
-        raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
-        audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
-        final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
+        image_paths[scene_index] = image_file
 
-        if not raw_prompt:
-            print(f"⚠️ Bỏ qua cảnh {scene_index} do không tìm thấy prompt ảnh")
+        if os.path.exists(image_file):
+            print(f"⏩ Ảnh cảnh {scene_index} đã tồn tại → Bỏ qua sinh ảnh")
             continue
 
-        if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 10000:
-            print(f"⏩ [{scene_index}/{total_scenes}] Đã tồn tại → bỏ qua")
-            rendered_files.append(final_scene_file)
-            continue
-
-        final_prompt = raw_prompt + FLUX_STYLE_SUFFIX
-
-        scene_seed = 42 + scene_index
-        generator = torch.Generator(device="cpu").manual_seed(scene_seed)
-
-        # ---------- 5.1 Text → Image (FLUX.1) ----------
-        print(f"\n🖼️ [{scene_index}/{total_scenes}] Tạo ảnh bằng FLUX.1 [schnell]...")
+        print(f"🖼️ [{scene_index}/{total_scenes}] Đang sinh ảnh FLUX.1...")
         try:
             gc.collect()
             torch.cuda.empty_cache()
 
-            # FLUX.1-schnell đạt chất lượng tối ưu chỉ với 4 steps
+            generator = torch.Generator(device="cpu").manual_seed(42 + scene_index)
             image = flux_pipe(
-                prompt=final_prompt,
+                prompt=img_prompt,
                 width=1024,
                 height=576,
                 num_inference_steps=4,
@@ -275,48 +235,102 @@ async def process_video_pipeline():
             ).images[0]
 
             image.save(image_file)
-            print(f"   ✅ Đã lưu ảnh FLUX sắc nét: {image_file}")
-
+            print(f"   ✅ Đã lưu ảnh: {image_file}")
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
-
         except Exception as e:
-            print(f"❌ Lỗi tạo ảnh cảnh {scene_index}: {e}")
+            print(f"❌ Lỗi sinh ảnh cảnh {scene_index}: {e}")
+
+    # UNLOAD FLUX HOÀN TOÀN KHỎI BỘ NHỚ TRƯỚC KHI CHUYỂN SANG GIAI ĐOẠN 2
+    print("\n🧹 Xóa FLUX.1 khỏi RAM & VRAM...")
+    del flux_pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+    time.sleep(3)
+
+    # ===============================================================
+    # GIAI ĐOẠN 2: TẠO VIDEO BẰNG LTX-VIDEO & LẮP RÁP AUDIO
+    # ===============================================================
+    print("\n🧠 [GIAI ĐOẠN 2] Khởi chạy LTX-Video (Image → Video)...")
+    try:
+        ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
+            "Lightricks/LTX-Video",
+            torch_dtype=torch.bfloat16,
+            token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
+        )
+        ltx_pipe.enable_model_cpu_offload()
+    except Exception as e:
+        print(f"❌ Lỗi load LTX-Video: {e}")
+        sys.exit(1)
+
+    for index, row in df.iterrows():
+        scene_idx_val = row.get("scene_index")
+        scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
+
+        image_file = image_paths.get(scene_index)
+        if not image_file or not os.path.exists(image_file):
+            print(f"⚠️ Thiếu ảnh đầu vào cho cảnh {scene_index} → Bỏ qua")
             continue
 
-        # ---------- 5.2 Image → Video (LTX-Video) ----------
-        print(f"🎬 [{scene_index}/{total_scenes}] Tạo video từ ảnh FLUX bằng LTX-Video...")
+        vid_prompt = str(row.get("video_prompt", "")).strip()
+        neg_prompt = str(row.get("negative_prompt", "")).strip()
+        dialogue_text = str(row.get("dialogue", "")).strip()
+        char_name = str(row.get("character_name", "")).strip()
+
+        if dialogue_text.lower() in ["nan", "[empty]", "none", "null"]:
+            dialogue_text = ""
+
+        # Tự động phân tách giọng Nam/Nữ
+        voice_to_use = VOICE_MAP["nam"]
+        if any(kw in char_name.lower() for kw in ["nữ", "chị", "muội", "cô"]):
+            voice_to_use = VOICE_MAP["nu"]
+
+        raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
+        audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
+        final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
+
+        if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 10000:
+            print(f"⏩ Video cảnh {scene_index} đã tồn tại → Bỏ qua")
+            rendered_files.append(final_scene_file)
+            continue
+
+        print(f"\n🎬 [{scene_index}/{total_scenes}] Đang tạo chuyển động LTX-Video...")
         try:
             gc.collect()
             torch.cuda.empty_cache()
 
             image_input = load_image(image_file).resize((1024, 576))
+            scene_seed = 42 + scene_index
 
+            motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth character movement, cinematic lighting"
+
+            # Tối ưu hóa số khung hình và suy luận để tiết kiệm bộ nhớ
             video_frames = ltx_pipe(
                 image=image_input,
-                prompt=raw_prompt,
+                prompt=motion_prompt,
+                negative_prompt=neg_prompt if neg_prompt else None,
                 width=1024,
                 height=576,
                 num_frames=25,
-                num_inference_steps=30,
+                num_inference_steps=25, # Khống chế 25 steps cho tốc độ & VRAM an toàn
                 generator=torch.Generator(device="cuda").manual_seed(scene_seed),
             ).frames[0]
 
             export_to_video(video_frames, raw_video_file, fps=25)
-            print(f"   ✅ Đã tạo video thô LTX: {raw_video_file}")
+            print(f"   ✅ Đã tạo video thô: {raw_video_file}")
 
             del video_frames
             gc.collect()
             torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"❌ Lỗi tạo video cảnh {scene_index}: {e}")
+            print(f"❌ Lỗi sinh video LTX cảnh {scene_index}: {e}")
             if os.path.exists(image_file): os.remove(image_file)
             continue
 
-        # ---------- 5.3 Tạo Voice & Lắp ráp MP4 ----------
-        if scene_text:
-            print(f"🎙️ Voice cảnh {scene_index}: {scene_text[:50]}...")
-            communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
+        # ---------- Tạo Voice & Lắp ráp FFmpeg ----------
+        if dialogue_text:
+            print(f"🎙️ Voice [{char_name}]: {dialogue_text}")
+            communicate = edge_tts.Communicate(text=dialogue_text, voice=voice_to_use)
             await communicate.save(audio_scene_file)
 
             v_dur = get_media_duration(raw_video_file)
@@ -345,19 +359,23 @@ async def process_video_pipeline():
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+        # Xóa các file trung gian
         for f in [image_file, raw_video_file, audio_scene_file]:
-            if os.path.exists(f):
+            if os.path.exists(f): 
                 os.remove(f)
-
-        print(f"💾 Hoàn tất cảnh {scene_index}")
 
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
 
-    # -------------------------------------------------------------------
-    # 6. GỘP CẢNH + BGM + HOÀN TẤT
-    # -------------------------------------------------------------------
-    print("\n🎞️ Gộp tất cả các cảnh thành phim...")
+    # UNLOAD LTX-VIDEO KHỎI BỘ NHỚ
+    del ltx_pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ===============================================================
+    # GIAI ĐOẠN 3: GỘP TẤT CẢ CẢNH VÀ THÊM BGM
+    # ===============================================================
+    print("\n🎞️ Gộp tất cả các cảnh thành bộ phim hoàn chỉnh...")
     if not rendered_files:
         send_n8n_final_webhook("failed", 0, error_message="Không render được cảnh nào.")
         sys.exit(1)
@@ -386,7 +404,7 @@ async def process_video_pipeline():
     else:
         final_output = concat_output
 
-    print(f"\n☁️ Upload phim hoàn chỉnh...")
+    print(f"\n☁️ Upload phim hoàn chỉnh lên Google Drive...")
     drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
     send_n8n_final_webhook(
@@ -395,8 +413,11 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
-    print("\n🎉 HOÀN TẤT PIPELINE FLUX + LTX!")
+    print("\n🎉 HOÀN TẤT PIPELINE FLUX + LTX CHỐNG TRÀN RAM!")
 
+# -------------------------------------------------------------------
+# 4. CHẠY PIPELINE
+# -------------------------------------------------------------------
 try:
     asyncio.run(process_video_pipeline())
 except RuntimeError:
