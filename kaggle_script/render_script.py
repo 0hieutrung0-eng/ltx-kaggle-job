@@ -7,8 +7,9 @@ import subprocess
 import sys
 import time
 
+
 # -------------------------------------------------------------------
-# 1. CÀI ĐẶT PACKAGE Ở ĐẦU SCRIPT
+# 1. CÀI ĐẶT PACKAGE (ĐÃ KHÓA PHIÊN BẢN TRÁNH XUNG ĐỘT DEPENDENCY)
 # -------------------------------------------------------------------
 def install_requirements():
   packages = [
@@ -23,13 +24,13 @@ def install_requirements():
       "av",
       "edge-tts",
       "accelerate",
-      "protobuf",
-      "numpy",
-      "pandas",
+      "protobuf<6.0.0,>=3.20.2",
+      "numpy<2.0.0",
+      "pandas<3.0.0",
   ]
   print("📦 Đang kiểm tra và đồng bộ Packages...")
   subprocess.check_call(
-      [sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + packages
+      [sys.executable, "-m", "pip", "install", "-q"] + packages
   )
 
 
@@ -84,8 +85,8 @@ GOOGLE_SHEET_CSV_URL = (
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# 🔑 HUGGING FACE TOKEN
-HF_TOKEN = "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"
+# 🔑 HUGGING FACE TOKEN (ĐÃ CẬP NHẬT TOKEN MỚI)
+HF_TOKEN = "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"
 
 VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
@@ -115,7 +116,6 @@ def get_oauth_credentials():
 
 
 def get_media_duration(file_path):
-  """Đo chính xác thời lượng media (giây) bằng ffprobe."""
   cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{file_path}"'
   try:
     result = subprocess.run(
@@ -212,7 +212,7 @@ print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 try:
   MODEL_ID = "Lightricks/LTX-Video"
   pipe = LTXPipeline.from_pretrained(
-      MODEL_ID, torch_dtype=torch.bfloat16, token=HF_TOKEN
+      MODEL_ID, dtype=torch.bfloat16, token=HF_TOKEN
   )
 
   pipe.enable_model_cpu_offload()
@@ -298,30 +298,21 @@ async def process_video_pipeline():
             num_inference_steps=20,
             guidance_scale=3.5,
             generator=generator,
-            output_type="pt",  # Trả về PyTorch Tensor
+            output_type="pt",
         )
         video_tensor = output.frames[0]
 
-      # -------------------------------------------------------------------
-      # XỬ LÝ SHAPE TENSOR & CHUYỂN KÊNH MÀU CHUẨN (TRÁNH SAI MÀU / XOAY VIDEO)
-      # -------------------------------------------------------------------
-      # 1. Chuẩn hóa dải giá trị về [0.0, 1.0]
       if video_tensor.min() < 0:
         video_tensor = (video_tensor + 1.0) / 2.0
       video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
 
-      # 2. Chuyển chiều Kênh (Channels) về cuối [Frames, Height, Width, Channels]
+      # Permute kênh màu chuẩn [Frames, Height, Width, Channels] Tránh sai màu / xoay video
       if video_tensor.ndim == 4 and video_tensor.shape[1] == 3:
-        # Dạng [F, C, H, W] -> [F, H, W, C]
         video_tensor = video_tensor.permute(0, 2, 3, 1)
       elif video_tensor.ndim == 4 and video_tensor.shape[0] == 3:
-        # Dạng [C, F, H, W] -> [F, H, W, C]
         video_tensor = video_tensor.permute(1, 2, 3, 0)
 
-      # 3. Chuyển sang Numpy uint8 [0, 255]
       video_frames = (video_tensor * 255.0).cpu().numpy().astype(np.uint8)
-
-      # 4. Xuất video bằng export_to_video
       export_to_video(video_frames, raw_video_file, fps=24)
 
     except Exception as e:
@@ -371,7 +362,6 @@ async def process_video_pipeline():
           stderr=subprocess.DEVNULL,
       )
 
-    # Dọn dẹp file tạm
     if os.path.exists(raw_video_file):
       os.remove(raw_video_file)
     if os.path.exists(audio_scene_file):
