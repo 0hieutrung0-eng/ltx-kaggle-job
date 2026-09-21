@@ -8,7 +8,7 @@ import sys
 import time
 
 # -------------------------------------------------------------------
-# 1. CÀI ĐẶT PACKAGE Ở ĐẦU SCRIPT (AN TOÀN TUYỆT ĐỐI)
+# 1. CÀI ĐẶT PACKAGE Ở ĐẦU SCRIPT
 # -------------------------------------------------------------------
 def install_requirements():
   packages = [
@@ -83,7 +83,9 @@ GOOGLE_SHEET_CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+# 🔑 ĐÃ THÊM HUGGING FACE TOKEN CỦA BẠN VÀO ĐÂY
+HF_TOKEN = "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"
 
 VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
@@ -210,9 +212,7 @@ print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO...")
 try:
   MODEL_ID = "Lightricks/LTX-Video"
   pipe = LTXPipeline.from_pretrained(
-      MODEL_ID,
-      torch_dtype=torch.bfloat16,
-      token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
+      MODEL_ID, torch_dtype=torch.bfloat16, token=HF_TOKEN
   )
 
   pipe.enable_model_cpu_offload()
@@ -288,6 +288,7 @@ async def process_video_pipeline():
       torch.cuda.empty_cache()
 
       with torch.inference_mode():
+        # Dùng output_type="pt" để xử lý màu chuẩn
         output = pipe(
             prompt=final_prompt,
             negative_prompt=final_negative,
@@ -298,13 +299,16 @@ async def process_video_pipeline():
             num_inference_steps=20,
             guidance_scale=3.5,
             generator=generator,
-            output_type="np",
+            output_type="pt",
         )
-        video_frames = output.frames[0]
+        video_tensor = output.frames[0]
 
-        # Đảm bảo ép đúng định dạng uint8 tránh crash màu sắc
-        if video_frames.dtype != np.uint8:
-          video_frames = (video_frames * 255).astype(np.uint8)
+      # SỬA LỖI MÀU NHÒE: Đưa tensor về [0, 1] rồi nhân 255 ép sang uint8
+      if video_tensor.min() < 0:
+        video_tensor = (video_tensor + 1.0) / 2.0
+
+      video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
+      video_frames = (video_tensor * 255).cpu().numpy().astype(np.uint8)
 
       export_to_video(video_frames, raw_video_file, fps=24)
 
@@ -312,7 +316,7 @@ async def process_video_pipeline():
       print(f"❌ Lỗi render video cảnh {scene_index}: {str(e)}")
       continue
 
-    # 4.2 Xử lý Audio & Pad Frame
+    # 4.2 Xử lý Audio & Trộn âm thanh
     if scene_text:
       print(f"🎙️ Tạo voice cảnh {scene_index}: '{scene_text}'")
       communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
@@ -345,8 +349,8 @@ async def process_video_pipeline():
     else:
       silent_cmd = (
           f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i'
-          " anullsrc=r=44100:cl=stereo -c:v copy -c:a aac -ar 44100 -ac 2"
-          f' -shortest "{final_scene_file}"'
+          " anullsrc=r=44100:cl=stereo -c:v libx264 -pix_fmt yuv420p -r 24 -c:a"
+          f' aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
       )
       subprocess.run(
           silent_cmd,
@@ -410,7 +414,7 @@ async def process_video_pipeline():
     final_output = concat_output
 
   # -------------------------------------------------------------------
-  # 7. UPLOAD & WEBHOOK
+  # 7. UPLOAD & WEBHOOK KẾT THÚC
   # -------------------------------------------------------------------
   print(f"\n☁️ 7. ĐANG TẢI PHIM HOÀN CHỈNH {final_output} LÊN GOOGLE DRIVE...")
   drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
