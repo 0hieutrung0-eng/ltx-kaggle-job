@@ -19,8 +19,8 @@ def install_requirements():
         "edge-tts",
         "accelerate",
         "protobuf<6.0.0,>=3.20.2",
-        "ftfy",
         "sentencepiece",
+        "ftfy",
     ]
     print("📦 Đang cài packages...")
     subprocess.check_call([
@@ -38,14 +38,14 @@ import numpy as np
 import pandas as pd
 import requests
 import edge_tts
-from diffusers import AutoencoderKLWan, WanPipeline
+from diffusers import CogVideoXPipeline
 from diffusers.utils import export_to_video
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 WAN 2.1 1.3B - TỐI ƯU T4 - [{RUN_DATE}]")
+print(f"🚀 COGVIDEOX-2B - TỐI ƯU T4 - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -161,26 +161,24 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
         print(f"❌ Lỗi webhook: {e}")
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL WAN 2.1 1.3B (TỐI ƯU T4)
+# 3. LOAD MODEL COGVIDEOX-2B
 # -------------------------------------------------------------------
-print("\n🧠 3. LOAD MODEL WAN 2.1 1.3B...")
+print("\n🧠 3. LOAD MODEL COGVIDEOX-2B...")
 try:
-    MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    MODEL_ID = "THUDM/CogVideoX-2b"
 
-    vae = AutoencoderKLWan.from_pretrained(
-        MODEL_ID, subfolder="vae", torch_dtype=torch.float32
-    )
-    pipe = WanPipeline.from_pretrained(
+    pipe = CogVideoXPipeline.from_pretrained(
         MODEL_ID,
-        vae=vae,
         torch_dtype=torch.bfloat16,
         token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
     )
 
-    # Sequential offload = tiết kiệm VRAM tối đa trên T4
-    pipe.enable_sequential_cpu_offload()
+    # Tối ưu VRAM cho T4
+    pipe.enable_model_cpu_offload()
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
 
-    print("✅ Load Wan 2.1 1.3B thành công!")
+    print("✅ Load CogVideoX-2B thành công!")
 except Exception as e:
     send_n8n_final_webhook("failed", 0, error_message=f"Lỗi load model: {e}")
     sys.exit(1)
@@ -239,7 +237,7 @@ async def process_video_pipeline():
         scene_seed = 42 + scene_index
         generator = torch.Generator(device="cuda").manual_seed(scene_seed)
 
-        print(f"\n🎬 [{scene_index}/{total_scenes}] Render Wan 2.1...")
+        print(f"\n🎬 [{scene_index}/{total_scenes}] Render CogVideoX-2B...")
         try:
             gc.collect()
             torch.cuda.empty_cache()
@@ -248,16 +246,14 @@ async def process_video_pipeline():
                 output = pipe(
                     prompt=final_prompt,
                     negative_prompt=final_negative,
-                    height=384,               # giảm mạnh
-                    width=640,                # giảm mạnh
-                    num_frames=49,            # ~3 giây
-                    guidance_scale=5.0,
-                    num_inference_steps=25,
+                    num_frames=49,            # ~6 giây ở 8fps
+                    num_inference_steps=50,
+                    guidance_scale=6.0,
                     generator=generator,
                 )
                 frames = output.frames[0]
 
-            export_to_video(frames, raw_video_file, fps=16)
+            export_to_video(frames, raw_video_file, fps=8)
 
             del output, frames
             gc.collect()
@@ -281,20 +277,20 @@ async def process_video_pipeline():
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
                     f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
-                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 16 '
+                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 8 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
                 )
             else:
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
-                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 16 '
+                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 8 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
                 )
             subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
-                f'-c:v libx264 -pix_fmt yuv420p -r 16 -c:a aac -ar 44100 -ac 2 -b:a 192k '
+                f'-c:v libx264 -pix_fmt yuv420p -r 8 -c:a aac -ar 44100 -ac 2 -b:a 192k '
                 f'-shortest "{final_scene_file}"'
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -347,7 +343,7 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
-    print("\n🎉 HOÀN TẤT WAN 2.1!")
+    print("\n🎉 HOÀN TẤT COGVIDEOX-2B!")
 
 try:
     asyncio.run(process_video_pipeline())
