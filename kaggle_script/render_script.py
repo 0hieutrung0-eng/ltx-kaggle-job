@@ -8,7 +8,7 @@ import time
 def install_requirements():
     packages = [
         "nest_asyncio",
-        "diffusers>=0.31.0",
+        "diffusers>=0.32.0",
         "transformers",
         "imageio-ffmpeg",
         "google-api-python-client",
@@ -19,7 +19,8 @@ def install_requirements():
         "edge-tts",
         "accelerate",
         "protobuf<6.0.0,>=3.20.2",
-        "peft",
+        "ftfy",
+        "sentencepiece",
     ]
     print("📦 Đang cài packages...")
     subprocess.check_call([
@@ -37,14 +38,14 @@ import numpy as np
 import pandas as pd
 import requests
 import edge_tts
-from diffusers import LTXPipeline
+from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.utils import export_to_video
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 LTX-VIDEO + FIX MÀU MẠNH - [{RUN_DATE}]")
+print(f"🚀 WAN 2.1 1.3B PIPELINE - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -67,9 +68,6 @@ SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-
-ANIME_LORA_PATH = None
-ANIME_LORA_SCALE = 0.75
 
 VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
@@ -163,74 +161,45 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
         print(f"❌ Lỗi webhook: {e}")
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL
+# 3. LOAD MODEL WAN 2.1 1.3B
 # -------------------------------------------------------------------
-print("\n🧠 3. LOAD MODEL LTX-VIDEO...")
+print("\n🧠 3. LOAD MODEL WAN 2.1 1.3B...")
 try:
-    MODEL_ID = "Lightricks/LTX-Video"
+    MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"   # bản 1.3B nhẹ, phù hợp T4
 
-    pipe = LTXPipeline.from_pretrained(
+    vae = AutoencoderKLWan.from_pretrained(
+        MODEL_ID, subfolder="vae", torch_dtype=torch.float32
+    )
+    pipe = WanPipeline.from_pretrained(
         MODEL_ID,
+        vae=vae,
         torch_dtype=torch.bfloat16,
         token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
     )
 
-    if ANIME_LORA_PATH:
-        print(f"🎨 Load Anime LoRA: {ANIME_LORA_PATH}")
-        pipe.load_lora_weights(ANIME_LORA_PATH)
-        pipe.fuse_lora(lora_scale=ANIME_LORA_SCALE)
+    # Tối ưu VRAM cho T4
+    pipe.enable_model_cpu_offload()
+    # pipe.enable_sequential_cpu_offload()  # dùng nếu vẫn OOM
 
-    pipe.enable_sequential_cpu_offload()
-    pipe.vae.enable_tiling()
-    pipe.vae.enable_slicing()
-
-    print("✅ Load model thành công!")
+    print("✅ Load Wan 2.1 1.3B thành công!")
 except Exception as e:
     send_n8n_final_webhook("failed", 0, error_message=f"Lỗi load model: {e}")
     sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. HÀM CHUẨN HÓA MÀU MẠNH (CÁCH 2)
-# -------------------------------------------------------------------
-def safe_color_normalize(video_tensor):
-    video_tensor = video_tensor.to(torch.float32)
-
-    print(f"   [DEBUG] shape={tuple(video_tensor.shape)} | "
-          f"min={video_tensor.min().item():.4f} | "
-          f"max={video_tensor.max().item():.4f} | "
-          f"mean={video_tensor.mean().item():.4f}")
-
-    # Ép về (F, H, W, C)
-    if video_tensor.ndim == 4:
-        if video_tensor.shape[1] == 3:          # (F, C, H, W) ← đúng với log của bạn
-            video_tensor = video_tensor.permute(0, 2, 3, 1)
-        elif video_tensor.shape[0] == 3:        # (C, F, H, W)
-            video_tensor = video_tensor.permute(1, 2, 3, 0)
-
-    # Vì đã ở [0, 1] nên chỉ cần clamp
-    video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
-
-    # Thử đảo kênh R ↔ B (nhiều model output theo BGR)
-    # Nếu màu vẫn sai, comment dòng dưới lại
-    video_tensor = video_tensor[..., [2, 1, 0]]   # BGR → RGB
-
-    return video_tensor
-
-# -------------------------------------------------------------------
-# 5. PROCESS PIPELINE
+# 4. PROCESS PIPELINE
 # -------------------------------------------------------------------
 async def process_video_pipeline():
     rendered_files = []
 
     STYLE_3D_PREFIX = (
         "3d chinese donghua animation style, unreal engine 5 render, "
-        "extremely detailed 3d face, anime style, "
+        "extremely detailed 3d face, anime style, high quality, "
     )
     DEFAULT_NEGATIVE = (
-        "2d, flat drawing, realistic human, photorealistic, blurry, low quality, "
-        "distorted face, morphing, text, watermark, stiff pose, deformed hands, "
-        "missing fingers, extra limbs, overexposed, oversaturated, burn effects, "
-        "rainbow color distortion, glitch"
+        "blurry, low quality, distorted face, deformed hands, extra limbs, "
+        "worst quality, low resolution, watermark, text, overexposed, "
+        "oversaturated, static, frozen"
     )
 
     for index, row in df.iterrows():
@@ -269,36 +238,30 @@ async def process_video_pipeline():
         )
 
         scene_seed = 42 + scene_index
-        generator = torch.Generator(device="cpu").manual_seed(scene_seed)
+        generator = torch.Generator(device="cuda").manual_seed(scene_seed)
 
-        print(f"\n🎬 [{scene_index}/{total_scenes}] Render...")
+        print(f"\n🎬 [{scene_index}/{total_scenes}] Render Wan 2.1...")
         try:
             gc.collect()
             torch.cuda.empty_cache()
 
             with torch.inference_mode():
-                # Thử output_type="pt" để kiểm soát tốt hơn
                 output = pipe(
                     prompt=final_prompt,
                     negative_prompt=final_negative,
-                    width=704,
-                    height=384,
-                    num_frames=49,
-                    frame_rate=24.0,
-                    num_inference_steps=25,
-                    guidance_scale=2.8,
+                    height=480,
+                    width=832,
+                    num_frames=81,          # ~5 giây ở 16fps
+                    guidance_scale=5.0,
+                    num_inference_steps=30,
                     generator=generator,
-                    output_type="pt",
                 )
-                video_tensor = output.frames[0] if hasattr(output, "frames") else output[0]
+                frames = output.frames[0]
 
-            # ===== CHUẨN HÓA MÀU MẠNH =====
-            video_tensor = safe_color_normalize(video_tensor)
+            # Wan thường trả về list of PIL hoặc np array sẵn sàng
+            export_to_video(frames, raw_video_file, fps=16)
 
-            video_frames = (video_tensor * 255.0).cpu().numpy().astype(np.uint8)
-            export_to_video(video_frames, raw_video_file, fps=24)
-
-            del output, video_tensor, video_frames
+            del output, frames
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -320,20 +283,20 @@ async def process_video_pipeline():
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
                     f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
-                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 '
+                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 16 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
                 )
             else:
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
-                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 '
+                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 16 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
                 )
             subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
-                f'-c:v libx264 -pix_fmt yuv420p -r 24 -c:a aac -ar 44100 -ac 2 -b:a 192k '
+                f'-c:v libx264 -pix_fmt yuv420p -r 16 -c:a aac -ar 44100 -ac 2 -b:a 192k '
                 f'-shortest "{final_scene_file}"'
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -347,7 +310,7 @@ async def process_video_pipeline():
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
 
-    # Gộp + BGM + Upload (giữ nguyên logic cũ)
+    # Gộp + BGM + Upload
     print("\n🎞️ Gộp các cảnh...")
     if not rendered_files:
         send_n8n_final_webhook("failed", 0, error_message="Không render được cảnh nào.")
@@ -386,7 +349,7 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
-    print("\n🎉 HOÀN TẤT!")
+    print("\n🎉 HOÀN TẤT WAN 2.1!")
 
 try:
     asyncio.run(process_video_pipeline())
