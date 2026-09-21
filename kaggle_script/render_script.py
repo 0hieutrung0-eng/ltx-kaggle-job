@@ -10,7 +10,7 @@ import time
 
 
 # -------------------------------------------------------------------
-# 1. CÀI ĐẶT PACKAGE
+# 1. CÀI ĐẶT PACKAGE (ĐÃ TỐI ƯU DEPENDENCY - KHÔNG ÉP NUMPY CŨ)
 # -------------------------------------------------------------------
 def install_requirements():
     packages = [
@@ -26,8 +26,6 @@ def install_requirements():
         "edge-tts",
         "accelerate",
         "protobuf<6.0.0,>=3.20.2",
-        "numpy<2.0.0",
-        "pandas<3.0.0",
     ]
     print("📦 Đang kiểm tra và đồng bộ Packages...")
     subprocess.check_call(
@@ -64,6 +62,7 @@ import torch
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
 print(f"🚀 KHỞI TẠO PIPELINE LTX-VIDEO TỐI ƯU VRAM - PHIÊN RUN [{RUN_DATE}]")
 
+# Tối ưu phân bổ bộ nhớ PyTorch
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
     "expandable_segments:True,max_split_size_mb:128"
 )
@@ -160,7 +159,7 @@ if not df.empty:
     for key in project_info.keys():
         if key in df.columns:
             val = str(first_row[key]).strip()
-            if val.lower() != "nan" and val != "":
+            if val.lower() not in ["nan", "[empty]", ""] :
                 project_info[key] = val
 
 SELECTED_GENDER = project_info.get("gender", "nam").lower()
@@ -221,6 +220,7 @@ try:
     MODEL_ID = "Lightricks/LTX-Video"
     pipe = LTXPipeline.from_pretrained(MODEL_ID, dtype=torch.bfloat16)
 
+    # Offload từng layer sang CPU & Tiling VAE để chống OOM VRAM
     pipe.enable_sequential_cpu_offload()
     pipe.vae.enable_tiling()
     pipe.vae.enable_slicing()
@@ -256,7 +256,7 @@ async def process_video_pipeline():
         raw_prompt = str(row.get("prompt", "")).strip()
         raw_negative = str(row.get("negative_prompt", "")).strip()
 
-        # Bổ sung bộ lọc thoại tránh nhận chuỗi rác [empty] hoặc None
+        # Bổ sung bộ lọc thoại tránh nhận chuỗi rác [empty], nan, null
         scene_text = ""
         for col in ["dialogue", "scene_narration_vi", "narration_vi", "narration"]:
             if col in row and pd.notna(row[col]):
@@ -269,7 +269,7 @@ async def process_video_pipeline():
         audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
-        if not raw_prompt or raw_prompt.lower() in ["nan", "none", "null"]:
+        if not raw_prompt or raw_prompt.lower() in ["nan", "[empty]", "none", "null"]:
             print(f"⚠️ Bỏ qua cảnh {scene_index} do không có Prompt.")
             continue
 
@@ -285,7 +285,7 @@ async def process_video_pipeline():
         final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
         final_negative = (
             raw_negative
-            if (raw_negative and raw_negative.lower() not in ["nan", "none"])
+            if (raw_negative and raw_negative.lower() not in ["nan", "[empty]", "none"])
             else DEFAULT_NEGATIVE
         )
 
@@ -337,7 +337,7 @@ async def process_video_pipeline():
             character_name = str(row.get("character_name", "")).strip()
             char_prefix = (
                 f"[{character_name}]: "
-                if character_name and character_name.lower() not in ["nan", "[empty]"]
+                if character_name and character_name.lower() not in ["nan", "[empty]", "none"]
                 else ""
             )
             print(f"🎙️ Tạo voice cảnh {scene_index} {char_prefix}'{scene_text}'")
@@ -370,7 +370,7 @@ async def process_video_pipeline():
                 stderr=subprocess.DEVNULL,
             )
         else:
-            # Nếu cảnh không có thoại -> Tạo audio câm (Silent Audio)
+            # Tạo audio câm (Silent Audio) cho cảnh không có lời thoại
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i'
                 " anullsrc=r=44100:cl=stereo -c:v libx264 -pix_fmt yuv420p -r 24 -c:a"
@@ -383,7 +383,7 @@ async def process_video_pipeline():
                 stderr=subprocess.DEVNULL,
             )
 
-        # Xóa file tạm
+        # Dọn dẹp file tạm
         if os.path.exists(raw_video_file):
             os.remove(raw_video_file)
         if os.path.exists(audio_scene_file):
