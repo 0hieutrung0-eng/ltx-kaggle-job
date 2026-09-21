@@ -193,7 +193,6 @@ except Exception as e:
 # 4. HÀM CHUẨN HÓA MÀU MẠNH (CÁCH 2)
 # -------------------------------------------------------------------
 def safe_color_normalize(video_tensor):
-    """Chuẩn hóa màu an toàn với nhiều lớp kiểm tra"""
     video_tensor = video_tensor.to(torch.float32)
 
     print(f"   [DEBUG] shape={tuple(video_tensor.shape)} | "
@@ -201,33 +200,20 @@ def safe_color_normalize(video_tensor):
           f"max={video_tensor.max().item():.4f} | "
           f"mean={video_tensor.mean().item():.4f}")
 
-    # Đưa về (F, H, W, C)
+    # Ép về (F, H, W, C)
     if video_tensor.ndim == 4:
-        if video_tensor.shape[0] in [3, 4]:          # (C, F, H, W)
-            video_tensor = video_tensor.permute(1, 2, 3, 0)
-        elif video_tensor.shape[1] in [3, 4]:        # (F, C, H, W)
+        if video_tensor.shape[1] == 3:          # (F, C, H, W) ← đúng với log của bạn
             video_tensor = video_tensor.permute(0, 2, 3, 1)
+        elif video_tensor.shape[0] == 3:        # (C, F, H, W)
+            video_tensor = video_tensor.permute(1, 2, 3, 0)
 
-    t_min = video_tensor.min().item()
-    t_max = video_tensor.max().item()
-
-    # Các trường hợp thường gặp
-    if t_min < -0.2:                                # rõ ràng [-1, 1]
-        print("   → Áp dụng (x + 1) / 2")
-        video_tensor = (video_tensor + 1.0) / 2.0
-    elif t_max > 1.5:                               # bị scale lớn
-        print("   → Áp dụng chia cho max")
-        video_tensor = video_tensor / t_max
-    elif t_min >= 0 and t_max <= 1.05:              # đã gần [0, 1]
-        print("   → Đã ở khoảng [0, 1], chỉ clamp")
-        pass
-    else:
-        # Fallback min-max (chỉ khi thật sự cần)
-        print("   → Fallback min-max")
-        if t_max > t_min:
-            video_tensor = (video_tensor - t_min) / (t_max - t_min)
-
+    # Vì đã ở [0, 1] nên chỉ cần clamp
     video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
+
+    # Thử đảo kênh R ↔ B (nhiều model output theo BGR)
+    # Nếu màu vẫn sai, comment dòng dưới lại
+    video_tensor = video_tensor[..., [2, 1, 0]]   # BGR → RGB
+
     return video_tensor
 
 # -------------------------------------------------------------------
