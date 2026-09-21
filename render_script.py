@@ -44,14 +44,14 @@ import pandas as pd
 import requests
 import edge_tts
 from PIL import Image
-from diffusers import StableDiffusionXLPipeline, LTXImageToVideoPipeline
+from diffusers import FluxPipeline, LTXImageToVideoPipeline
 from diffusers.utils import export_to_video, load_image
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 SDXL → LTX-VIDEO PIPELINE - [{RUN_DATE}]")
+print(f"🚀 FLUX.1 + LTX-VIDEO PIPELINE - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -175,22 +175,19 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
         print(f"❌ Lỗi webhook: {e}")
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL SDXL (Text → Image)
+# 3. LOAD MODEL FLUX.1 (Text → Image)
 # -------------------------------------------------------------------
-print("\n🧠 3. LOAD SDXL (Text → Image)...")
+print("\n🧠 3. LOAD FLUX.1 [schnell] (Text → Image)...")
 try:
-    sdxl = StableDiffusionXLPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-xl-base-1.0",
-        torch_dtype=torch.float16,
-        variant="fp16",
-        use_safetensors=True,
+    flux_pipe = FluxPipeline.from_pretrained(
+        "black-forest-labs/FLUX.1-schnell",
+        torch_dtype=torch.bfloat16,
         token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
     )
-    sdxl.enable_model_cpu_offload()
-    sdxl.vae.enable_tiling()
-    print("✅ Load SDXL thành công!")
+    flux_pipe.enable_model_cpu_offload()
+    print("✅ Load FLUX.1 thành công!")
 except Exception as e:
-    print(f"❌ Lỗi load SDXL: {e}")
+    print(f"❌ Lỗi load FLUX.1: {e}")
     sys.exit(1)
 
 # -------------------------------------------------------------------
@@ -215,9 +212,10 @@ except Exception as e:
 async def process_video_pipeline():
     rendered_files = []
 
-    DEFAULT_NEGATIVE = (
-        "2d, flat drawing, realistic human, photorealistic, blurry, low quality, "
-        "distorted face, text, watermark, deformed structures"
+    # Từ khóa bổ trợ phong cách 3D Tiên Hiệp cho FLUX
+    FLUX_STYLE_SUFFIX = (
+        ", 3d chinese animation style, donghua style, masterpiece, "
+        "highly detailed face, sharp focus, Unreal Engine 5 render, cinematic lighting"
     )
 
     for index, row in df.iterrows():
@@ -231,8 +229,6 @@ async def process_video_pipeline():
                 if val and val.lower() not in ["nan", "[empty]", "none", "null"]:
                     raw_prompt = val
                     break
-
-        raw_negative = str(row.get("negative_prompt", "")).strip()
 
         scene_text = ""
         for col in ["narration_vi", "dialogue", "scene_narration_vi", "narration"]:
@@ -256,30 +252,30 @@ async def process_video_pipeline():
             rendered_files.append(final_scene_file)
             continue
 
-        final_prompt = raw_prompt
-        final_negative = raw_negative if (raw_negative and raw_negative.lower() not in ["nan", "[empty]", "none"]) else DEFAULT_NEGATIVE
+        final_prompt = raw_prompt + FLUX_STYLE_SUFFIX
 
         scene_seed = 42 + scene_index
-        generator = torch.Generator(device="cuda").manual_seed(scene_seed)
+        generator = torch.Generator(device="cpu").manual_seed(scene_seed)
 
-        # ---------- 5.1 Text → Image (SDXL) ----------
-        print(f"\n🖼️ [{scene_index}/{total_scenes}] Tạo ảnh bằng SDXL...")
+        # ---------- 5.1 Text → Image (FLUX.1) ----------
+        print(f"\n🖼️ [{scene_index}/{total_scenes}] Tạo ảnh bằng FLUX.1 [schnell]...")
         try:
             gc.collect()
             torch.cuda.empty_cache()
 
-            image = sdxl(
+            # FLUX.1-schnell đạt chất lượng tối ưu chỉ với 4 steps
+            image = flux_pipe(
                 prompt=final_prompt,
-                negative_prompt=final_negative,
                 width=1024,
                 height=576,
-                num_inference_steps=25,
-                guidance_scale=7.0,
+                num_inference_steps=4,
+                guidance_scale=0.0,
                 generator=generator,
+                max_sequence_length=256,
             ).images[0]
 
             image.save(image_file)
-            print(f"   ✅ Đã lưu ảnh cục bộ: {image_file}")
+            print(f"   ✅ Đã lưu ảnh FLUX sắc nét: {image_file}")
 
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
 
@@ -288,26 +284,23 @@ async def process_video_pipeline():
             continue
 
         # ---------- 5.2 Image → Video (LTX-Video) ----------
-        print(f"🎬 [{scene_index}/{total_scenes}] Tạo video từ ảnh bằng LTX-Video...")
+        print(f"🎬 [{scene_index}/{total_scenes}] Tạo video từ ảnh FLUX bằng LTX-Video...")
         try:
             gc.collect()
             torch.cuda.empty_cache()
 
             image_input = load_image(image_file).resize((1024, 576))
 
-            # Số khung hình phải có dạng 8N + 1 (ví dụ: 25, 33, 41, 49)
             video_frames = ltx_pipe(
                 image=image_input,
-                prompt=final_prompt,
-                negative_prompt=final_negative,
+                prompt=raw_prompt,
                 width=1024,
                 height=576,
                 num_frames=25,
                 num_inference_steps=30,
-                generator=generator,
+                generator=torch.Generator(device="cuda").manual_seed(scene_seed),
             ).frames[0]
 
-            # Xuất video với chuẩn 25 fps của LTX-Video
             export_to_video(video_frames, raw_video_file, fps=25)
             print(f"   ✅ Đã tạo video thô LTX: {raw_video_file}")
 
@@ -402,7 +395,7 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
-    print("\n🎉 HOÀN TẤT PIPELINE!")
+    print("\n🎉 HOÀN TẤT PIPELINE FLUX + LTX!")
 
 try:
     asyncio.run(process_video_pipeline())
