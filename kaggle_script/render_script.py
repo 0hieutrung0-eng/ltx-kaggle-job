@@ -5,9 +5,6 @@ import subprocess
 import sys
 import time
 
-# -------------------------------------------------------------------
-# 1. CÀI ĐẶT PACKAGE
-# -------------------------------------------------------------------
 def install_requirements():
     packages = [
         "nest_asyncio",
@@ -24,7 +21,7 @@ def install_requirements():
         "protobuf<6.0.0,>=3.20.2",
         "peft",
     ]
-    print("📦 Đang kiểm tra và đồng bộ Packages...")
+    print("📦 Đang cài packages...")
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "--no-warn-script-location", "--disable-pip-version-check"
@@ -47,7 +44,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 KHỞI TẠO PIPELINE LTX-VIDEO + ANIME LORA - PHIÊN RUN [{RUN_DATE}]")
+print(f"🚀 LTX-VIDEO + FIX MÀU MẠNH - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -63,23 +60,18 @@ def sync_system_time():
 sync_system_time()
 
 # -------------------------------------------------------------------
-# CONFIG & AUTH
+# CONFIG
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
-
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-# ====== CẤU HÌNH ANIME LORA ======
-ANIME_LORA_PATH = None          # Đặt đường dẫn LoRA nếu có
+ANIME_LORA_PATH = None
 ANIME_LORA_SCALE = 0.75
 
-VOICE_MAP = {
-    "nam": "vi-VN-NamMinhNeural",
-    "nu": "vi-VN-HoaiMyNeural"
-}
+VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "948179937421-o55enfl61lb8ou0ms2jmrr4dlf1fhgip.apps.googleusercontent.com")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "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")
@@ -105,15 +97,15 @@ def get_media_duration(file_path):
         return 2.0
 
 # -------------------------------------------------------------------
-# 2. ĐỌC DỮ LIỆU SHEETS
+# 2. ĐỌC SHEETS
 # -------------------------------------------------------------------
 print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
 try:
     df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
     total_scenes = len(df)
-    print(f"✅ Tìm thấy {total_scenes} cảnh trong Google Sheet.")
+    print(f"✅ Tìm thấy {total_scenes} cảnh.")
 except Exception as e:
-    print(f"❌ Lỗi đọc Google Sheet: {str(e)}")
+    print(f"❌ Lỗi đọc Google Sheet: {e}")
     sys.exit(1)
 
 project_info = {
@@ -146,10 +138,10 @@ def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
             file_metadata = {'name': file_name, 'parents': [folder_id]}
             media = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
             uploaded_file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-            print(f"☁️ Đã tải lên Google Drive thành công: {file_name}")
+            print(f"☁️ Upload thành công: {file_name}")
             return uploaded_file.get('id')
         except Exception as e:
-            print(f"⚠️ [Lần {attempt}/{retries}] Upload Drive thất bại: {str(e)}")
+            print(f"⚠️ Upload lần {attempt} thất bại: {e}")
             if attempt < retries:
                 time.sleep(3)
             else:
@@ -166,14 +158,14 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
     }
     try:
         res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
-        print(f"📡 [FINAL WEBHOOK {status.upper()}] HTTP {res.status_code}")
+        print(f"📡 Webhook {status.upper()} → {res.status_code}")
     except Exception as e:
-        print(f"❌ Lỗi gửi Webhook: {str(e)}")
+        print(f"❌ Lỗi webhook: {e}")
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL + ANIME LORA
+# 3. LOAD MODEL
 # -------------------------------------------------------------------
-print("\n🧠 3. KHỞI TẠO MODEL LTX-VIDEO + ANIME LORA...")
+print("\n🧠 3. LOAD MODEL LTX-VIDEO...")
 try:
     MODEL_ID = "Lightricks/LTX-Video"
 
@@ -184,22 +176,62 @@ try:
     )
 
     if ANIME_LORA_PATH:
-        print(f"🎨 Đang load Anime LoRA: {ANIME_LORA_PATH}")
+        print(f"🎨 Load Anime LoRA: {ANIME_LORA_PATH}")
         pipe.load_lora_weights(ANIME_LORA_PATH)
         pipe.fuse_lora(lora_scale=ANIME_LORA_SCALE)
-        print(f"✅ Đã fuse Anime LoRA với scale = {ANIME_LORA_SCALE}")
 
     pipe.enable_sequential_cpu_offload()
     pipe.vae.enable_tiling()
     pipe.vae.enable_slicing()
 
-    print("✅ Load Model + Offload VRAM thành công!")
+    print("✅ Load model thành công!")
 except Exception as e:
-    send_n8n_final_webhook("failed", 0, error_message=f"Lỗi load model: {str(e)}")
+    send_n8n_final_webhook("failed", 0, error_message=f"Lỗi load model: {e}")
     sys.exit(1)
 
 # -------------------------------------------------------------------
-# 4. PROCESS PIPELINE
+# 4. HÀM CHUẨN HÓA MÀU MẠNH (CÁCH 2)
+# -------------------------------------------------------------------
+def safe_color_normalize(video_tensor):
+    """Chuẩn hóa màu an toàn với nhiều lớp kiểm tra"""
+    video_tensor = video_tensor.to(torch.float32)
+
+    print(f"   [DEBUG] shape={tuple(video_tensor.shape)} | "
+          f"min={video_tensor.min().item():.4f} | "
+          f"max={video_tensor.max().item():.4f} | "
+          f"mean={video_tensor.mean().item():.4f}")
+
+    # Đưa về (F, H, W, C)
+    if video_tensor.ndim == 4:
+        if video_tensor.shape[0] in [3, 4]:          # (C, F, H, W)
+            video_tensor = video_tensor.permute(1, 2, 3, 0)
+        elif video_tensor.shape[1] in [3, 4]:        # (F, C, H, W)
+            video_tensor = video_tensor.permute(0, 2, 3, 1)
+
+    t_min = video_tensor.min().item()
+    t_max = video_tensor.max().item()
+
+    # Các trường hợp thường gặp
+    if t_min < -0.2:                                # rõ ràng [-1, 1]
+        print("   → Áp dụng (x + 1) / 2")
+        video_tensor = (video_tensor + 1.0) / 2.0
+    elif t_max > 1.5:                               # bị scale lớn
+        print("   → Áp dụng chia cho max")
+        video_tensor = video_tensor / t_max
+    elif t_min >= 0 and t_max <= 1.05:              # đã gần [0, 1]
+        print("   → Đã ở khoảng [0, 1], chỉ clamp")
+        pass
+    else:
+        # Fallback min-max (chỉ khi thật sự cần)
+        print("   → Fallback min-max")
+        if t_max > t_min:
+            video_tensor = (video_tensor - t_min) / (t_max - t_min)
+
+    video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
+    return video_tensor
+
+# -------------------------------------------------------------------
+# 5. PROCESS PIPELINE
 # -------------------------------------------------------------------
 async def process_video_pipeline():
     rendered_files = []
@@ -235,11 +267,11 @@ async def process_video_pipeline():
         final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
         if not raw_prompt or raw_prompt.lower() in ["nan", "[empty]", "none", "null"]:
-            print(f"⚠️ Bỏ qua cảnh {scene_index} do không có Prompt.")
+            print(f"⚠️ Bỏ qua cảnh {scene_index}")
             continue
 
         if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 10000:
-            print(f"⏩ [{scene_index}/{total_scenes}] Đã tồn tại file -> bỏ qua")
+            print(f"⏩ [{scene_index}/{total_scenes}] Đã tồn tại → bỏ qua")
             rendered_files.append(final_scene_file)
             continue
 
@@ -253,12 +285,13 @@ async def process_video_pipeline():
         scene_seed = 42 + scene_index
         generator = torch.Generator(device="cpu").manual_seed(scene_seed)
 
-        print(f"\n🎬 [{scene_index}/{total_scenes}] Render Video LTX...")
+        print(f"\n🎬 [{scene_index}/{total_scenes}] Render...")
         try:
             gc.collect()
             torch.cuda.empty_cache()
 
             with torch.inference_mode():
+                # Thử output_type="pt" để kiểm soát tốt hơn
                 output = pipe(
                     prompt=final_prompt,
                     negative_prompt=final_negative,
@@ -269,33 +302,27 @@ async def process_video_pipeline():
                     num_inference_steps=25,
                     guidance_scale=2.8,
                     generator=generator,
-                    output_type="np",          # ← quan trọng: dùng "np" để tránh lỗi màu
+                    output_type="pt",
                 )
+                video_tensor = output.frames[0] if hasattr(output, "frames") else output[0]
 
-            # Khi output_type="np", pipeline đã trả về frames sẵn sàng
-            video_frames = output.frames[0]
+            # ===== CHUẨN HÓA MÀU MẠNH =====
+            video_tensor = safe_color_normalize(video_tensor)
 
-            # Nếu vẫn là float thì chuẩn hóa
-            if video_frames.dtype != np.uint8:
-                video_frames = np.clip(video_frames, 0.0, 1.0)
-                video_frames = (video_frames * 255).astype(np.uint8)
-
+            video_frames = (video_tensor * 255.0).cpu().numpy().astype(np.uint8)
             export_to_video(video_frames, raw_video_file, fps=24)
 
-            del output, video_frames
+            del output, video_tensor, video_frames
             gc.collect()
             torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"❌ Lỗi render video cảnh {scene_index}: {str(e)}")
+            print(f"❌ Lỗi render cảnh {scene_index}: {e}")
             continue
 
-        # 4.2 Xử lý Voice
+        # Voice
         if scene_text:
-            character_name = str(row.get("character_name", "")).strip()
-            char_prefix = f"[{character_name}]: " if character_name and character_name.lower() not in ["nan", "[empty]", "none"] else ""
-            print(f"🎙️ Tạo voice cảnh {scene_index} {char_prefix}'{scene_text[:60]}...'")
-
+            print(f"🎙️ Voice cảnh {scene_index}: {scene_text[:50]}...")
             communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
             await communicate.save(audio_scene_file)
 
@@ -304,19 +331,19 @@ async def process_video_pipeline():
             pad_dur = max(0.0, a_dur - v_dur)
 
             if pad_dur > 0:
-                mix_scene_cmd = (
+                mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
                     f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
                     f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
                 )
             else:
-                mix_scene_cmd = (
+                mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
                     f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 24 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
                 )
-            subprocess.run(mix_scene_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
@@ -330,14 +357,12 @@ async def process_video_pipeline():
         if os.path.exists(audio_scene_file):
             os.remove(audio_scene_file)
 
-        print(f"💾 Hoàn tất Cảnh {scene_index}: {final_scene_file}")
+        print(f"💾 Hoàn tất cảnh {scene_index}")
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
 
-    # -------------------------------------------------------------------
-    # 5. GỘP CẢNH
-    # -------------------------------------------------------------------
-    print("\n🎞️ 5. TIẾN HÀNH GỘP TOÀN BỘ CÁC CẢNH...")
+    # Gộp + BGM + Upload (giữ nguyên logic cũ)
+    print("\n🎞️ Gộp các cảnh...")
     if not rendered_files:
         send_n8n_final_webhook("failed", 0, error_message="Không render được cảnh nào.")
         sys.exit(1)
@@ -349,23 +374,15 @@ async def process_video_pipeline():
     concat_output = f"final_concat_{RUN_DATE}.mp4"
     final_output = f"final_movie_{RUN_DATE}.mp4"
 
-    subprocess.run(
-        f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}",
-        shell=True, check=True
-    )
+    subprocess.run(f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}", shell=True, check=True)
 
-    # -------------------------------------------------------------------
-    # 6. BGM
-    # -------------------------------------------------------------------
     bgm_file = "bgm_xianxia.mp3"
     if os.path.exists(bgm_file):
-        print("🎵 Đang hòa âm Nhạc nền BGM...")
         bgm_cmd = (
             f'ffmpeg -y -i {concat_output} -stream_loop -1 -i {bgm_file} '
             f'-filter_complex "[0:a]volume=1.2[v_tts];[1:a]volume=0.15[v_bgm];'
             f'[v_tts][v_bgm]amix=inputs=2:duration=first[a]" '
-            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k '
-            f"{final_output}"
+            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k {final_output}'
         )
         try:
             subprocess.run(bgm_cmd, shell=True, check=True)
@@ -374,10 +391,7 @@ async def process_video_pipeline():
     else:
         final_output = concat_output
 
-    # -------------------------------------------------------------------
-    # 7. UPLOAD & WEBHOOK
-    # -------------------------------------------------------------------
-    print(f"\n☁️ 7. ĐANG TẢI PHIM HOÀN CHỈNH {final_output} LÊN GOOGLE DRIVE...")
+    print(f"\n☁️ Upload phim hoàn chỉnh...")
     drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
     send_n8n_final_webhook(
@@ -386,9 +400,8 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
-    print("\n🎉 HOÀN TẤT TOÀN BỘ TIẾN TRÌNH RENDER!")
+    print("\n🎉 HOÀN TẤT!")
 
-# Thực thi
 try:
     asyncio.run(process_video_pipeline())
 except RuntimeError:
