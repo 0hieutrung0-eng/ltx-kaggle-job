@@ -64,7 +64,6 @@ import torch
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
 print(f"🚀 KHỞI TẠO PIPELINE LTX-VIDEO TỐI ƯU VRAM - PHIÊN RUN [{RUN_DATE}]")
 
-# Tối ưu phân bổ bộ nhớ PyTorch
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
     "expandable_segments:True,max_split_size_mb:128"
 )
@@ -222,10 +221,9 @@ try:
     MODEL_ID = "Lightricks/LTX-Video"
     pipe = LTXPipeline.from_pretrained(MODEL_ID, dtype=torch.bfloat16)
 
-    # ĐIỂM CỐT LÕI TỐI ƯU VRAM
-    pipe.enable_sequential_cpu_offload()  # Chuyển từng layer sang CPU khi chạy xong
-    pipe.vae.enable_tiling()  # Tách tile VAE để tránh tràn VRAM
-    pipe.vae.enable_slicing()  # Cắt slice VAE
+    pipe.enable_sequential_cpu_offload()
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
 
     print("✅ Load Model LTX-Video & Bật Offload VRAM thành công!")
 except Exception as e:
@@ -258,12 +256,12 @@ async def process_video_pipeline():
         raw_prompt = str(row.get("prompt", "")).strip()
         raw_negative = str(row.get("negative_prompt", "")).strip()
 
-        # 🎯 Ưu tiên lấy đúng Lời thoại nhân vật (dialogue)
+        # Bổ sung bộ lọc thoại tránh nhận chuỗi rác [empty] hoặc None
         scene_text = ""
         for col in ["dialogue", "scene_narration_vi", "narration_vi", "narration"]:
             if col in row and pd.notna(row[col]):
                 val = str(row[col]).strip()
-                if val and val.lower() != "nan":
+                if val and val.lower() not in ["nan", "[empty]", "none", "null"]:
                     scene_text = val
                     break
 
@@ -271,7 +269,7 @@ async def process_video_pipeline():
         audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
-        if not raw_prompt or raw_prompt.lower() == "nan":
+        if not raw_prompt or raw_prompt.lower() in ["nan", "none", "null"]:
             print(f"⚠️ Bỏ qua cảnh {scene_index} do không có Prompt.")
             continue
 
@@ -287,7 +285,7 @@ async def process_video_pipeline():
         final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
         final_negative = (
             raw_negative
-            if (raw_negative and raw_negative.lower() != "nan")
+            if (raw_negative and raw_negative.lower() not in ["nan", "none"])
             else DEFAULT_NEGATIVE
         )
 
@@ -296,7 +294,6 @@ async def process_video_pipeline():
 
         print(f"\n🎬 [{scene_index}/{total_scenes}] Render Video LTX...")
         try:
-            # Dọn dẹp GPU cache triệt để trước khi render
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -304,7 +301,7 @@ async def process_video_pipeline():
                 output = pipe(
                     prompt=final_prompt,
                     negative_prompt=final_negative,
-                    width=704,  # Chuẩn 16:9, vừa khít VRAM 15GB
+                    width=704,
                     height=384,
                     num_frames=49,
                     frame_rate=24.0,
@@ -327,7 +324,6 @@ async def process_video_pipeline():
             video_frames = (video_tensor * 255.0).cpu().numpy().astype(np.uint8)
             export_to_video(video_frames, raw_video_file, fps=24)
 
-            # Dọn dẹp bộ nhớ ngay sau khi tạo video
             del output, video_tensor, video_frames
             gc.collect()
             torch.cuda.empty_cache()
@@ -339,7 +335,11 @@ async def process_video_pipeline():
         # 4.2 Xử lý Voice Thuyết Minh & Trộn Âm thanh
         if scene_text:
             character_name = str(row.get("character_name", "")).strip()
-            char_prefix = f"[{character_name}]: " if character_name and character_name.lower() != "nan" else ""
+            char_prefix = (
+                f"[{character_name}]: "
+                if character_name and character_name.lower() not in ["nan", "[empty]"]
+                else ""
+            )
             print(f"🎙️ Tạo voice cảnh {scene_index} {char_prefix}'{scene_text}'")
 
             communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
