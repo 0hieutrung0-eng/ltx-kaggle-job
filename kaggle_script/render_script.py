@@ -4,12 +4,17 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
+# -------------------------------------------------------------------
+# 1. INSTALL REQUIREMENTS
+# -------------------------------------------------------------------
 def install_requirements():
     packages = [
         "nest_asyncio",
         "diffusers>=0.32.0",
         "transformers",
+        "accelerate",
         "imageio-ffmpeg",
         "google-api-python-client",
         "google-auth-oauthlib",
@@ -17,12 +22,17 @@ def install_requirements():
         "soundfile",
         "av",
         "edge-tts",
-        "accelerate",
         "protobuf<6.0.0,>=3.20.2",
         "sentencepiece",
         "ftfy",
+        "safetensors",
+        "omegaconf",
+        "einops",
+        "opencv-python",
+        "pandas",
+        "requests"
     ]
-    print("📦 Đang cài packages...")
+    print("📦 Đang kiểm tra & cài đặt packages...")
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "--no-warn-script-location", "--disable-pip-version-check"
@@ -38,14 +48,15 @@ import numpy as np
 import pandas as pd
 import requests
 import edge_tts
-from diffusers import CogVideoXPipeline
-from diffusers.utils import export_to_video
+from PIL import Image
+from diffusers import StableDiffusionXLPipeline, StableVideoDiffusionPipeline
+from diffusers.utils import export_to_video, load_image
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 COGVIDEOX-2B - TỐI ƯU T4 - [{RUN_DATE}]")
+print(f"🚀 SDXL → SVD I2V PIPELINE - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -61,7 +72,7 @@ def sync_system_time():
 sync_system_time()
 
 # -------------------------------------------------------------------
-# CONFIG
+# CONFIGURATION
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
@@ -92,39 +103,7 @@ def get_media_duration(file_path):
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
         return float(result.stdout.strip())
     except Exception:
-        return 2.0
-
-# -------------------------------------------------------------------
-# 2. ĐỌC SHEETS
-# -------------------------------------------------------------------
-print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
-try:
-    df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
-    total_scenes = len(df)
-    print(f"✅ Tìm thấy {total_scenes} cảnh.")
-except Exception as e:
-    print(f"❌ Lỗi đọc Google Sheet: {e}")
-    sys.exit(1)
-
-project_info = {
-    "title": "Chưa đặt tiêu đề",
-    "genre": "Mặc định",
-    "character_design": "",
-    "world_setting": "",
-    "visual_style": "",
-    "gender": "nam"
-}
-
-if not df.empty:
-    first_row = df.iloc[0]
-    for key in project_info.keys():
-        if key in df.columns:
-            val = str(first_row[key]).strip()
-            if val.lower() not in ["nan", "[empty]", ""]:
-                project_info[key] = val
-
-SELECTED_GENDER = project_info.get("gender", "nam").lower()
-ACTIVE_VOICE = VOICE_MAP.get(SELECTED_GENDER, "vi-VN-NamMinhNeural")
+        return 3.0
 
 def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
     file_name = os.path.basename(file_path)
@@ -136,7 +115,7 @@ def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
             file_metadata = {'name': file_name, 'parents': [folder_id]}
             media = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
             uploaded_file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-            print(f"☁️ Upload thành công: {file_name}")
+            print(f"☁️ Upload Google Drive thành công: {file_name}")
             return uploaded_file.get('id')
         except Exception as e:
             print(f"⚠️ Upload lần {attempt} thất bại: {e}")
@@ -156,56 +135,155 @@ def send_n8n_final_webhook(status, total_scenes, final_file=None, drive_file_id=
     }
     try:
         res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
-        print(f"📡 Webhook {status.upper()} → {res.status_code}")
+        print(f"📡 Webhook {status.upper()} → HTTP {res.status_code}")
     except Exception as e:
-        print(f"❌ Lỗi webhook: {e}")
+        print(f"❌ Lỗi gửi Webhook: {e}")
 
 # -------------------------------------------------------------------
-# 3. LOAD MODEL COGVIDEOX-2B
+# 2. ĐỌC DỮ LIỆU TỪ GOOGLE SHEETS
 # -------------------------------------------------------------------
-print("\n🧠 3. LOAD MODEL COGVIDEOX-2B...")
+print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
 try:
-    MODEL_ID = "THUDM/CogVideoX-2b"
-
-    pipe = CogVideoXPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
-    )
-
-    # Tối ưu VRAM cho T4
-    pipe.enable_model_cpu_offload()
-    pipe.vae.enable_tiling()
-    pipe.vae.enable_slicing()
-
-    print("✅ Load CogVideoX-2B thành công!")
+    df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
+    total_scenes = len(df)
+    print(f"✅ Tìm thấy tổng cộng {total_scenes} cảnh.")
 except Exception as e:
-    send_n8n_final_webhook("failed", 0, error_message=f"Lỗi load model: {e}")
+    print(f"❌ Lỗi đọc Google Sheet CSV: {e}")
     sys.exit(1)
 
+project_info = {
+    "title": "Chưa đặt tiêu đề",
+    "genre": "Tiên Hiệp",
+    "character_design": "",
+    "world_setting": "",
+    "visual_style": "",
+    "gender": "nam"
+}
+
+if not df.empty:
+    first_row = df.iloc[0]
+    for key in project_info.keys():
+        if key in df.columns:
+            val = str(first_row[key]).strip()
+            if val.lower() not in ["nan", "[empty]", ""]:
+                project_info[key] = val
+
+SELECTED_GENDER = project_info.get("gender", "nam").lower()
+ACTIVE_VOICE = VOICE_MAP.get(SELECTED_GENDER, "vi-VN-NamMinhNeural")
+
 # -------------------------------------------------------------------
-# 4. PROCESS PIPELINE
+# 3. QUẢN LÝ BỘ NHỚ MODEL (SDXL & SVD)
+# -------------------------------------------------------------------
+def clear_vram():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def load_sdxl_pipeline():
+    print("\n🧠 Load SDXL Pipeline (Text → Image)...")
+    sdxl = StableDiffusionXLPipeline.from_pretrained(
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        torch_dtype=torch.float16,
+        variant="fp16",
+        use_safetensors=True,
+        token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
+    )
+    sdxl.enable_model_cpu_offload()
+    sdxl.enable_vae_tiling()
+    return sdxl
+
+def load_svd_pipeline():
+    print("\n🧠 Load Stable Video Diffusion Pipeline (Image → Video)...")
+    svd = StableVideoDiffusionPipeline.from_pretrained(
+        "stabilityai/stable-video-diffusion-img2vid-xt",
+        torch_dtype=torch.float16,
+        variant="fp16",
+        token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None,
+    )
+    svd.enable_model_cpu_offload()
+    return svd
+
+# -------------------------------------------------------------------
+# 4. THỰC THI PIPELINE CHÍNH (IMAGE-TO-VIDEO)
 # -------------------------------------------------------------------
 async def process_video_pipeline():
     rendered_files = []
 
-    STYLE_3D_PREFIX = (
+    STYLE_PREFIX = (
         "3d chinese donghua animation style, unreal engine 5 render, "
-        "extremely detailed 3d face, anime style, high quality, "
+        "extremely detailed 3d face, anime style, cinematic lighting, masterpiece, best quality, "
     )
     DEFAULT_NEGATIVE = (
-        "blurry, low quality, distorted face, deformed hands, extra limbs, "
-        "worst quality, low resolution, watermark, text, overexposed, "
-        "oversaturated, static, frozen"
+        "2d, flat drawing, realistic human, photorealistic, blurry, low quality, "
+        "distorted face, morphing, text, watermark, stiff pose, deformed hands, extra limbs"
     )
 
+    # Khởi tạo pipeline sinh ảnh trước
+    sdxl = load_sdxl_pipeline()
+    generated_images = {}
+
+    # PHASE 1: GENERATE ALL IMAGES (SDXL)
+    print("\n🎨 --- GIAI ĐOẠN 1: TẠO ẢNH TĨNH TỪ IMAGE_PROMPT (SDXL) ---")
     for index, row in df.iterrows():
         scene_idx_val = row.get("scene_index")
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
 
-        raw_prompt = str(row.get("prompt", "")).strip()
-        raw_negative = str(row.get("negative_prompt", "")).strip()
+        # Đọc trường image_prompt (fallback về prompt cũ nếu trống)
+        image_prompt_raw = str(row.get("image_prompt", "")).strip()
+        if not image_prompt_raw or image_prompt_raw.lower() in ["nan", "[empty]", "none", "null"]:
+            image_prompt_raw = str(row.get("prompt", "")).strip()
 
+        negative_prompt = str(row.get("negative_prompt", "")).strip()
+        if not negative_prompt or negative_prompt.lower() in ["nan", "[empty]", "none", "null"]:
+            negative_prompt = DEFAULT_NEGATIVE
+
+        image_file = f"image_{scene_index:03d}_{RUN_DATE}.png"
+
+        if not image_prompt_raw or image_prompt_raw.lower() in ["nan", "[empty]", "none"]:
+            print(f"⚠️ Bỏ qua tạo ảnh Cảnh {scene_index}: prompt rỗng.")
+            continue
+
+        if os.path.exists(image_file):
+            print(f"⏩ Ảnh cảnh {scene_index} đã tồn tại → dùng lại: {image_file}")
+            generated_images[scene_index] = image_file
+            continue
+
+        final_prompt = f"{STYLE_PREFIX} {image_prompt_raw}"
+        scene_seed = 42 + scene_index
+        generator = torch.Generator(device="cuda").manual_seed(scene_seed)
+
+        print(f"🖼️ [{scene_index}/{total_scenes}] Đang tạo ảnh bằng SDXL...")
+        try:
+            clear_vram()
+            image = sdxl(
+                prompt=final_prompt,
+                negative_prompt=negative_prompt,
+                width=1024,
+                height=576,
+                num_inference_steps=25,
+                guidance_scale=7.0,
+                generator=generator,
+            ).images[0]
+
+            image.save(image_file)
+            generated_images[scene_index] = image_file
+            print(f"   ✅ Đã lưu ảnh: {image_file}")
+        except Exception as e:
+            print(f"❌ Lỗi tạo ảnh ở Cảnh {scene_index}: {e}")
+
+    # Giải phóng SDXL khỏi GPU để nhường RAM cho SVD
+    del sdxl
+    clear_vram()
+
+    # PHASE 2: GENERATE VIDEO & AUDIO (SVD + Edge-TTS)
+    print("\n🎬 --- GIAI ĐOẠN 2: CHUYỂN ĐỔI ẢNH THÀNH VIDEO (SVD) & GHÉP LỜI THOẠI ---")
+    svd = load_svd_pipeline()
+
+    for index, row in df.iterrows():
+        scene_idx_val = row.get("scene_index")
+        scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
+        location_val = str(row.get("location", "Location")).strip()
+
+        # Đọc thoại từ các cột có sẵn
         scene_text = ""
         for col in ["dialogue", "scene_narration_vi", "narration_vi", "narration"]:
             if col in row and pd.notna(row[col]):
@@ -214,58 +292,54 @@ async def process_video_pipeline():
                     scene_text = val
                     break
 
+        image_file = generated_images.get(scene_index, f"image_{scene_index:03d}_{RUN_DATE}.png")
         raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
         audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
-        if not raw_prompt or raw_prompt.lower() in ["nan", "[empty]", "none", "null"]:
-            print(f"⚠️ Bỏ qua cảnh {scene_index}")
-            continue
-
         if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 10000:
-            print(f"⏩ [{scene_index}/{total_scenes}] Đã tồn tại → bỏ qua")
+            print(f"⏩ [{scene_index}/{total_scenes}] Video hoàn chỉnh đã tồn tại → Bỏ qua render.")
             rendered_files.append(final_scene_file)
             continue
 
-        final_prompt = f"{STYLE_3D_PREFIX} {raw_prompt}"
-        final_negative = (
-            raw_negative
-            if (raw_negative and raw_negative.lower() not in ["nan", "[empty]", "none"])
-            else DEFAULT_NEGATIVE
-        )
+        if not os.path.exists(image_file):
+            print(f"⚠️ Không tìm thấy ảnh đầu vào cho Cảnh {scene_index}. Bỏ qua...")
+            continue
+
+        # Đọc duration_sec thiết lập từ Gemini (mặc định 3s)
+        duration_sec = float(row.get("duration_sec", 3)) if pd.notna(row.get("duration_sec")) else 3.0
+        num_frames = int(max(14, min(30, duration_sec * 7))) # Tính khung hình theo fps=7
 
         scene_seed = 42 + scene_index
         generator = torch.Generator(device="cuda").manual_seed(scene_seed)
 
-        print(f"\n🎬 [{scene_index}/{total_scenes}] Render CogVideoX-2B...")
+        # ---------- 4.1 Sinh Video bằng SVD ----------
+        print(f"📹 [{scene_index}/{total_scenes}] Render video SVD ({location_val}) - Frame count: {num_frames}...")
         try:
-            gc.collect()
-            torch.cuda.empty_cache()
+            clear_vram()
+            img_input = load_image(image_file).resize((1024, 576))
 
-            with torch.inference_mode():
-                output = pipe(
-                    prompt=final_prompt,
-                    negative_prompt=final_negative,
-                    num_frames=49,            # ~6 giây ở 8fps
-                    num_inference_steps=50,
-                    guidance_scale=6.0,
-                    generator=generator,
-                )
-                frames = output.frames[0]
+            frames = svd(
+                img_input,
+                decode_chunk_size=8,
+                generator=generator,
+                num_frames=num_frames,
+                motion_bucket_id=127,
+                noise_aug_strength=0.02,
+            ).frames[0]
 
-            export_to_video(frames, raw_video_file, fps=8)
+            export_to_video(frames, raw_video_file, fps=7)
+            print(f"   ✅ Đã tạo video thô: {raw_video_file}")
 
-            del output, frames
-            gc.collect()
-            torch.cuda.empty_cache()
-
+            del frames
+            clear_vram()
         except Exception as e:
-            print(f"❌ Lỗi render cảnh {scene_index}: {e}")
+            print(f"❌ Lỗi render SVD cảnh {scene_index}: {e}")
             continue
 
-        # Voice
+        # ---------- 4.2 Lồng thoại bằng Edge-TTS ----------
         if scene_text:
-            print(f"🎙️ Voice cảnh {scene_index}: {scene_text[:50]}...")
+            print(f"🎙️ Tạo thoại cảnh {scene_index}: '{scene_text[:40]}...'")
             communicate = edge_tts.Communicate(text=scene_text, voice=ACTIVE_VOICE)
             await communicate.save(audio_scene_file)
 
@@ -277,35 +351,41 @@ async def process_video_pipeline():
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
                     f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
-                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 8 '
+                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 7 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
                 )
             else:
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
-                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 8 '
+                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 7 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
                 )
             subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
-                f'-c:v libx264 -pix_fmt yuv420p -r 8 -c:a aac -ar 44100 -ac 2 -b:a 192k '
+                f'-c:v libx264 -pix_fmt yuv420p -r 7 -c:a aac -ar 44100 -ac 2 -b:a 192k '
                 f'-shortest "{final_scene_file}"'
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        if os.path.exists(raw_video_file):
-            os.remove(raw_video_file)
-        if os.path.exists(audio_scene_file):
-            os.remove(audio_scene_file)
+        # Xóa bớt các file trung gian
+        for f in [raw_video_file, audio_scene_file]:
+            if os.path.exists(f):
+                os.remove(f)
 
-        print(f"💾 Hoàn tất cảnh {scene_index}")
+        print(f"💾 Cảnh {scene_index} đã tạo thành công!")
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
 
-    # Gộp + BGM + Upload
-    print("\n🎞️ Gộp các cảnh...")
+    # Giải phóng SVD
+    del svd
+    clear_vram()
+
+    # -------------------------------------------------------------------
+    # 5. GHÉP TẤT CẢ NGHỆ THUẬT & UPLOAD PHIM HOÀN CHỈNH
+    # -------------------------------------------------------------------
+    print("\n🎞️ --- GIAI ĐOẠN 3: GHÉP TẤT CẢ CÁC CẢNH THÀNH PHIM HOÀN CHỈNH ---")
     if not rendered_files:
         send_n8n_final_webhook("failed", 0, error_message="Không render được cảnh nào.")
         sys.exit(1)
@@ -334,7 +414,7 @@ async def process_video_pipeline():
     else:
         final_output = concat_output
 
-    print(f"\n☁️ Upload phim hoàn chỉnh...")
+    print(f"\n☁️ Tiến hành Upload Phim Hoàn Chỉnh lên Google Drive...")
     drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
 
     send_n8n_final_webhook(
@@ -343,8 +423,11 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
-    print("\n🎉 HOÀN TẤT COGVIDEOX-2B!")
+    print("\n🎉 HOÀN TẤT QUY TRÌNH TỰ ĐỘNG SDXL → SVD I2V!")
 
+# -------------------------------------------------------------------
+# KÍCH HOẠT VÒNG LẶP ASYNCIO
+# -------------------------------------------------------------------
 try:
     asyncio.run(process_video_pipeline())
 except RuntimeError:
