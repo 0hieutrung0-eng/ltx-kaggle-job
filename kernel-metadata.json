@@ -1,12 +1,12 @@
 {
   "id": "0hieutrung0-eng/ltx-video-render",
-  "title": "LTX Video Render",
+  "title": "Wan 2.1 Video Render",
   "code_file": "kaggle_script/render_script.py",
   "language": "python",
   "kernel_type": "script",
-  "is_private": "true",
-  "enable_gpu": "true",
-  "enable_internet": "true",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
   "dataset_sources": [],
   "kernel_sources": [],
   "competition_sources": []
