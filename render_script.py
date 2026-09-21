@@ -308,10 +308,10 @@ async def process_video_pipeline():
                 image=image_input,
                 prompt=motion_prompt,
                 negative_prompt=neg_prompt if neg_prompt else None,
-                width=1024,
-                height=576,
-                num_frames=25,
-                num_inference_steps=25, # Khống chế 25 steps cho tốc độ & VRAM an toàn
+                width=768,
+                height=432,
+                num_frames=20,
+                num_inference_steps=20, # Khống chế 25 steps cho tốc độ & VRAM an toàn
                 generator=torch.Generator(device="cuda").manual_seed(scene_seed),
             ).frames[0]
 
