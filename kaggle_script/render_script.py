@@ -84,7 +84,7 @@ GOOGLE_SHEET_CSV_URL = (
 )
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# 🔑 ĐÃ THÊM HUGGING FACE TOKEN CỦA BẠN VÀO ĐÂY
+# 🔑 HUGGING FACE TOKEN
 HF_TOKEN = "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"
 
 VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
@@ -288,7 +288,6 @@ async def process_video_pipeline():
       torch.cuda.empty_cache()
 
       with torch.inference_mode():
-        # Dùng output_type="pt" để xử lý màu chuẩn
         output = pipe(
             prompt=final_prompt,
             negative_prompt=final_negative,
@@ -299,17 +298,30 @@ async def process_video_pipeline():
             num_inference_steps=20,
             guidance_scale=3.5,
             generator=generator,
-            output_type="pt",
+            output_type="pt",  # Trả về PyTorch Tensor
         )
         video_tensor = output.frames[0]
 
-      # SỬA LỖI MÀU NHÒE: Đưa tensor về [0, 1] rồi nhân 255 ép sang uint8
+      # -------------------------------------------------------------------
+      # XỬ LÝ SHAPE TENSOR & CHUYỂN KÊNH MÀU CHUẨN (TRÁNH SAI MÀU / XOAY VIDEO)
+      # -------------------------------------------------------------------
+      # 1. Chuẩn hóa dải giá trị về [0.0, 1.0]
       if video_tensor.min() < 0:
         video_tensor = (video_tensor + 1.0) / 2.0
-
       video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
-      video_frames = (video_tensor * 255).cpu().numpy().astype(np.uint8)
 
+      # 2. Chuyển chiều Kênh (Channels) về cuối [Frames, Height, Width, Channels]
+      if video_tensor.ndim == 4 and video_tensor.shape[1] == 3:
+        # Dạng [F, C, H, W] -> [F, H, W, C]
+        video_tensor = video_tensor.permute(0, 2, 3, 1)
+      elif video_tensor.ndim == 4 and video_tensor.shape[0] == 3:
+        # Dạng [C, F, H, W] -> [F, H, W, C]
+        video_tensor = video_tensor.permute(1, 2, 3, 0)
+
+      # 3. Chuyển sang Numpy uint8 [0, 255]
+      video_frames = (video_tensor * 255.0).cpu().numpy().astype(np.uint8)
+
+      # 4. Xuất video bằng export_to_video
       export_to_video(video_frames, raw_video_file, fps=24)
 
     except Exception as e:
