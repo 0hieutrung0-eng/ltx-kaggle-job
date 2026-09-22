@@ -55,6 +55,7 @@ from diffusers.utils import export_to_video, load_image
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from huggingface_hub import login
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
 print(f"🚀 FLUX.1 + LTX-VIDEO PIPELINE (RAM SAFE EDITION) - [{RUN_DATE}]")
@@ -80,7 +81,18 @@ N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-don
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
-HF_TOKEN = os.environ.get("HF_TOKEN", "HFAKXfcl67Rf4havwPrfA3niEuM7tPT")
+
+# 🔑 Token Hugging Face đã được gắn trực tiếp vào mã nguồn
+HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+
+if HF_TOKEN.startswith("hf_"):
+    try:
+        login(token=HF_TOKEN)
+        print("🔑 Đã xác thực thành công Hugging Face Token.")
+    except Exception as e:
+        print(f"⚠️ Không thể login Hugging Face: {e}")
+else:
+    print("⚠️ CẢNH BÁO: HF_TOKEN không hợp lệ (cần bắt đầu bằng 'hf_').")
 
 VOICE_MAP = {
     "nam": "vi-VN-NamMinhNeural",
@@ -195,7 +207,7 @@ async def process_video_pipeline():
         flux_pipe = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
-            token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
+            token=HF_TOKEN,
         )
         flux_pipe.enable_sequential_cpu_offload() # Tối ưu hóa RAM/VRAM cấp độ cao nhất
     except Exception as e:
@@ -255,7 +267,7 @@ async def process_video_pipeline():
         ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
             "Lightricks/LTX-Video",
             torch_dtype=torch.bfloat16,
-            token=HF_TOKEN if HF_TOKEN and HF_TOKEN.startswith("hf_") else None,
+            token=HF_TOKEN,
         )
         ltx_pipe.enable_model_cpu_offload()
     except Exception as e:
@@ -303,7 +315,6 @@ async def process_video_pipeline():
 
             motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth character movement, cinematic lighting"
 
-            # Tối ưu hóa số khung hình và suy luận để tiết kiệm bộ nhớ
             video_frames = ltx_pipe(
                 image=image_input,
                 prompt=motion_prompt,
@@ -311,7 +322,7 @@ async def process_video_pipeline():
                 width=768,
                 height=432,
                 num_frames=20,
-                num_inference_steps=20, # Khống chế 25 steps cho tốc độ & VRAM an toàn
+                num_inference_steps=20,
                 generator=torch.Generator(device="cuda").manual_seed(scene_seed),
             ).frames[0]
 
