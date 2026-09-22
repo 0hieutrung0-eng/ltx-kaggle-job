@@ -82,17 +82,17 @@ SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# 🔑 Token Hugging Face đã được gắn trực tiếp vào mã nguồn
-HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+# 🔑 Đọc Hugging Face Token an toàn từ biến môi trường (GitHub/Kaggle Secrets)
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-if HF_TOKEN.startswith("hf_"):
+if HF_TOKEN and HF_TOKEN.startswith("hf_"):
     try:
         login(token=HF_TOKEN)
         print("🔑 Đã xác thực thành công Hugging Face Token.")
     except Exception as e:
         print(f"⚠️ Không thể login Hugging Face: {e}")
 else:
-    print("⚠️ CẢNH BÁO: HF_TOKEN không hợp lệ (cần bắt đầu bằng 'hf_').")
+    print("⚠️ CẢNH BÁO: HF_TOKEN không tìm thấy hoặc không hợp lệ trong biến môi trường.")
 
 VOICE_MAP = {
     "nam": "vi-VN-NamMinhNeural",
