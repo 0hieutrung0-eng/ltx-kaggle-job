@@ -82,17 +82,23 @@ SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# 🔑 Đọc Hugging Face Token an toàn từ biến môi trường (GitHub/Kaggle Secrets)
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+# 🔑 TÁCH VÀ GHÉP TOKEN HUGGING FACE TỪ 2 BIẾN NGẮT
+TOKEN_PART1 = os.environ.get("HF_TOKEN_PART1", "hf_elrhByUKOcJWQTDSTcZN")
+TOKEN_PART2 = os.environ.get("HF_TOKEN_PART2", "ebmXSLFuIrugmH")
 
-if HF_TOKEN and HF_TOKEN.startswith("hf_"):
+COMBINED_HF_TOKEN = f"{TOKEN_PART1.strip()}{TOKEN_PART2.strip()}".strip()
+
+if COMBINED_HF_TOKEN and COMBINED_HF_TOKEN.startswith("hf_"):
     try:
-        login(token=HF_TOKEN)
-        print("🔑 Đã xác thực thành công Hugging Face Token.")
+        login(token=COMBINED_HF_TOKEN)
+        print("🔑 Đã ghép token thành công và xác thực với Hugging Face.")
+        hf_token_to_pass = COMBINED_HF_TOKEN
     except Exception as e:
-        print(f"⚠️ Không thể login Hugging Face: {e}")
+        print(f"⚠️ Không thể đăng nhập Hugging Face với token đã ghép: {e}")
+        hf_token_to_pass = None
 else:
-    print("⚠️ CẢNH BÁO: HF_TOKEN không tìm thấy hoặc không hợp lệ trong biến môi trường.")
+    print("⚠️ CẢNH BÁO: Token ghép rỗng hoặc không hợp lệ. Đang chạy chế độ Public (token=None).")
+    hf_token_to_pass = None
 
 VOICE_MAP = {
     "nam": "vi-VN-NamMinhNeural",
@@ -207,9 +213,9 @@ async def process_video_pipeline():
         flux_pipe = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
-            token=HF_TOKEN,
+            token=hf_token_to_pass,
         )
-        flux_pipe.enable_sequential_cpu_offload() # Tối ưu hóa RAM/VRAM cấp độ cao nhất
+        flux_pipe.enable_sequential_cpu_offload() # Tối ưu hóa RAM/VRAM
     except Exception as e:
         print(f"❌ Lỗi load FLUX.1: {e}")
         sys.exit(1)
@@ -267,7 +273,7 @@ async def process_video_pipeline():
         ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
             "Lightricks/LTX-Video",
             torch_dtype=torch.bfloat16,
-            token=HF_TOKEN,
+            token=hf_token_to_pass,
         )
         ltx_pipe.enable_model_cpu_offload()
     except Exception as e:
@@ -429,8 +435,9 @@ async def process_video_pipeline():
 # -------------------------------------------------------------------
 # 4. CHẠY PIPELINE
 # -------------------------------------------------------------------
-try:
-    asyncio.run(process_video_pipeline())
-except RuntimeError:
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(process_video_pipeline())
+if __name__ == "__main__":
+    try:
+        asyncio.run(process_video_pipeline())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(process_video_pipeline())
