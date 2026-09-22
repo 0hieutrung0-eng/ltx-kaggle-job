@@ -215,7 +215,7 @@ async def process_video_pipeline():
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        flux_pipe.enable_sequential_cpu_offload() # Tối ưu hóa RAM/VRAM
+        flux_pipe.enable_model_cpu_offload() # Tối ưu hóa RAM/VRAM
     except Exception as e:
         print(f"❌ Lỗi load FLUX.1: {e}")
         sys.exit(1)
