@@ -6,13 +6,15 @@ import sys
 import time
 from pathlib import Path
 
+# -------------------------------------------------------------------
+# 1. CÀI ĐẶT PACKAGES & CẤU HÌNH HỆ THỐNG
+# -------------------------------------------------------------------
 def install_requirements():
     packages = [
         "nest_asyncio",
         "diffusers>=0.32.0",
         "transformers",
         "accelerate",
-        "bitsandbytes",          # cần cho NF4
         "imageio-ffmpeg",
         "google-api-python-client",
         "google-auth-oauthlib",
@@ -29,80 +31,36 @@ def install_requirements():
         "opencv-python",
         "pandas",
         "requests",
-        "Pillow",
+        "Pillow"
     ]
     print("📦 Đang kiểm tra và cài đặt packages...")
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "--no-warn-script-location", "--disable-pip-version-check"
     ] + packages)
-    try:
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-q",
-            "realesrgan", "basicsr", "facexlib", "gfpgan",
-            "--no-warn-script-location", "--disable-pip-version-check"
-        ])
-    except Exception as e:
-        print(f"⚠️ Cài Real-ESRGAN thất bại (sẽ dùng upscale dự phòng): {e}")
 
 install_requirements()
 
 import nest_asyncio
 nest_asyncio.apply()
 
-import cv2
 import torch
 import numpy as np
 import pandas as pd
 import requests
 import edge_tts
 from PIL import Image, ImageFilter, ImageEnhance
-from diffusers import FluxPipeline, FluxTransformer2DModel, BitsAndBytesConfig
-from transformers import T5EncoderModel
+from diffusers import FluxPipeline, LTXImageToVideoPipeline
 from diffusers.utils import export_to_video, load_image
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from huggingface_hub import login
 
-# ---- PATCH tương thích torchvision mới ----
-try:
-    import torchvision.transforms.functional as TVF
-    sys.modules["torchvision.transforms.functional_tensor"] = TVF
-except Exception:
-    pass
-
-HAS_REALESRGAN = False
-try:
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    from realesrgan import RealESRGANer
-    HAS_REALESRGAN = True
-except Exception as e:
-    print(f"⚠️ Real-ESRGAN không dùng được: {e}")
-    print("→ Sẽ dùng upscale dự phòng (PIL high-quality).")
-
-try:
-    from diffusers import LTXImageToVideoPipeline
-    HAS_LTX_I2V = True
-except ImportError:
-    HAS_LTX_I2V = False
-    print("⚠️ Không tìm thấy LTXImageToVideoPipeline")
-
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 FLUX NF4 + UPSCALE CAO + LTX (T4) - [{RUN_DATE}]")
+print(f"🚀 FLUX.1 + LTX-VIDEO + UPSCALE (SEQUENTIAL SAFE T4) - [{RUN_DATE}]")
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
-
-# ==================== CẤU HÌNH ====================
-FLUX_WIDTH = 512
-FLUX_HEIGHT = 288
-LTX_WIDTH = 512
-LTX_HEIGHT = 288
-LTX_NUM_FRAMES = 20
-LTX_STEPS = 10
-FLUX_STEPS = 4
-USE_REALESRGAN = True          # Bật để upscale chất lượng cao
-UPSCALE_FACTOR = 4             # ×4 → ~2048×1152 (gần 2K)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
 def sync_system_time():
     try:
@@ -116,7 +74,7 @@ def sync_system_time():
 sync_system_time()
 
 # -------------------------------------------------------------------
-# CONFIG + GHÉP HF TOKEN
+# CONFIG
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
@@ -174,64 +132,27 @@ def clear_memory():
         torch.cuda.ipc_collect()
         torch.cuda.synchronize()
 
-def truncate_prompt(prompt, max_words=60):
-    words = prompt.split()
-    if len(words) > max_words:
-        return " ".join(words[:max_words])
-    return prompt
-
 # -------------------------------------------------------------------
-# UPSCALER (ưu tiên chất lượng cao)
+# UPSCALE CHẤT LƯỢNG CAO (PIL - an toàn VRAM)
 # -------------------------------------------------------------------
-def create_upsampler():
-    if not HAS_REALESRGAN or not USE_REALESRGAN:
-        return None
-    try:
-        # Dùng model x4 để upscale mạnh
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-        upsampler = RealESRGANer(
-            scale=4,
-            model_path="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-            model=model,
-            tile=200,          # nhỏ để an toàn VRAM
-            tile_pad=10,
-            pre_pad=0,
-            half=True
-        )
-        return upsampler
-    except Exception as e:
-        print(f"⚠️ Không tạo được RealESRGANer x4: {e}")
-        return None
-
-def upscale_image_realesrgan(upsampler, input_path, output_path):
-    img = cv2.imread(input_path, cv2.IMREAD_COLOR)
-    output, _ = upsampler.enhance(img, outscale=UPSCALE_FACTOR)
-    cv2.imwrite(output_path, output)
-    return output_path
-
-def upscale_image_pil(input_path, output_path, scale=4):
-    """Upscale chất lượng cao bằng PIL (LANCZOS + sharpen)"""
+def upscale_image_pil(input_path, output_path, scale=2):
+    """Upscale ×2 chất lượng cao bằng PIL"""
     img = Image.open(input_path).convert("RGB")
     new_size = (img.width * scale, img.height * scale)
     img = img.resize(new_size, Image.Resampling.LANCZOS)
-    img = img.filter(ImageFilter.UnsharpMask(radius=1.8, percent=140, threshold=2))
+    
+    # Làm nét + tăng tương phản nhẹ
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=130, threshold=2))
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(1.08)
     enhancer = ImageEnhance.Sharpness(img)
-    img = enhancer.enhance(1.15)
+    img = enhancer.enhance(1.12)
+    
     img.save(output_path, quality=95)
     return output_path
 
-def upscale_image(upsampler, input_path, output_path):
-    if upsampler is not None:
-        try:
-            return upscale_image_realesrgan(upsampler, input_path, output_path)
-        except Exception as e:
-            print(f"⚠️ Real-ESRGAN lỗi, chuyển sang PIL: {e}")
-    return upscale_image_pil(input_path, output_path, scale=UPSCALE_FACTOR)
-
 # -------------------------------------------------------------------
-# 2. ĐỌC SHEETS
+# 2. ĐỌC DỮ LIỆU TỪ GOOGLE SHEETS
 # -------------------------------------------------------------------
 print("\n📊 2. TẢI DỮ LIỆU TỪ GOOGLE SHEETS...")
 try:
@@ -303,61 +224,27 @@ async def process_video_pipeline():
     rendered_files = []
     image_paths = {}
 
-    # ==================== GIAI ĐOẠN 1: FLUX NF4 ====================
-    print("\n🧠 [GIAI ĐOẠN 1] Load FLUX.1-schnell NF4 (nhẹ + nhanh)...")
+    # ==================== GIAI ĐOẠN 1: FLUX + UPSCALE ====================
+    print("\n🧠 [GIAI ĐOẠN 1] Load FLUX.1-schnell (sequential_cpu_offload)...")
     try:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-
-        transformer = FluxTransformer2DModel.from_pretrained(
-            "black-forest-labs/FLUX.1-schnell",
-            subfolder="transformer",
-            quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16,
-            token=hf_token_to_pass,
-        )
-
-        text_encoder_2 = T5EncoderModel.from_pretrained(
-            "black-forest-labs/FLUX.1-schnell",
-            subfolder="text_encoder_2",
-            quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16,
-            token=hf_token_to_pass,
-        )
-
         flux_pipe = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
-            transformer=transformer,
-            text_encoder_2=text_encoder_2,
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-
-        flux_pipe.enable_model_cpu_offload()
+        flux_pipe.enable_sequential_cpu_offload()
         
         if hasattr(flux_pipe, "enable_attention_slicing"):
-            flux_pipe.enable_attention_slicing("auto")
-        
+            flux_pipe.enable_attention_slicing("max")
         if hasattr(flux_pipe, "vae"):
             flux_pipe.vae.enable_slicing()
             flux_pipe.vae.enable_tiling()
             
-        print(f"✅ Load FLUX NF4 thành công! ({FLUX_WIDTH}×{FLUX_HEIGHT})")
+        print("✅ Load FLUX thành công! (640×360 + sequential)")
     except Exception as e:
-        print(f"❌ Lỗi load FLUX NF4: {e}")
+        print(f"❌ Lỗi load FLUX: {e}")
         send_n8n_final_webhook("failed", 0, error_message=str(e))
         sys.exit(1)
-
-    print("🔧 Khởi tạo Upscaler (chất lượng cao ×4)...")
-    upsampler = create_upsampler()
-    if upsampler:
-        print("✅ Real-ESRGAN ×4 sẵn sàng!")
-    else:
-        print("✅ Dùng PIL upscale ×4 (chất lượng cao).")
 
     for index, row in df.iterrows():
         scene_start = time.time()
@@ -380,17 +267,16 @@ async def process_video_pipeline():
         image_file = f"image_{scene_index:03d}_{RUN_DATE}.png"
         image_paths[scene_index] = image_file
 
-        print(f"🖼️ [{scene_index}/{total_scenes}] Sinh ảnh FLUX NF4...")
+        print(f"🖼️ [{scene_index}/{total_scenes}] Sinh ảnh FLUX...")
         try:
             clear_memory()
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_index)
-            safe_prompt = truncate_prompt(img_prompt, max_words=60)
 
             image = flux_pipe(
-                prompt=safe_prompt,
-                width=FLUX_WIDTH,
-                height=FLUX_HEIGHT,
-                num_inference_steps=FLUX_STEPS,
+                prompt=img_prompt,
+                width=640,
+                height=360,
+                num_inference_steps=4,
                 guidance_scale=0.0,
                 generator=generator,
                 max_sequence_length=256,
@@ -399,18 +285,18 @@ async def process_video_pipeline():
             image.save(raw_image_file)
             print(f"   ✅ Ảnh thô: {raw_image_file}")
 
-            print(f"   🔍 Upscaling ×{UPSCALE_FACTOR} (chất lượng cao)...")
-            upscale_image(upsampler, raw_image_file, image_file)
+            # === NÂNG CHẤT LƯỢNG ẢNH (UPSCALE ×2) ===
+            print(f"   🔍 Nâng chất lượng ảnh ×2...")
+            upscale_image_pil(raw_image_file, image_file, scale=2)
 
             if os.path.exists(raw_image_file):
                 os.remove(raw_image_file)
 
-            print(f"   ✅ Ảnh nét cao: {image_file}")
+            print(f"   ✅ Ảnh nét: {image_file}")
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
-            
+
             del image
             clear_memory()
-
         except Exception as e:
             print(f"❌ Lỗi ảnh cảnh {scene_index}: {e}")
             clear_memory()
@@ -419,17 +305,10 @@ async def process_video_pipeline():
 
     print("\n🧹 Xóa FLUX khỏi bộ nhớ...")
     del flux_pipe
-    if upsampler is not None:
-        del upsampler
     clear_memory()
     time.sleep(3)
 
-    # ==================== GIAI ĐOẠN 2: LTX I2V ====================
-    if not HAS_LTX_I2V:
-        print("❌ Không có LTXImageToVideoPipeline. Dừng.")
-        send_n8n_final_webhook("failed", 0, error_message="Missing LTXImageToVideoPipeline")
-        sys.exit(1)
-
+    # ==================== GIAI ĐOẠN 2: LTX ====================
     print("\n🧠 [GIAI ĐOẠN 2] Load LTX Image-to-Video...")
     try:
         ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
@@ -438,7 +317,7 @@ async def process_video_pipeline():
             token=hf_token_to_pass,
         )
         ltx_pipe.enable_model_cpu_offload()
-        print(f"✅ Load LTX I2V thành công! ({LTX_WIDTH}×{LTX_HEIGHT}, {LTX_NUM_FRAMES}f, {LTX_STEPS} steps)")
+        print("✅ Load LTX thành công!")
     except Exception as e:
         print(f"❌ Lỗi load LTX: {e}")
         send_n8n_final_webhook("failed", 0, error_message=str(e))
@@ -481,7 +360,7 @@ async def process_video_pipeline():
         try:
             clear_memory()
             # Resize ảnh đã upscale về size LTX
-            image_input = load_image(image_file).resize((LTX_WIDTH, LTX_HEIGHT))
+            image_input = load_image(image_file).resize((640, 360))
 
             motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth cinematic movement, gentle wind"
 
@@ -489,19 +368,18 @@ async def process_video_pipeline():
                 image=image_input,
                 prompt=motion_prompt,
                 negative_prompt=neg_prompt if neg_prompt else None,
-                width=LTX_WIDTH,
-                height=LTX_HEIGHT,
-                num_frames=LTX_NUM_FRAMES,
-                num_inference_steps=LTX_STEPS,
+                width=640,
+                height=360,
+                num_frames=20,
+                num_inference_steps=15,
                 generator=torch.Generator("cpu").manual_seed(42 + scene_index),
             ).frames[0]
-
+    
             export_to_video(video_frames, raw_video_file, fps=12)
             print(f"   ✅ Video thô: {raw_video_file}")
 
             del video_frames
             clear_memory()
-
         except Exception as e:
             print(f"❌ Lỗi video cảnh {scene_index}: {e}")
             clear_memory()
@@ -545,7 +423,7 @@ async def process_video_pipeline():
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
 
-        print(f"⏱️ Cảnh {scene_index} hoàn thành trong {time.time() - scene_start:.1f} giây")
+        print(f"⏱️ Cảnh {scene_index} hoàn thành trong {time.time() - scene_start:.1f}s")
 
     del ltx_pipe
     clear_memory()
