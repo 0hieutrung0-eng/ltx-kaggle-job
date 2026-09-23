@@ -82,7 +82,6 @@ SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# 🔑 TÁCH VÀ GHÉP TOKEN HUGGING FACE TỪ 2 BIẾN NGẮT
 TOKEN_PART1 = os.environ.get("HF_TOKEN_PART1", "hf_elrhByUKOcJWQTDSTcZN")
 TOKEN_PART2 = os.environ.get("HF_TOKEN_PART2", "ebmXSLFuIrugmH")
 
@@ -215,7 +214,8 @@ async def process_video_pipeline():
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        flux_pipe.enable_model_cpu_offload() # Tối ưu hóa RAM/VRAM
+        # Sử dụng enable_model_cpu_offload thay vì sequential để tối ưu tốc độ
+        flux_pipe.enable_model_cpu_offload()
     except Exception as e:
         print(f"❌ Lỗi load FLUX.1: {e}")
         sys.exit(1)
@@ -229,12 +229,16 @@ async def process_video_pipeline():
             print(f"⚠️ Bỏ qua cảnh {scene_index}: Không tìm thấy image_prompt")
             continue
 
-        image_file = f"image_{scene_index:03d}_{RUN_DATE}.png"
-        image_paths[scene_index] = image_file
-
-        if os.path.exists(image_file):
-            print(f"⏩ Ảnh cảnh {scene_index} đã tồn tại → Bỏ qua sinh ảnh")
+        # Tìm kiếm ảnh cũ hoặc tạo tên mới
+        existing_images = list(Path('.').glob(f"image_{scene_index:03d}_*.png"))
+        if existing_images:
+            image_file = str(existing_images[0])
+            image_paths[scene_index] = image_file
+            print(f"⏩ Ảnh cảnh {scene_index} đã tồn tại ({image_file}) → Bỏ qua sinh ảnh")
             continue
+        else:
+            image_file = f"image_{scene_index:03d}_{RUN_DATE}.png"
+            image_paths[scene_index] = image_file
 
         print(f"🖼️ [{scene_index}/{total_scenes}] Đang sinh ảnh FLUX.1...")
         try:
@@ -316,7 +320,8 @@ async def process_video_pipeline():
             gc.collect()
             torch.cuda.empty_cache()
 
-            image_input = load_image(image_file).resize((1024, 576))
+            # Fix kích thước chia hết cho 32 (768 x 448)
+            image_input = load_image(image_file).resize((768, 448))
             scene_seed = 42 + scene_index
 
             motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth character movement, cinematic lighting"
@@ -325,9 +330,9 @@ async def process_video_pipeline():
                 image=image_input,
                 prompt=motion_prompt,
                 negative_prompt=neg_prompt if neg_prompt else None,
-                width=768,
-                height=432,
-                num_frames=20,
+                width=768,     # Chia hết cho 32 (24)
+                height=448,    # Đổi từ 432 thành 448 (448 / 32 = 14) -> FIX LỖI CRASH
+                num_frames=25, # Định dạng khung hình chuẩn 8k + 1
                 num_inference_steps=20,
                 generator=torch.Generator(device="cuda").manual_seed(scene_seed),
             ).frames[0]
@@ -341,7 +346,6 @@ async def process_video_pipeline():
 
         except Exception as e:
             print(f"❌ Lỗi sinh video LTX cảnh {scene_index}: {e}")
-            if os.path.exists(image_file): os.remove(image_file)
             continue
 
         # ---------- Tạo Voice & Lắp ráp FFmpeg ----------
@@ -376,8 +380,8 @@ async def process_video_pipeline():
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Xóa các file trung gian
-        for f in [image_file, raw_video_file, audio_scene_file]:
+        # Xóa các file trung gian (giữ lại image_file để phục vụ resume khi rerun)
+        for f in [raw_video_file, audio_scene_file]:
             if os.path.exists(f): 
                 os.remove(f)
 
