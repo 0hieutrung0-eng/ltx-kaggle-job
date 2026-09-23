@@ -85,7 +85,6 @@ SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# ===== GIỮ CÁCH GHÉP TOKEN =====
 TOKEN_PART1 = os.environ.get("HF_TOKEN_PART1", "hf_elrhByUKOcJWQTDSTcZN")
 TOKEN_PART2 = os.environ.get("HF_TOKEN_PART2", "ebmXSLFuIrugmH")
 COMBINED_HF_TOKEN = f"{TOKEN_PART1.strip()}{TOKEN_PART2.strip()}".strip()
@@ -337,7 +336,7 @@ async def process_video_pipeline():
                 negative_prompt=neg_prompt if neg_prompt else None,
                 width=768,
                 height=448,
-                num_frames=17,          # an toàn cho T4
+                num_frames=17,
                 num_inference_steps=20,
                 generator=torch.Generator("cpu").manual_seed(42 + scene_index),
             ).frames[0]
@@ -350,7 +349,7 @@ async def process_video_pipeline():
             print(f"❌ Lỗi video cảnh {scene_index}: {e}")
             continue
 
-        # Voice
+        # Voice + FFmpeg (đã sửa lỗi cú pháp)
         if dialogue_text:
             print(f"🎙️ Voice [{char_name}]: {dialogue_text[:40]}...")
             communicate = edge_tts.Communicate(text=dialogue_text, voice=voice_to_use)
@@ -378,3 +377,62 @@ async def process_video_pipeline():
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
                 f'-c:v libx264 -pix_fmt yuv420p -r 16 -c:a aac -ar 44100 -ac 2 -b:a 192k '
+                f'-shortest "{final_scene_file}"'
+            )
+            subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        for f in [raw_video_file, audio_scene_file]:
+            if os.path.exists(f):
+                os.remove(f)
+
+        upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
+        rendered_files.append(final_scene_file)
+
+    del ltx_pipe
+    clear_memory()
+
+    # ==================== GIAI ĐOẠN 3: GỘP + BGM ====================
+    print("\n🎞️ Gộp các cảnh...")
+    if not rendered_files:
+        send_n8n_final_webhook("failed", 0, error_message="Không render được cảnh nào.")
+        sys.exit(1)
+
+    with open("file_list.txt", "w") as f:
+        for file in rendered_files:
+            f.write(f"file '{file}'\n")
+
+    concat_output = f"final_concat_{RUN_DATE}.mp4"
+    final_output = f"final_movie_{RUN_DATE}.mp4"
+    subprocess.run(f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}", shell=True, check=True)
+
+    bgm_file = "bgm_xianxia.mp3"
+    if os.path.exists(bgm_file):
+        bgm_cmd = (
+            f'ffmpeg -y -i {concat_output} -stream_loop -1 -i {bgm_file} '
+            f'-filter_complex "[0:a]volume=1.2[v_tts];[1:a]volume=0.15[v_bgm];'
+            f'[v_tts][v_bgm]amix=inputs=2:duration=first[a]" '
+            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k {final_output}'
+        )
+        try:
+            subprocess.run(bgm_cmd, shell=True, check=True)
+        except Exception:
+            final_output = concat_output
+    else:
+        final_output = concat_output
+
+    print(f"\n☁️ Upload phim hoàn chỉnh...")
+    drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
+    send_n8n_final_webhook(
+        status="completed_all",
+        total_scenes=len(rendered_files),
+        final_file=final_output,
+        drive_file_id=drive_file_id
+    )
+    print("\n🎉 HOÀN TẤT PIPELINE!")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(process_video_pipeline())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(process_video_pipeline())
