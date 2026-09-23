@@ -35,7 +35,6 @@ def install_requirements():
         sys.executable, "-m", "pip", "install", "-q",
         "--no-warn-script-location", "--disable-pip-version-check"
     ] + packages)
-
     # Thử cài Real-ESRGAN (có thể lỗi trên torchvision mới)
     try:
         subprocess.check_call([
@@ -91,6 +90,7 @@ except ImportError:
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
 print(f"🚀 FLUX + UPSCALE + LTX (TỐI ƯU T4) - [{RUN_DATE}]")
 
+# Quan trọng cho T4 15GB
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
 def sync_system_time():
@@ -176,9 +176,10 @@ def create_upsampler():
         return None
     try:
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+        # URL ĐÚNG (v0.2.1) - fix lỗi 404
         upsampler = RealESRGANer(
             scale=2,
-            model_path="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x2plus.pth",
+            model_path="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
             model=model,
             tile=400,
             tile_pad=10,
@@ -296,11 +297,18 @@ async def process_video_pipeline():
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        flux_pipe.enable_model_cpu_offload()
+        # Sequential offload = tiết kiệm VRAM nhất trên T4 15GB (chậm hơn một chút)
+        flux_pipe.enable_sequential_cpu_offload()
+        
+        # Thêm attention slicing để giảm peak memory
+        if hasattr(flux_pipe, "enable_attention_slicing"):
+            flux_pipe.enable_attention_slicing()
+        
         if hasattr(flux_pipe, "vae"):
             flux_pipe.vae.enable_slicing()
             flux_pipe.vae.enable_tiling()
-        print("✅ Load FLUX thành công!")
+            
+        print("✅ Load FLUX thành công! (sequential_cpu_offload + attention_slicing)")
     except Exception as e:
         print(f"❌ Lỗi load FLUX: {e}")
         send_n8n_final_webhook("failed", 0, error_message=str(e))
@@ -316,8 +324,8 @@ async def process_video_pipeline():
     for index, row in df.iterrows():
         scene_idx_val = row.get("scene_index")
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
-        img_prompt = str(row.get("image_prompt", "")).strip()
 
+        img_prompt = str(row.get("image_prompt", "")).strip()
         if not img_prompt or img_prompt.lower() in ["nan", "none", "null"]:
             print(f"⚠️ Bỏ qua cảnh {scene_index}: không có image_prompt")
             continue
@@ -354,21 +362,24 @@ async def process_video_pipeline():
 
             print(f"   🔍 Upscaling ×2...")
             upscale_image(upsampler, raw_image_file, image_file)
+
             if os.path.exists(raw_image_file):
                 os.remove(raw_image_file)
-            print(f"   ✅ Ảnh nét: {image_file}")
 
+            print(f"   ✅ Ảnh nét: {image_file}")
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
             clear_memory()
+
         except Exception as e:
             print(f"❌ Lỗi ảnh cảnh {scene_index}: {e}")
+            clear_memory()   # vẫn clear dù lỗi
 
     print("\n🧹 Xóa FLUX khỏi bộ nhớ...")
     del flux_pipe
     if upsampler is not None:
         del upsampler
     clear_memory()
-    time.sleep(2)
+    time.sleep(3)   # đợi GPU giải phóng hoàn toàn
 
     # ==================== GIAI ĐOẠN 2: LTX I2V ====================
     if not HAS_LTX_I2V:
@@ -383,7 +394,7 @@ async def process_video_pipeline():
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        ltx_pipe.enable_model_cpu_offload()
+        ltx_pipe.enable_model_cpu_offload()   # LTX nhẹ hơn, model_offload đủ
         print("✅ Load LTX I2V thành công!")
     except Exception as e:
         print(f"❌ Lỗi load LTX: {e}")
@@ -426,6 +437,7 @@ async def process_video_pipeline():
         try:
             clear_memory()
             image_input = load_image(image_file).resize((768, 448))
+
             motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth cinematic movement, gentle wind"
 
             video_frames = ltx_pipe(
@@ -441,10 +453,13 @@ async def process_video_pipeline():
 
             export_to_video(video_frames, raw_video_file, fps=16)
             print(f"   ✅ Video thô: {raw_video_file}")
+
             del video_frames
             clear_memory()
+
         except Exception as e:
             print(f"❌ Lỗi video cảnh {scene_index}: {e}")
+            clear_memory()
             continue
 
         if dialogue_text:
@@ -500,6 +515,7 @@ async def process_video_pipeline():
 
     concat_output = f"final_concat_{RUN_DATE}.mp4"
     final_output = f"final_movie_{RUN_DATE}.mp4"
+
     subprocess.run(f"ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy {concat_output}", shell=True, check=True)
 
     bgm_file = "bgm_xianxia.mp3"
@@ -519,6 +535,7 @@ async def process_video_pipeline():
 
     print(f"\n☁️ Upload phim hoàn chỉnh...")
     drive_file_id = upload_file_to_drive_fresh(final_output, DRIVE_FOLDER_ID)
+
     send_n8n_final_webhook(
         status="completed_all",
         total_scenes=len(rendered_files),
