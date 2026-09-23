@@ -58,7 +58,7 @@ from googleapiclient.http import MediaFileUpload
 from huggingface_hub import login
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 FLUX.1 + LTX-VIDEO PIPELINE (RAM SAFE EDITION) - [{RUN_DATE}]")
+print(f"🚀 FLUX.1 + LTX-VIDEO PIPELINE (VRAM OPTIMIZED FOR T4) - [{RUN_DATE}]")
 
 # Cấu hình PyTorch quản lý bộ nhớ chống phân mảnh VRAM
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
@@ -205,7 +205,7 @@ async def process_video_pipeline():
     image_paths = {}
 
     # ===============================================================
-    # GIAI ĐOẠN 1: TẠO TOÀN BỘ ẢNH TĨNH BẰNG FLUX.1
+    # GIAI ĐOẠN 1: TẠO TOÀN BỘ ẢNH TĨNH BẰNG FLUX.1 (AN TOÀN VRAM)
     # ===============================================================
     print("\n🧠 [GIAI ĐOẠN 1] Khởi chạy FLUX.1 (Text → Image)...")
     try:
@@ -214,8 +214,14 @@ async def process_video_pipeline():
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        # Sử dụng enable_model_cpu_offload thay vì sequential để tối ưu tốc độ
+        
+        # Bật Cpu Offload kết hợp VAE slicing & tiling để chống OOM tuyệt đối
         flux_pipe.enable_model_cpu_offload()
+        if hasattr(flux_pipe, "enable_vae_slicing"):
+            flux_pipe.enable_vae_slicing()
+        if hasattr(flux_pipe, "enable_vae_tiling"):
+            flux_pipe.enable_vae_tiling()
+
     except Exception as e:
         print(f"❌ Lỗi load FLUX.1: {e}")
         sys.exit(1)
@@ -229,7 +235,7 @@ async def process_video_pipeline():
             print(f"⚠️ Bỏ qua cảnh {scene_index}: Không tìm thấy image_prompt")
             continue
 
-        # Tìm kiếm ảnh cũ hoặc tạo tên mới
+        # Kiểm tra nếu ảnh cũ đã tồn tại trên đĩa local
         existing_images = list(Path('.').glob(f"image_{scene_index:03d}_*.png"))
         if existing_images:
             image_file = str(existing_images[0])
@@ -246,10 +252,12 @@ async def process_video_pipeline():
             torch.cuda.empty_cache()
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_index)
+            
+            # Đổi độ phân giải thành 768x448 giúp VRAM luôn ổn định dưới 11GB
             image = flux_pipe(
                 prompt=img_prompt,
-                width=1024,
-                height=576,
+                width=768,
+                height=448,
                 num_inference_steps=4,
                 guidance_scale=0.0,
                 generator=generator,
@@ -310,9 +318,12 @@ async def process_video_pipeline():
         audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
 
-        if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 10000:
-            print(f"⏩ Video cảnh {scene_index} đã tồn tại → Bỏ qua")
-            rendered_files.append(final_scene_file)
+        # Tự động tìm video cảnh cũ đã hoàn thành
+        existing_scenes = list(Path('.').glob(f"scene_{scene_index:03d}_*.mp4"))
+        if existing_scenes and os.path.getsize(str(existing_scenes[0])) > 10000:
+            found_scene = str(existing_scenes[0])
+            print(f"⏩ Video cảnh {scene_index} đã tồn tại ({found_scene}) → Bỏ qua")
+            rendered_files.append(found_scene)
             continue
 
         print(f"\n🎬 [{scene_index}/{total_scenes}] Đang tạo chuyển động LTX-Video...")
@@ -320,7 +331,7 @@ async def process_video_pipeline():
             gc.collect()
             torch.cuda.empty_cache()
 
-            # Fix kích thước chia hết cho 32 (768 x 448)
+            # Fix chuẩn kích thước chia hết cho 32 (768 x 448)
             image_input = load_image(image_file).resize((768, 448))
             scene_seed = 42 + scene_index
 
@@ -331,8 +342,8 @@ async def process_video_pipeline():
                 prompt=motion_prompt,
                 negative_prompt=neg_prompt if neg_prompt else None,
                 width=768,     # Chia hết cho 32 (24)
-                height=448,    # Đổi từ 432 thành 448 (448 / 32 = 14) -> FIX LỖI CRASH
-                num_frames=25, # Định dạng khung hình chuẩn 8k + 1
+                height=448,    # Chia hết cho 32 (14) -> FIX HOÀN TOÀN LỖI CRASH
+                num_frames=25, # Định dạng khung hình chuẩn (8k + 1)
                 num_inference_steps=20,
                 generator=torch.Generator(device="cuda").manual_seed(scene_seed),
             ).frames[0]
@@ -380,7 +391,7 @@ async def process_video_pipeline():
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Xóa các file trung gian (giữ lại image_file để phục vụ resume khi rerun)
+        # Xóa các file trung gian
         for f in [raw_video_file, audio_scene_file]:
             if os.path.exists(f): 
                 os.remove(f)
