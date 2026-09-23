@@ -29,16 +29,22 @@ def install_requirements():
         "pandas",
         "requests",
         "Pillow",
-        "realesrgan",
-        "basicsr",
-        "facexlib",
-        "gfpgan",
     ]
     print("📦 Đang kiểm tra và cài đặt packages...")
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "--no-warn-script-location", "--disable-pip-version-check"
     ] + packages)
+
+    # Thử cài Real-ESRGAN (có thể lỗi trên torchvision mới)
+    try:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "-q",
+            "realesrgan", "basicsr", "facexlib", "gfpgan",
+            "--no-warn-script-location", "--disable-pip-version-check"
+        ])
+    except Exception as e:
+        print(f"⚠️ Cài Real-ESRGAN thất bại (sẽ dùng upscale dự phòng): {e}")
 
 install_requirements()
 
@@ -51,15 +57,29 @@ import numpy as np
 import pandas as pd
 import requests
 import edge_tts
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 from diffusers import FluxPipeline
 from diffusers.utils import export_to_video, load_image
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from huggingface_hub import login
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan import RealESRGANer
+
+# ---- PATCH tương thích torchvision mới ----
+try:
+    import torchvision.transforms.functional as TVF
+    sys.modules["torchvision.transforms.functional_tensor"] = TVF
+except Exception:
+    pass
+
+HAS_REALESRGAN = False
+try:
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
+    HAS_REALESRGAN = True
+except Exception as e:
+    print(f"⚠️ Real-ESRGAN không dùng được: {e}")
+    print("→ Sẽ dùng upscale dự phòng (PIL high-quality).")
 
 try:
     from diffusers import LTXImageToVideoPipeline
@@ -69,7 +89,7 @@ except ImportError:
     print("⚠️ Không tìm thấy LTXImageToVideoPipeline")
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 FLUX + RealESRGAN + LTX (TỐI ƯU TỐC ĐỘ T4) - [{RUN_DATE}]")
+print(f"🚀 FLUX + UPSCALE + LTX (TỐI ƯU T4) - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
@@ -149,26 +169,51 @@ def truncate_prompt(prompt, max_words=65):
     return prompt
 
 # -------------------------------------------------------------------
-# Real-ESRGAN Upscaler
+# UPSCALER
 # -------------------------------------------------------------------
 def create_upsampler():
-    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
-    upsampler = RealESRGANer(
-        scale=2,
-        model_path="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x2plus.pth",
-        model=model,
-        tile=400,
-        tile_pad=10,
-        pre_pad=0,
-        half=True
-    )
-    return upsampler
+    if not HAS_REALESRGAN:
+        return None
+    try:
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+        upsampler = RealESRGANer(
+            scale=2,
+            model_path="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x2plus.pth",
+            model=model,
+            tile=400,
+            tile_pad=10,
+            pre_pad=0,
+            half=True
+        )
+        return upsampler
+    except Exception as e:
+        print(f"⚠️ Không tạo được RealESRGANer: {e}")
+        return None
 
-def upscale_image(upsampler, input_path, output_path):
+def upscale_image_realesrgan(upsampler, input_path, output_path):
     img = cv2.imread(input_path, cv2.IMREAD_COLOR)
     output, _ = upsampler.enhance(img, outscale=2)
     cv2.imwrite(output_path, output)
     return output_path
+
+def upscale_image_pil(input_path, output_path, scale=2):
+    """Fallback upscale chất lượng cao bằng PIL"""
+    img = Image.open(input_path).convert("RGB")
+    new_size = (img.width * scale, img.height * scale)
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2))
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(1.05)
+    img.save(output_path, quality=95)
+    return output_path
+
+def upscale_image(upsampler, input_path, output_path):
+    if upsampler is not None:
+        try:
+            return upscale_image_realesrgan(upsampler, input_path, output_path)
+        except Exception as e:
+            print(f"⚠️ Real-ESRGAN lỗi, chuyển sang PIL: {e}")
+    return upscale_image_pil(input_path, output_path, scale=2)
 
 # -------------------------------------------------------------------
 # 2. ĐỌC SHEETS
@@ -243,15 +288,14 @@ async def process_video_pipeline():
     rendered_files = []
     image_paths = {}
 
-    # ==================== GIAI ĐOẠN 1: FLUX (NHANH HƠN) ====================
-    print("\n🧠 [GIAI ĐOẠN 1] Load FLUX.1-schnell (model_cpu_offload)...")
+    # ==================== GIAI ĐOẠN 1: FLUX ====================
+    print("\n🧠 [GIAI ĐOẠN 1] Load FLUX.1-schnell...")
     try:
         flux_pipe = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        # model_cpu_offload nhanh hơn sequential rất nhiều
         flux_pipe.enable_model_cpu_offload()
         if hasattr(flux_pipe, "vae"):
             flux_pipe.vae.enable_slicing()
@@ -262,13 +306,12 @@ async def process_video_pipeline():
         send_n8n_final_webhook("failed", 0, error_message=str(e))
         sys.exit(1)
 
-    print("🔧 Khởi tạo Real-ESRGAN Upscaler...")
-    try:
-        upsampler = create_upsampler()
+    print("🔧 Khởi tạo Upscaler...")
+    upsampler = create_upsampler()
+    if upsampler:
         print("✅ Real-ESRGAN sẵn sàng!")
-    except Exception as e:
-        print(f"⚠️ Không load được Real-ESRGAN: {e}. Sẽ bỏ qua upscale.")
-        upsampler = None
+    else:
+        print("✅ Dùng PIL upscale dự phòng.")
 
     for index, row in df.iterrows():
         scene_idx_val = row.get("scene_index")
@@ -309,15 +352,11 @@ async def process_video_pipeline():
             image.save(raw_image_file)
             print(f"   ✅ Ảnh thô: {raw_image_file}")
 
-            # Upscale ×2
-            if upsampler is not None:
-                print(f"   🔍 Upscaling ×2 bằng Real-ESRGAN...")
-                upscale_image(upsampler, raw_image_file, image_file)
-                if os.path.exists(raw_image_file):
-                    os.remove(raw_image_file)
-                print(f"   ✅ Ảnh nét: {image_file}")
-            else:
-                os.rename(raw_image_file, image_file)
+            print(f"   🔍 Upscaling ×2...")
+            upscale_image(upsampler, raw_image_file, image_file)
+            if os.path.exists(raw_image_file):
+                os.remove(raw_image_file)
+            print(f"   ✅ Ảnh nét: {image_file}")
 
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
             clear_memory()
@@ -386,7 +425,6 @@ async def process_video_pipeline():
         print(f"\n🎬 [{scene_index}/{total_scenes}] LTX Image → Video...")
         try:
             clear_memory()
-            # Resize về kích thước LTX ổn định
             image_input = load_image(image_file).resize((768, 448))
             motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth cinematic movement, gentle wind"
 
@@ -409,7 +447,6 @@ async def process_video_pipeline():
             print(f"❌ Lỗi video cảnh {scene_index}: {e}")
             continue
 
-        # Voice + FFmpeg
         if dialogue_text:
             print(f"🎙️ Voice [{char_name}]: {dialogue_text[:40]}...")
             communicate = edge_tts.Communicate(text=dialogue_text, voice=voice_to_use)
@@ -488,7 +525,7 @@ async def process_video_pipeline():
         final_file=final_output,
         drive_file_id=drive_file_id
     )
-    print("\n🎉 HOÀN TẤT PIPELINE TỐI ƯU!")
+    print("\n🎉 HOÀN TẤT PIPELINE!")
 
 if __name__ == "__main__":
     try:
