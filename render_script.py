@@ -87,20 +87,20 @@ except ImportError:
     print("⚠️ Không tìm thấy LTXImageToVideoPipeline")
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 FLUX + UPSCALE + LTX (TỐI ƯU TỐC ĐỘ T4) - [{RUN_DATE}]")
+print(f"🚀 FLUX + UPSCALE + LTX (CHỐNG TRÀN VRAM T4) - [{RUN_DATE}]")
 
-# Quan trọng cho T4 15GB
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+# Cực kỳ quan trọng cho T4
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
 
-# ==================== CẤU HÌNH TỐI ƯU TỐC ĐỘ ====================
-FLUX_WIDTH = 640
-FLUX_HEIGHT = 360
-LTX_WIDTH = 640
-LTX_HEIGHT = 360
-LTX_NUM_FRAMES = 9          # giảm từ 17 → 9
-LTX_STEPS = 10              # giảm từ 20 → 10
+# ==================== CẤU HÌNH AN TOÀN VRAM ====================
+FLUX_WIDTH = 512
+FLUX_HEIGHT = 288
+LTX_WIDTH = 512
+LTX_HEIGHT = 288
+LTX_NUM_FRAMES = 9
+LTX_STEPS = 10
 FLUX_STEPS = 4
-USE_REALESRGAN = False      # False = ưu tiên tốc độ (PIL), True = chất lượng cao hơn
+USE_REALESRGAN = False      # Tắt để giảm peak memory
 
 def sync_system_time():
     try:
@@ -170,8 +170,9 @@ def clear_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
-def truncate_prompt(prompt, max_words=65):
+def truncate_prompt(prompt, max_words=60):
     words = prompt.split()
     if len(words) > max_words:
         return " ".join(words[:max_words])
@@ -189,8 +190,8 @@ def create_upsampler():
             scale=2,
             model_path="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
             model=model,
-            tile=400,
-            tile_pad=10,
+            tile=300,
+            tile_pad=8,
             pre_pad=0,
             half=True
         )
@@ -206,7 +207,6 @@ def upscale_image_realesrgan(upsampler, input_path, output_path):
     return output_path
 
 def upscale_image_pil(input_path, output_path, scale=2):
-    """Upscale nhanh bằng PIL (ưu tiên tốc độ)"""
     img = Image.open(input_path).convert("RGB")
     new_size = (img.width * scale, img.height * scale)
     img = img.resize(new_size, Image.Resampling.LANCZOS)
@@ -298,24 +298,25 @@ async def process_video_pipeline():
     image_paths = {}
 
     # ==================== GIAI ĐOẠN 1: FLUX ====================
-    print("\n🧠 [GIAI ĐOẠN 1] Load FLUX.1-schnell (tối ưu tốc độ)...")
+    print("\n🧠 [GIAI ĐOẠN 1] Load FLUX.1-schnell (CHỐNG TRÀN VRAM)...")
     try:
         flux_pipe = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        # model_cpu_offload nhanh hơn sequential rất nhiều trên T4
-        flux_pipe.enable_model_cpu_offload()
+        
+        # sequential_cpu_offload = tiết kiệm VRAM nhất trên T4
+        flux_pipe.enable_sequential_cpu_offload()
         
         if hasattr(flux_pipe, "enable_attention_slicing"):
-            flux_pipe.enable_attention_slicing("auto")
+            flux_pipe.enable_attention_slicing("max")
         
         if hasattr(flux_pipe, "vae"):
             flux_pipe.vae.enable_slicing()
             flux_pipe.vae.enable_tiling()
             
-        print(f"✅ Load FLUX thành công! ({FLUX_WIDTH}×{FLUX_HEIGHT}, model_cpu_offload)")
+        print(f"✅ Load FLUX thành công! ({FLUX_WIDTH}×{FLUX_HEIGHT}, sequential_cpu_offload)")
     except Exception as e:
         print(f"❌ Lỗi load FLUX: {e}")
         send_n8n_final_webhook("failed", 0, error_message=str(e))
@@ -324,9 +325,9 @@ async def process_video_pipeline():
     print("🔧 Khởi tạo Upscaler...")
     upsampler = create_upsampler()
     if upsampler:
-        print("✅ Real-ESRGAN sẵn sàng (chất lượng cao).")
+        print("✅ Real-ESRGAN sẵn sàng.")
     else:
-        print("✅ Dùng PIL upscale (ưu tiên tốc độ).")
+        print("✅ Dùng PIL upscale (an toàn VRAM).")
 
     for index, row in df.iterrows():
         scene_start = time.time()
@@ -353,7 +354,7 @@ async def process_video_pipeline():
         try:
             clear_memory()
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_index)
-            safe_prompt = truncate_prompt(img_prompt, max_words=65)
+            safe_prompt = truncate_prompt(img_prompt, max_words=60)
 
             image = flux_pipe(
                 prompt=safe_prompt,
@@ -376,6 +377,8 @@ async def process_video_pipeline():
 
             print(f"   ✅ Ảnh nét: {image_file}")
             upload_file_to_drive_fresh(image_file, DRIVE_FOLDER_ID)
+            
+            del image
             clear_memory()
 
         except Exception as e:
@@ -389,7 +392,7 @@ async def process_video_pipeline():
     if upsampler is not None:
         del upsampler
     clear_memory()
-    time.sleep(2)
+    time.sleep(3)
 
     # ==================== GIAI ĐOẠN 2: LTX I2V ====================
     if not HAS_LTX_I2V:
@@ -397,7 +400,7 @@ async def process_video_pipeline():
         send_n8n_final_webhook("failed", 0, error_message="Missing LTXImageToVideoPipeline")
         sys.exit(1)
 
-    print("\n🧠 [GIAI ĐOẠN 2] Load LTX Image-to-Video (tối ưu tốc độ)...")
+    print("\n🧠 [GIAI ĐOẠN 2] Load LTX Image-to-Video (an toàn VRAM)...")
     try:
         ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
             "Lightricks/LTX-Video",
@@ -405,7 +408,7 @@ async def process_video_pipeline():
             token=hf_token_to_pass,
         )
         ltx_pipe.enable_model_cpu_offload()
-        print(f"✅ Load LTX I2V thành công! ({LTX_WIDTH}×{LTX_HEIGHT}, {LTX_NUM_FRAMES} frames, {LTX_STEPS} steps)")
+        print(f"✅ Load LTX I2V thành công! ({LTX_WIDTH}×{LTX_HEIGHT}, {LTX_NUM_FRAMES}f, {LTX_STEPS} steps)")
     except Exception as e:
         print(f"❌ Lỗi load LTX: {e}")
         send_n8n_final_webhook("failed", 0, error_message=str(e))
