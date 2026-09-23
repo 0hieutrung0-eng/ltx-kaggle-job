@@ -35,7 +35,6 @@ def install_requirements():
         sys.executable, "-m", "pip", "install", "-q",
         "--no-warn-script-location", "--disable-pip-version-check"
     ] + packages)
-    # Thử cài Real-ESRGAN (có thể lỗi trên torchvision mới)
     try:
         subprocess.check_call([
             sys.executable, "-m", "pip", "install", "-q",
@@ -88,10 +87,20 @@ except ImportError:
     print("⚠️ Không tìm thấy LTXImageToVideoPipeline")
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 FLUX + UPSCALE + LTX (TỐI ƯU T4) - [{RUN_DATE}]")
+print(f"🚀 FLUX + UPSCALE + LTX (TỐI ƯU TỐC ĐỘ T4) - [{RUN_DATE}]")
 
 # Quan trọng cho T4 15GB
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+
+# ==================== CẤU HÌNH TỐI ƯU TỐC ĐỘ ====================
+FLUX_WIDTH = 640
+FLUX_HEIGHT = 360
+LTX_WIDTH = 640
+LTX_HEIGHT = 360
+LTX_NUM_FRAMES = 9          # giảm từ 17 → 9
+LTX_STEPS = 10              # giảm từ 20 → 10
+FLUX_STEPS = 4
+USE_REALESRGAN = False      # False = ưu tiên tốc độ (PIL), True = chất lượng cao hơn
 
 def sync_system_time():
     try:
@@ -172,11 +181,10 @@ def truncate_prompt(prompt, max_words=65):
 # UPSCALER
 # -------------------------------------------------------------------
 def create_upsampler():
-    if not HAS_REALESRGAN:
+    if not HAS_REALESRGAN or not USE_REALESRGAN:
         return None
     try:
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
-        # URL ĐÚNG (v0.2.1) - fix lỗi 404
         upsampler = RealESRGANer(
             scale=2,
             model_path="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
@@ -198,14 +206,14 @@ def upscale_image_realesrgan(upsampler, input_path, output_path):
     return output_path
 
 def upscale_image_pil(input_path, output_path, scale=2):
-    """Fallback upscale chất lượng cao bằng PIL"""
+    """Upscale nhanh bằng PIL (ưu tiên tốc độ)"""
     img = Image.open(input_path).convert("RGB")
     new_size = (img.width * scale, img.height * scale)
     img = img.resize(new_size, Image.Resampling.LANCZOS)
-    img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2))
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=110, threshold=2))
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(1.05)
-    img.save(output_path, quality=95)
+    img.save(output_path, quality=92)
     return output_path
 
 def upscale_image(upsampler, input_path, output_path):
@@ -263,7 +271,7 @@ def upload_file_to_drive_fresh(file_path, folder_id, retries=3):
         except Exception as e:
             print(f"⚠️ Upload lần {attempt} thất bại: {e}")
             if attempt < retries:
-                time.sleep(3)
+                time.sleep(2)
             else:
                 return None
 
@@ -290,25 +298,24 @@ async def process_video_pipeline():
     image_paths = {}
 
     # ==================== GIAI ĐOẠN 1: FLUX ====================
-    print("\n🧠 [GIAI ĐOẠN 1] Load FLUX.1-schnell...")
+    print("\n🧠 [GIAI ĐOẠN 1] Load FLUX.1-schnell (tối ưu tốc độ)...")
     try:
         flux_pipe = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        # Sequential offload = tiết kiệm VRAM nhất trên T4 15GB (chậm hơn một chút)
-        flux_pipe.enable_sequential_cpu_offload()
+        # model_cpu_offload nhanh hơn sequential rất nhiều trên T4
+        flux_pipe.enable_model_cpu_offload()
         
-        # Thêm attention slicing để giảm peak memory
         if hasattr(flux_pipe, "enable_attention_slicing"):
-            flux_pipe.enable_attention_slicing()
+            flux_pipe.enable_attention_slicing("auto")
         
         if hasattr(flux_pipe, "vae"):
             flux_pipe.vae.enable_slicing()
             flux_pipe.vae.enable_tiling()
             
-        print("✅ Load FLUX thành công! (sequential_cpu_offload + attention_slicing)")
+        print(f"✅ Load FLUX thành công! ({FLUX_WIDTH}×{FLUX_HEIGHT}, model_cpu_offload)")
     except Exception as e:
         print(f"❌ Lỗi load FLUX: {e}")
         send_n8n_final_webhook("failed", 0, error_message=str(e))
@@ -317,11 +324,12 @@ async def process_video_pipeline():
     print("🔧 Khởi tạo Upscaler...")
     upsampler = create_upsampler()
     if upsampler:
-        print("✅ Real-ESRGAN sẵn sàng!")
+        print("✅ Real-ESRGAN sẵn sàng (chất lượng cao).")
     else:
-        print("✅ Dùng PIL upscale dự phòng.")
+        print("✅ Dùng PIL upscale (ưu tiên tốc độ).")
 
     for index, row in df.iterrows():
+        scene_start = time.time()
         scene_idx_val = row.get("scene_index")
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
 
@@ -349,9 +357,9 @@ async def process_video_pipeline():
 
             image = flux_pipe(
                 prompt=safe_prompt,
-                width=768,
-                height=448,
-                num_inference_steps=4,
+                width=FLUX_WIDTH,
+                height=FLUX_HEIGHT,
+                num_inference_steps=FLUX_STEPS,
                 guidance_scale=0.0,
                 generator=generator,
                 max_sequence_length=256,
@@ -372,14 +380,16 @@ async def process_video_pipeline():
 
         except Exception as e:
             print(f"❌ Lỗi ảnh cảnh {scene_index}: {e}")
-            clear_memory()   # vẫn clear dù lỗi
+            clear_memory()
+
+        print(f"⏱️ Cảnh {scene_index} (ảnh) xong trong {time.time() - scene_start:.1f}s")
 
     print("\n🧹 Xóa FLUX khỏi bộ nhớ...")
     del flux_pipe
     if upsampler is not None:
         del upsampler
     clear_memory()
-    time.sleep(3)   # đợi GPU giải phóng hoàn toàn
+    time.sleep(2)
 
     # ==================== GIAI ĐOẠN 2: LTX I2V ====================
     if not HAS_LTX_I2V:
@@ -387,21 +397,22 @@ async def process_video_pipeline():
         send_n8n_final_webhook("failed", 0, error_message="Missing LTXImageToVideoPipeline")
         sys.exit(1)
 
-    print("\n🧠 [GIAI ĐOẠN 2] Load LTX Image-to-Video...")
+    print("\n🧠 [GIAI ĐOẠN 2] Load LTX Image-to-Video (tối ưu tốc độ)...")
     try:
         ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
             "Lightricks/LTX-Video",
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-        ltx_pipe.enable_model_cpu_offload()   # LTX nhẹ hơn, model_offload đủ
-        print("✅ Load LTX I2V thành công!")
+        ltx_pipe.enable_model_cpu_offload()
+        print(f"✅ Load LTX I2V thành công! ({LTX_WIDTH}×{LTX_HEIGHT}, {LTX_NUM_FRAMES} frames, {LTX_STEPS} steps)")
     except Exception as e:
         print(f"❌ Lỗi load LTX: {e}")
         send_n8n_final_webhook("failed", 0, error_message=str(e))
         sys.exit(1)
 
     for index, row in df.iterrows():
+        scene_start = time.time()
         scene_idx_val = row.get("scene_index")
         scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
 
@@ -436,7 +447,7 @@ async def process_video_pipeline():
         print(f"\n🎬 [{scene_index}/{total_scenes}] LTX Image → Video...")
         try:
             clear_memory()
-            image_input = load_image(image_file).resize((768, 448))
+            image_input = load_image(image_file).resize((LTX_WIDTH, LTX_HEIGHT))
 
             motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth cinematic movement, gentle wind"
 
@@ -444,14 +455,14 @@ async def process_video_pipeline():
                 image=image_input,
                 prompt=motion_prompt,
                 negative_prompt=neg_prompt if neg_prompt else None,
-                width=768,
-                height=448,
-                num_frames=17,
-                num_inference_steps=20,
+                width=LTX_WIDTH,
+                height=LTX_HEIGHT,
+                num_frames=LTX_NUM_FRAMES,
+                num_inference_steps=LTX_STEPS,
                 generator=torch.Generator("cpu").manual_seed(42 + scene_index),
             ).frames[0]
 
-            export_to_video(video_frames, raw_video_file, fps=16)
+            export_to_video(video_frames, raw_video_file, fps=12)
             print(f"   ✅ Video thô: {raw_video_file}")
 
             del video_frames
@@ -475,20 +486,20 @@ async def process_video_pipeline():
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
                     f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
-                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 16 '
+                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 12 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
                 )
             else:
                 mix_cmd = (
                     f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
-                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 16 '
+                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 12 '
                     f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
                 )
             subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             silent_cmd = (
                 f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
-                f'-c:v libx264 -pix_fmt yuv420p -r 16 -c:a aac -ar 44100 -ac 2 -b:a 192k '
+                f'-c:v libx264 -pix_fmt yuv420p -r 12 -c:a aac -ar 44100 -ac 2 -b:a 192k '
                 f'-shortest "{final_scene_file}"'
             )
             subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -499,6 +510,8 @@ async def process_video_pipeline():
 
         upload_file_to_drive_fresh(final_scene_file, DRIVE_FOLDER_ID)
         rendered_files.append(final_scene_file)
+
+        print(f"⏱️ Cảnh {scene_index} hoàn thành trong {time.time() - scene_start:.1f} giây")
 
     del ltx_pipe
     clear_memory()
