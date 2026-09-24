@@ -240,7 +240,7 @@ async def process_video_pipeline():
             flux_pipe.vae.enable_slicing()
             flux_pipe.vae.enable_tiling()
             
-        print("✅ Load FLUX thành công! (640×360 + sequential)")
+        print("✅ Load FLUX thành công! (640×352 + sequential)")
     except Exception as e:
         print(f"❌ Lỗi load FLUX: {e}")
         send_n8n_final_webhook("failed", 0, error_message=str(e))
@@ -275,7 +275,7 @@ async def process_video_pipeline():
             image = flux_pipe(
                 prompt=img_prompt,
                 width=640,
-                height=360,
+                height=352,
                 num_inference_steps=4,
                 guidance_scale=0.0,
                 generator=generator,
@@ -360,7 +360,7 @@ async def process_video_pipeline():
         try:
             clear_memory()
             # Resize ảnh đã upscale về size LTX
-            image_input = load_image(image_file).resize((640, 360))
+            image_input = load_image(image_file).resize((640, 352))
 
             motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth cinematic movement, gentle wind"
 
@@ -369,7 +369,7 @@ async def process_video_pipeline():
                 prompt=motion_prompt,
                 negative_prompt=neg_prompt if neg_prompt else None,
                 width=640,
-                height=360,
+                height=352,
                 num_frames=20,
                 num_inference_steps=15,
                 generator=torch.Generator("cpu").manual_seed(42 + scene_index),
