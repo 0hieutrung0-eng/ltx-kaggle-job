@@ -1,7 +1,7 @@
 {
   "id": "0hieutrung0-eng/ltx-video-render",
-  "title": "Wan 2.1 Video Render",
-  "code_file": "kaggle_script/render_script.py",
+  "title": "LTX Render",
+  "code_file": "render_script.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
