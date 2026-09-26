@@ -1,6 +1,6 @@
 # ============================================================
 # PIPELINE HOÀN CHỈNH:
-# Sheet + Drive ảnh → LTX I2V → Lồng tiếng VI → BGM → 1 video
+# Sheet + Drive ảnh → LTX I2V → Lồng tiếng VI → AI BGM & SFX → 1 video
 # Upload Drive + Webhook n8n
 # ============================================================
 
@@ -8,6 +8,7 @@ import asyncio
 import gc
 import io
 import os
+import re
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ def install_requirements():
         "google-auth-httplib2",
         "huggingface_hub",
         "soundfile",
+        "scipy",
         "av",
         "edge-tts",
         "protobuf<6.0.0,>=3.20.2",
@@ -55,19 +57,22 @@ nest_asyncio.apply()
 import torch
 import pandas as pd
 import requests
+import scipy.io.wavfile as wavfile
 import edge_tts
 from PIL import Image
-from diffusers import LTXImageToVideoPipeline
+from diffusers import LTXImageToVideoPipeline, AudioLDMPipeline
 from diffusers.utils import export_to_video, load_image
+from transformers import AutoProcessor, MusicgenForConditionalGeneration
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from huggingface_hub import login
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 LTX + TTS + BGM PIPELINE - [{RUN_DATE}]")
+print(f"🚀 LTX + TTS + AI BGM/SFX PIPELINE - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # -------------------------------------------------------------------
 # 2. CONFIG (đổi theo của bạn)
@@ -101,7 +106,7 @@ VOICE_MAP = {
     "nu": "vi-VN-HoaiMyNeural",
 }
 
-BGM_FILE = "bgm_xianxia.mp3"  # đặt file nhạc nền cùng thư mục (hoặc tải từ Drive)
+BGM_FILE = f"bgm_generated_{RUN_DATE}.mp3"
 
 # -------------------------------------------------------------------
 # 3. HELPERS
@@ -217,6 +222,58 @@ def pick_voice(char_name: str) -> str:
     return VOICE_MAP["nam"]
 
 # -------------------------------------------------------------------
+# 3.1 AI MUSIC & AUDIO GENERATION HELPERS
+# -------------------------------------------------------------------
+def generate_ai_bgm(prompt_text: str, duration_sec: int, output_path: str):
+    """Tự động tạo nhạc nền BGM dựa vào phong cách câu chuyện"""
+    print(f"🎵 [AI BGM] Đang tạo BGM theo mô tả: '{prompt_text}' ({duration_sec}s)...")
+    try:
+        clear_memory()
+        processor_bgm = AutoProcessor.from_pretrained("facebook/musicgen-small")
+        model_bgm = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").to(DEVICE)
+        
+        inputs = processor_bgm(text=[prompt_text], padding=True, return_tensors="pt").to(DEVICE)
+        max_tokens = min(int(duration_sec * 50), 1500) # Giới hạn tối đa ~30s sample (có thể loop bằng FFmpeg)
+        
+        audio_outputs = model_bgm.generate(**inputs, max_new_tokens=max_tokens)
+        sampling_rate = model_bgm.config.audio_encoder.sampling_rate
+        
+        wav_path = output_path.replace(".mp3", ".wav")
+        wavfile.write(wav_path, rate=sampling_rate, data=audio_outputs[0, 0].cpu().numpy())
+        
+        # Convert WAV -> MP3
+        subprocess.run(["ffmpeg", "-y", "-i", wav_path, "-acodec", "libmp3lame", output_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+            
+        del processor_bgm, model_bgm
+        clear_memory()
+        print(f"✅ [AI BGM] Đã sinh nhạc nền: {output_path}")
+        return True
+    except Exception as e:
+        print(f"⚠️ [AI BGM] Không tạo được BGM: {e}")
+        return False
+
+def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
+    """Tự động tạo hiệu ứng âm thanh SFX cho từng cảnh"""
+    print(f"🔊 [AI SFX] Đang sinh âm thanh: '{prompt_text}'...")
+    try:
+        clear_memory()
+        pipe_sfx = AudioLDMPipeline.from_pretrained("cvssp/audioldm-m-full", torch_dtype=torch.float16 if DEVICE=="cuda" else torch.float32)
+        pipe_sfx = pipe_sfx.to(DEVICE)
+        
+        audio = pipe_sfx(prompt_text, num_inference_steps=20, audio_length_in_s=max(1.0, duration_sec)).audios[0]
+        wavfile.write(output_path, rate=16000, data=audio)
+        
+        del pipe_sfx
+        clear_memory()
+        print(f"✅ [AI SFX] Đã tạo SFX: {output_path}")
+        return True
+    except Exception as e:
+        print(f"⚠️ [AI SFX] Lỗi tạo SFX: {e}")
+        return False
+
+# -------------------------------------------------------------------
 # 4. ĐỌC GOOGLE SHEET
 # -------------------------------------------------------------------
 print("\n📊 Đọc Google Sheet...")
@@ -233,7 +290,7 @@ except Exception as e:
 project_info = {}
 if not df.empty:
     first = df.iloc[0]
-    for key in ["title", "genre", "visual_style", "world_setting"]:
+    for key in ["title", "genre", "visual_style", "world_setting", "bgm_prompt"]:
         if key in df.columns:
             val = str(first[key]).strip()
             if val.lower() not in ["nan", "", "[empty]"]:
@@ -275,6 +332,11 @@ async def process_video_pipeline():
         else:
             print(f"⚠️ Cảnh {scene_index}: không tìm thấy ảnh trên Drive")
 
+    # ========== GIAI ĐOẠN 1.5: TỰ ĐỘNG TẠO BGM CHO TOÀN BỘ PHIM/CHƯƠNG ==========
+    bgm_desc = project_info.get("bgm_prompt", f"{project_info.get('genre', 'dramatic')} cinematic background music")
+    estimated_total_duration = total_scenes * 6  # Ước tính 6s mỗi cảnh
+    generate_ai_bgm(bgm_desc, duration_sec=estimated_total_duration, output_path=BGM_FILE)
+
     # ========== GIAI ĐOẠN 2: LTX IMAGE → VIDEO ==========
     print("\n🎬 [2] Load LTX Image-to-Video...")
     try:
@@ -311,12 +373,18 @@ async def process_video_pipeline():
         neg_prompt = str(row.get("negative_prompt", "")).strip()
         dialogue_text = str(row.get("dialogue", "")).strip()
         char_name = str(row.get("character_name", "")).strip()
+        
+        # Cột từ khóa âm thanh SFX (vd: "thunderstorm, sword clash")
+        sfx_prompt = str(row.get("sound_effect", row.get("sfx_prompt", ""))).strip()
 
         if dialogue_text.lower() in ["nan", "[empty]", "none", "null"]:
             dialogue_text = ""
+        if sfx_prompt.lower() in ["nan", "[empty]", "none", "null"]:
+            sfx_prompt = ""
 
         raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
-        audio_scene_file = f"audio_scene_{scene_index:03d}_{RUN_DATE}.mp3"
+        audio_tts_file = f"tts_scene_{scene_index:03d}_{RUN_DATE}.mp3"
+        audio_sfx_file = f"sfx_scene_{scene_index:03d}_{RUN_DATE}.wav"
 
         print(f"\n🎬 [{scene_index}/{total_scenes}] LTX...")
         try:
@@ -344,40 +412,61 @@ async def process_video_pipeline():
             clear_memory()
             continue
 
-        # ----- Lồng tiếng Việt -----
+        # ----- 1. Lồng tiếng Việt (TTS) -----
+        a_dur = 2.0
+        has_tts = False
         if dialogue_text:
             voice = pick_voice(char_name)
             print(f"🎙️ TTS [{char_name}] ({voice}): {dialogue_text[:50]}...")
             communicate = edge_tts.Communicate(text=dialogue_text, voice=voice)
-            await communicate.save(audio_scene_file)
+            await communicate.save(audio_tts_file)
+            a_dur = get_media_duration(audio_tts_file)
+            has_tts = True
 
-            v_dur = get_media_duration(raw_video_file)
-            a_dur = get_media_duration(audio_scene_file)
-            pad_dur = max(0.0, a_dur - v_dur)
+        # ----- 2. Sinh Hiệu Ứng Âm Thanh (SFX) -----
+        has_sfx = False
+        if sfx_prompt:
+            has_sfx = generate_ai_sfx(sfx_prompt, duration_sec=a_dur, output_path=audio_sfx_file)
 
-            if pad_dur > 0:
-                mix_cmd = (
-                    f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
-                    f'-filter_complex "[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]" '
-                    f'-map "[v]" -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 12 '
-                    f'-c:a aac -ar 44100 -ac 2 -b:a 192k "{final_scene_file}"'
-                )
-            else:
-                mix_cmd = (
-                    f'ffmpeg -y -i "{raw_video_file}" -i "{audio_scene_file}" '
-                    f'-map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 12 '
-                    f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
-                )
-            subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # ----- 3. Ghép & Căn chỉnh Thời lượng Video với TTS + SFX -----
+        v_dur = get_media_duration(raw_video_file)
+        pad_dur = max(0.0, a_dur - v_dur) if has_tts else 0.0
+
+        # Xử lý Filter ffmpeg trộn Voice + SFX
+        inputs_str = f'-i "{raw_video_file}" '
+        filter_complex = []
+        
+        if pad_dur > 0:
+            filter_complex.append(f"[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]")
+            map_v = "[v]"
         else:
-            silent_cmd = (
-                f'ffmpeg -y -i "{raw_video_file}" -f lavfi -i anullsrc=r=44100:cl=stereo '
-                f'-c:v libx264 -pix_fmt yuv420p -r 12 -c:a aac -ar 44100 -ac 2 -b:a 192k '
-                f'-shortest "{final_scene_file}"'
-            )
-            subprocess.run(silent_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            map_v = "0:v:0"
 
-        for f in [raw_video_file, audio_scene_file]:
+        if has_tts and has_sfx:
+            inputs_str += f'-i "{audio_tts_file}" -i "{audio_sfx_file}" '
+            filter_complex.append("[1:a]volume=1.0[tts];[2:a]volume=0.5[sfx];[tts][sfx]amix=inputs=2:duration=first[a]")
+            map_a = "[a]"
+        elif has_tts:
+            inputs_str += f'-i "{audio_tts_file}" '
+            map_a = "1:a:0"
+        elif has_sfx:
+            inputs_str += f'-i "{audio_sfx_file}" '
+            map_a = "1:a:0"
+        else:
+            inputs_str += '-f lavfi -i anullsrc=r=44100:cl=stereo '
+            map_a = "1:a:0"
+
+        filter_str = f'-filter_complex "{";".join(filter_complex)}"' if filter_complex else ""
+        
+        mix_cmd = (
+            f'ffmpeg -y {inputs_str} {filter_str} '
+            f'-map {map_v} -map {map_a} -c:v libx264 -pix_fmt yuv420p -r 12 '
+            f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
+        )
+        subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Dọn dẹp file tạm cảnh
+        for f in [raw_video_file, audio_tts_file, audio_sfx_file]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
@@ -394,7 +483,7 @@ async def process_video_pipeline():
     del ltx_pipe
     clear_memory()
 
-    # ========== GIAI ĐOẠN 3: GỘP + BGM ==========
+    # ========== GIAI ĐOẠN 3: GỘP + TRỘN BGM ==========
     print("\n🎞️ [3] Gộp tất cả cảnh thành 1 video...")
     if not rendered_files:
         send_n8n_webhook("failed", error_message="Không render được cảnh nào", extra=project_info)
@@ -414,17 +503,17 @@ async def process_video_pipeline():
     )
 
     if os.path.exists(BGM_FILE):
-        print("🎵 Ghép nhạc nền...")
+        print("🎵 Ghép nhạc nền AI vào toàn bộ phim...")
         bgm_cmd = (
             f'ffmpeg -y -i "{concat_output}" -stream_loop -1 -i "{BGM_FILE}" '
-            f'-filter_complex "[0:a]volume=1.15[a_tts];[1:a]volume=0.12[a_bgm];'
+            f'-filter_complex "[0:a]volume=1.0[a_tts];[1:a]volume=0.15[a_bgm];'
             f'[a_tts][a_bgm]amix=inputs=2:duration=first[a]" '
             f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k "{final_output}"'
         )
         try:
             subprocess.run(bgm_cmd, shell=True, check=True)
         except Exception as e:
-            print(f"⚠️ BGM lỗi, dùng bản không BGM: {e}")
+            print(f"⚠️ Ghép BGM lỗi, dùng bản không BGM: {e}")
             final_output = concat_output
     else:
         print("⚠️ Không có file BGM → bỏ qua nhạc nền")
