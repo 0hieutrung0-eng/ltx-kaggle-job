@@ -1,6 +1,9 @@
 # ============================================================
-# PIPELINE KAGGLE - KHỚP GOOGLE SHEET MỚI
-# Đọc Scenes (có dialogue + scene_description) → LTX → TTS → BGM → Gộp video
+# PIPELINE KAGGLE - TẠO ẢNH NHÂN VẬT → ẢNH CẢNH → VIDEO
+# Đọc Characters + Scenes từ Google Sheet
+# 1. Tạo ảnh nhân vật (reference)
+# 2. Tạo ảnh cảnh (dùng ảnh nhân vật làm reference)
+# 3. LTX → TTS → SFX → BGM → Gộp video
 # ============================================================
 import asyncio
 import gc
@@ -43,11 +46,9 @@ def install_requirements():
             __import__(import_name)
         except ImportError:
             missing.append(pip_name)
-
     if not missing:
         print("✅ Tất cả package đã có sẵn → bỏ qua cài đặt")
         return
-
     print(f"📦 Đang cài {len(missing)} package còn thiếu...")
     packages = missing + ["protobuf<6.0.0,>=3.20.2", "imageio-ffmpeg"]
     subprocess.check_call([
@@ -67,7 +68,12 @@ import requests
 import scipy.io.wavfile as wavfile
 import edge_tts
 from PIL import Image
-from diffusers import LTXImageToVideoPipeline, AudioLDMPipeline
+from diffusers import (
+    LTXImageToVideoPipeline,
+    AudioLDMPipeline,
+    AutoPipelineForText2Image,
+    AutoPipelineForImage2Image,
+)
 from diffusers.utils import export_to_video, load_image
 from transformers import AutoProcessor, MusicgenForConditionalGeneration
 from google.oauth2.credentials import Credentials
@@ -76,7 +82,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from huggingface_hub import login
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 LTX + TTS + BGM PIPELINE - [{RUN_DATE}]")
+print(f"🚀 LTX + TTS + BGM PIPELINE (có tạo ảnh nhân vật + cảnh) - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -86,8 +92,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
-GOOGLE_SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
+
+# Tên sheet trong Google Spreadsheet
+CHARACTERS_SHEET = "Characters"
+SCENES_SHEET = "Scenes"
 
 TOKEN_PART1 = os.environ.get("HF_TOKEN_PART1", "")
 TOKEN_PART2 = os.environ.get("HF_TOKEN_PART2", "")
@@ -112,6 +121,9 @@ VOICE_MAP = {
 }
 BGM_FILE = f"bgm_generated_{RUN_DATE}.mp3"
 
+# Model tạo ảnh (nhẹ + nhanh trên Kaggle)
+IMAGE_MODEL_ID = "black-forest-labs/FLUX.1-schnell"   # hoặc "stabilityai/sdxl-turbo"
+
 # -------------------------------------------------------------------
 # 3. HELPERS
 # -------------------------------------------------------------------
@@ -122,7 +134,10 @@ def get_oauth_credentials():
         token_uri=TOKEN_URI,
         client_id=OAUTH_CLIENT_ID,
         client_secret=OAUTH_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/drive"],
+        scopes=[
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+        ],
     )
 
 def clear_memory():
@@ -173,7 +188,7 @@ def upload_file_to_drive(file_path, folder_id, retries=3):
     if not os.path.exists(file_path) or not folder_id:
         return None
     file_name = os.path.basename(file_path)
-    mimetype = "image/png" if file_name.endswith(".png") else "video/mp4"
+    mimetype = "image/png" if file_name.endswith((".png", ".jpg", ".jpeg", ".webp")) else "video/mp4"
     if file_name.endswith(".mp3"):
         mimetype = "audio/mpeg"
     for attempt in range(1, retries + 1):
@@ -207,11 +222,11 @@ def send_n8n_webhook(status, total_scenes=0, final_file=None, drive_file_id=None
     except Exception as e:
         print(f"❌ Webhook lỗi: {e}")
 
-def find_scene_image(drive_files, scene_index):
-    keys = [f"scene_{scene_index:03d}", f"image_{scene_index:03d}", f"scene_{scene_index}"]
+def find_file_in_drive(drive_files, keywords, extensions=(".png", ".jpg", ".jpeg", ".webp")):
+    keywords = [k.lower() for k in keywords]
     for f in drive_files:
         name = f["name"].lower()
-        if any(k in name for k in keys) and name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        if any(k in name for k in keywords) and name.endswith(extensions):
             return f
     return None
 
@@ -222,12 +237,36 @@ def pick_voice(char_name: str) -> str:
     return VOICE_MAP["nam"]
 
 def safe_get(row, *keys, default=""):
-    """Lấy giá trị từ row, hỗ trợ nhiều tên cột"""
     for key in keys:
         val = row.get(key)
         if pd.notna(val) and str(val).strip().lower() not in ["nan", "none", "null", "", "[empty]"]:
             return str(val).strip()
     return default
+
+def get_sheet_as_df(sheet_name: str) -> pd.DataFrame:
+    """Đọc một sheet cụ thể từ Google Spreadsheet"""
+    try:
+        creds = get_oauth_credentials()
+        service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"{sheet_name}!A:Z"
+        ).execute()
+        values = result.get("values", [])
+        if not values:
+            print(f"⚠️ Sheet '{sheet_name}' trống")
+            return pd.DataFrame()
+        header = [str(h).strip().lower() for h in values[0]]
+        data = values[1:]
+        # Đồng bộ số cột
+        max_cols = len(header)
+        data = [row + [""] * (max_cols - len(row)) for row in data]
+        df = pd.DataFrame(data, columns=header)
+        print(f"✅ Đọc sheet '{sheet_name}': {len(df)} dòng | Cột: {df.columns.tolist()}")
+        return df
+    except Exception as e:
+        print(f"❌ Lỗi đọc sheet '{sheet_name}': {e}")
+        return pd.DataFrame()
 
 # -------------------------------------------------------------------
 # 3.1 AI MUSIC & SFX
@@ -276,38 +315,123 @@ def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
         return False
 
 # -------------------------------------------------------------------
-# 4. ĐỌC GOOGLE SHEET (KHỚP CẤU TRÚC MỚI)
+# 3.2 TẠO ẢNH (NHÂN VẬT + CẢNH)
 # -------------------------------------------------------------------
-print("\n📊 Đọc Google Sheet...")
-try:
-    df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
-    df.columns = df.columns.str.strip().str.lower()
-    total_scenes = len(df)
-    print(f"✅ {total_scenes} cảnh")
-    print(f"   Cột có: {df.columns.tolist()}")
-except Exception as e:
-    print(f"❌ Lỗi Sheet: {e}")
-    send_n8n_webhook("failed", error_message=str(e))
-    sys.exit(1)
+def load_image_pipeline(task="text2img"):
+    """Load pipeline tạo ảnh, tự offload để tiết kiệm VRAM"""
+    clear_memory()
+    dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+    if task == "text2img":
+        pipe = AutoPipelineForText2Image.from_pretrained(
+            IMAGE_MODEL_ID,
+            torch_dtype=dtype,
+            token=hf_token_to_pass,
+        )
+    else:
+        pipe = AutoPipelineForImage2Image.from_pretrained(
+            IMAGE_MODEL_ID,
+            torch_dtype=dtype,
+            token=hf_token_to_pass,
+        )
+    if DEVICE == "cuda":
+        try:
+            pipe.enable_model_cpu_offload()
+        except Exception:
+            pipe = pipe.to(DEVICE)
+    print(f"✅ Loaded image pipeline ({task})")
+    return pipe
 
-project_info = {}
-if not df.empty:
-    first = df.iloc[0]
-    for key in ["title", "genre", "visual_style", "world_setting", "bgm_prompt", "project_title"]:
-        if key in df.columns:
-            val = str(first[key]).strip()
-            if val.lower() not in ["nan", "", "[empty]"]:
-                project_info[key] = val
+def generate_character_image(prompt: str, output_path: str, width=1280, height=720):
+    """Tạo ảnh nhân vật (4-view hoặc full body)"""
+    print(f"🎨 [Character] {os.path.basename(output_path)}")
+    try:
+        pipe = load_image_pipeline("text2img")
+        image = pipe(
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_inference_steps=4 if "schnell" in IMAGE_MODEL_ID else 20,
+            guidance_scale=0.0 if "schnell" in IMAGE_MODEL_ID else 7.5,
+            generator=torch.Generator("cpu").manual_seed(42),
+        ).images[0]
+        image.save(output_path)
+        del pipe
+        clear_memory()
+        print(f"   ✅ Đã tạo: {output_path}")
+        return True
+    except Exception as e:
+        print(f"   ❌ Lỗi tạo ảnh nhân vật: {e}")
+        clear_memory()
+        return False
+
+def generate_scene_image(prompt: str, output_path: str, ref_image_path: str = None, width=1280, height=720):
+    """Tạo ảnh cảnh. Nếu có ref_image_path (1 nhân vật) thì dùng img2img để giữ consistency"""
+    print(f"🖼️  [Scene] {os.path.basename(output_path)}")
+    try:
+        if ref_image_path and os.path.exists(ref_image_path):
+            # img2img với ảnh nhân vật làm reference
+            pipe = load_image_pipeline("img2img")
+            init_image = load_image(ref_image_path).resize((width, height))
+            image = pipe(
+                prompt=prompt,
+                image=init_image,
+                strength=0.65,          # giữ khuôn mặt + trang phục
+                num_inference_steps=4 if "schnell" in IMAGE_MODEL_ID else 20,
+                guidance_scale=0.0 if "schnell" in IMAGE_MODEL_ID else 7.5,
+                generator=torch.Generator("cpu").manual_seed(42),
+            ).images[0]
+        else:
+            # text2img thuần
+            pipe = load_image_pipeline("text2img")
+            image = pipe(
+                prompt=prompt,
+                width=width,
+                height=height,
+                num_inference_steps=4 if "schnell" in IMAGE_MODEL_ID else 20,
+                guidance_scale=0.0 if "schnell" in IMAGE_MODEL_ID else 7.5,
+                generator=torch.Generator("cpu").manual_seed(42),
+            ).images[0]
+        image.save(output_path)
+        del pipe
+        clear_memory()
+        print(f"   ✅ Đã tạo: {output_path}")
+        return True
+    except Exception as e:
+        print(f"   ❌ Lỗi tạo ảnh cảnh: {e}")
+        clear_memory()
+        return False
 
 # -------------------------------------------------------------------
-# 5. PIPELINE
+# 4. PIPELINE CHÍNH
 # -------------------------------------------------------------------
 async def process_video_pipeline():
     rendered_files = []
-    image_paths = {}
+    character_images = {}   # {character_name_lower: local_path}
+    scene_image_paths = {}
 
-    # ========== 1. TẢI ẢNH TỪ DRIVE ==========
-    print("\n📥 [1] Tải ảnh cảnh từ Drive...")
+    # ========== 0. ĐỌC GOOGLE SHEET ==========
+    print("\n📊 Đọc Google Sheet...")
+    df_chars = get_sheet_as_df(CHARACTERS_SHEET)
+    df_scenes = get_sheet_as_df(SCENES_SHEET)
+
+    if df_scenes.empty:
+        send_n8n_webhook("failed", error_message="Sheet Scenes trống hoặc không đọc được")
+        sys.exit(1)
+
+    total_scenes = len(df_scenes)
+    print(f"✅ {total_scenes} cảnh cần xử lý")
+
+    # Lấy thông tin project (nếu có)
+    project_info = {}
+    if not df_scenes.empty:
+        first = df_scenes.iloc[0]
+        for key in ["title", "genre", "visual_style", "world_setting", "bgm_prompt", "project_title"]:
+            val = safe_get(first, key)
+            if val:
+                project_info[key] = val
+
+    # ========== 1. TẢI DANH SÁCH FILE TRÊN DRIVE ==========
+    print("\n📥 [1] Lấy danh sách file trên Drive...")
     try:
         drive_files = list_files_in_folder(DRIVE_FOLDER_ID)
         print(f"✅ {len(drive_files)} file trên Drive")
@@ -316,30 +440,113 @@ async def process_video_pipeline():
         send_n8n_webhook("failed", error_message=str(e))
         sys.exit(1)
 
-    for index, row in df.iterrows():
+    # ========== 2. TẠO / TẢI ẢNH NHÂN VẬT ==========
+    print("\n🧑‍🎨 [2] Xử lý ảnh nhân vật...")
+    if not df_chars.empty:
+        for idx, row in df_chars.iterrows():
+            char_id = safe_get(row, "character_id", default=f"char_{idx+1:02d}")
+            char_name = safe_get(row, "character_name", default=f"Character_{idx+1}")
+            design = safe_get(row, "design_detail", "appearance", "design")
+            image_prompt = safe_get(row, "image_prompt", "design_detail")
+            file_name = safe_get(row, "file_name", default=f"character_{idx+1:02d}_{char_name.lower().replace(' ', '_')}.png")
+
+            local_path = f"char_{char_id}_{RUN_DATE}.png"
+            name_key = char_name.lower().strip()
+
+            # Đã có local?
+            existing_local = list(Path(".").glob(f"char_{char_id}_*.png")) + list(Path(".").glob(f"*{file_name}"))
+            if existing_local:
+                character_images[name_key] = str(existing_local[0])
+                print(f"⏩ {char_name}: dùng ảnh local")
+                continue
+
+            # Tìm trên Drive
+            found = find_file_in_drive(drive_files, [char_id, file_name.replace(".png", ""), char_name.lower().replace(" ", "_")])
+            if found:
+                download_drive_file(found["id"], local_path)
+                character_images[name_key] = local_path
+                print(f"✅ {char_name}: tải từ Drive")
+                continue
+
+            # Chưa có → tạo mới
+            if not image_prompt:
+                image_prompt = f"full body character reference sheet of {design}, 3d chinese donghua style, unreal engine 5, highly detailed"
+
+            success = generate_character_image(image_prompt, local_path)
+            if success:
+                upload_file_to_drive(local_path, DRIVE_FOLDER_ID)
+                character_images[name_key] = local_path
+            else:
+                print(f"⚠️ {char_name}: tạo ảnh thất bại")
+    else:
+        print("⚠️ Không có dữ liệu Characters → bỏ qua bước tạo ảnh nhân vật")
+
+    print(f"✅ Có {len(character_images)} ảnh nhân vật sẵn sàng")
+
+    # ========== 3. TẠO / TẢI ẢNH CẢNH ==========
+    print("\n🖼️  [3] Xử lý ảnh cảnh...")
+    for index, row in df_scenes.iterrows():
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
         local_img = f"image_{scene_index:03d}_{RUN_DATE}.png"
 
+        # Đã có local?
         existing = list(Path(".").glob(f"image_{scene_index:03d}_*.png"))
         if existing:
-            image_paths[scene_index] = str(existing[0])
+            scene_image_paths[scene_index] = str(existing[0])
             print(f"⏩ Cảnh {scene_index}: ảnh local đã có")
             continue
 
-        found = find_scene_image(drive_files, scene_index)
+        # Tìm trên Drive
+        found = find_file_in_drive(drive_files, [f"scene_{scene_index:03d}", f"image_{scene_index:03d}", f"scene_{scene_index}"])
         if found:
             download_drive_file(found["id"], local_img)
-            image_paths[scene_index] = local_img
-            print(f"✅ Cảnh {scene_index}: tải {found['name']}")
-        else:
-            print(f"⚠️ Cảnh {scene_index}: không tìm thấy ảnh")
+            scene_image_paths[scene_index] = local_img
+            print(f"✅ Cảnh {scene_index}: tải từ Drive")
+            continue
 
-    # ========== 2. TẠO BGM ==========
+        # Chưa có → tạo mới
+        image_prompt = safe_get(row, "image_prompt", "scene_description", "prompt")
+        char_name_raw = safe_get(row, "character_name")
+        neg_prompt = safe_get(row, "negative_prompt")
+
+        # Tìm ảnh nhân vật reference (ưu tiên nhân vật đầu tiên)
+        ref_path = None
+        if char_name_raw:
+            for name in char_name_raw.split(","):
+                key = name.strip().lower()
+                if key in character_images:
+                    ref_path = character_images[key]
+                    break
+                # fuzzy
+                for ck, cp in character_images.items():
+                    if key in ck or ck in key:
+                        ref_path = cp
+                        break
+                if ref_path:
+                    break
+
+        if not image_prompt:
+            image_prompt = "3d chinese donghua style scene, unreal engine 5, cinematic lighting"
+
+        success = generate_scene_image(
+            prompt=image_prompt,
+            output_path=local_img,
+            ref_image_path=ref_path,
+        )
+        if success:
+            upload_file_to_drive(local_img, DRIVE_FOLDER_ID)
+            scene_image_paths[scene_index] = local_img
+        else:
+            print(f"⚠️ Cảnh {scene_index}: tạo ảnh thất bại → bỏ qua video")
+
+    print(f"✅ Có {len(scene_image_paths)} ảnh cảnh sẵn sàng")
+
+    # ========== 4. TẠO BGM ==========
     bgm_desc = project_info.get("bgm_prompt") or f"{project_info.get('genre', 'dramatic')} cinematic background music"
     generate_ai_bgm(bgm_desc, duration_sec=total_scenes * 5, output_path=BGM_FILE)
 
-    # ========== 3. LOAD LTX ==========
-    print("\n🎬 [3] Load LTX...")
+    # ========== 5. LOAD LTX ==========
+    print("\n🎬 [5] Load LTX...")
     try:
         ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
             "Lightricks/LTX-Video",
@@ -364,12 +571,12 @@ async def process_video_pipeline():
         send_n8n_webhook("failed", error_message=str(e))
         sys.exit(1)
 
-    # ========== 4. TẠO VIDEO TỪNG CẢNH ==========
-    for index, row in df.iterrows():
+    # ========== 6. TẠO VIDEO TỪNG CẢNH ==========
+    for index, row in df_scenes.iterrows():
         scene_start = time.time()
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
+        image_file = scene_image_paths.get(scene_index)
 
-        image_file = image_paths.get(scene_index)
         if not image_file or not os.path.exists(image_file):
             print(f"⚠️ Cảnh {scene_index}: thiếu ảnh → bỏ qua")
             continue
@@ -381,19 +588,17 @@ async def process_video_pipeline():
             print(f"⏩ Cảnh {scene_index}: video đã có")
             continue
 
-        # Lấy dữ liệu từ Sheet (hỗ trợ nhiều tên cột)
         vid_prompt = safe_get(row, "video_prompt", "camera_motion", default="smooth cinematic movement")
         neg_prompt = safe_get(row, "negative_prompt")
         dialogue_text = safe_get(row, "dialogue")
         char_name = safe_get(row, "character_name")
         sfx_prompt = safe_get(row, "sfx_type", "sound_effect", "sfx_prompt")
-        scene_desc = safe_get(row, "scene_description", "image_prompt")
 
         raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
         audio_tts_file = f"tts_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         audio_sfx_file = f"sfx_scene_{scene_index:03d}_{RUN_DATE}.wav"
 
-        print(f"\n🎬 [{scene_index}/{total_scenes}] LTX | {char_name[:30]}")
+        print(f"\n🎬 [{scene_index}/{total_scenes}] LTX | {char_name[:40]}")
 
         # --- LTX ---
         try:
@@ -431,7 +636,7 @@ async def process_video_pipeline():
 
         # --- SFX ---
         has_sfx = False
-        if sfx_prompt and sfx_prompt.lower() not in ["none", "nan"]:
+        if sfx_prompt and sfx_prompt.lower() not in ["none", "nan", ""]:
             has_sfx = generate_ai_sfx(sfx_prompt, duration_sec=a_dur, output_path=audio_sfx_file)
 
         # --- Mix ---
@@ -470,8 +675,10 @@ async def process_video_pipeline():
 
         for f in [raw_video_file, audio_tts_file, audio_sfx_file]:
             if os.path.exists(f):
-                try: os.remove(f)
-                except: pass
+                try:
+                    os.remove(f)
+                except:
+                    pass
 
         if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 15000:
             upload_file_to_drive(final_scene_file, DRIVE_FOLDER_ID)
@@ -483,8 +690,8 @@ async def process_video_pipeline():
     del ltx_pipe
     clear_memory()
 
-    # ========== 5. GỘP + BGM ==========
-    print("\n🎞️ [5] Gộp video...")
+    # ========== 7. GỘP + BGM ==========
+    print("\n🎞️ [7] Gộp video...")
     if not rendered_files:
         send_n8n_webhook("failed", error_message="Không render được cảnh nào", extra=project_info)
         sys.exit(1)
@@ -526,7 +733,7 @@ async def process_video_pipeline():
     print("\n🎉 HOÀN TẤT PIPELINE!")
 
 # -------------------------------------------------------------------
-# 6. RUN
+# 8. RUN
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     try:
