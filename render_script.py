@@ -1,7 +1,6 @@
 # ============================================================
-# PIPELINE HOÀN CHỈNH (TỐI ƯU - CHỈ CÀI PACKAGE 1 LẦN)
-# Sheet + Drive ảnh → LTX I2V → Lồng tiếng VI → AI BGM & SFX → 1 video
-# Upload Drive + Webhook n8n
+# PIPELINE KAGGLE - KHỚP GOOGLE SHEET MỚI
+# Đọc Scenes (có dialogue + scene_description) → LTX → TTS → BGM → Gộp video
 # ============================================================
 import asyncio
 import gc
@@ -12,7 +11,7 @@ import time
 from pathlib import Path
 
 # -------------------------------------------------------------------
-# 1. CÀI PACKAGE THÔNG MINH (CHỈ CÀI KHI THIẾU)
+# 1. CÀI PACKAGE THÔNG MINH
 # -------------------------------------------------------------------
 def install_requirements():
     required = {
@@ -38,7 +37,6 @@ def install_requirements():
         "requests": "requests",
         "PIL": "Pillow",
     }
-
     missing = []
     for import_name, pip_name in required.items():
         try:
@@ -50,11 +48,8 @@ def install_requirements():
         print("✅ Tất cả package đã có sẵn → bỏ qua cài đặt")
         return
 
-    print(f"📦 Đang cài {len(missing)} package còn thiếu: {missing}")
-    packages = missing + [
-        "protobuf<6.0.0,>=3.20.2",
-        "imageio-ffmpeg",
-    ]
+    print(f"📦 Đang cài {len(missing)} package còn thiếu...")
+    packages = missing + ["protobuf<6.0.0,>=3.20.2", "imageio-ffmpeg"]
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "--no-warn-script-location", "--disable-pip-version-check",
@@ -81,7 +76,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from huggingface_hub import login
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 LTX + TTS + AI BGM/SFX PIPELINE - [{RUN_DATE}]")
+print(f"🚀 LTX + TTS + BGM PIPELINE - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -98,7 +93,6 @@ TOKEN_PART1 = os.environ.get("HF_TOKEN_PART1", "")
 TOKEN_PART2 = os.environ.get("HF_TOKEN_PART2", "")
 COMBINED_HF_TOKEN = f"{TOKEN_PART1.strip()}{TOKEN_PART2.strip()}".strip()
 hf_token_to_pass = None
-
 if COMBINED_HF_TOKEN.startswith("hf_"):
     try:
         login(token=COMBINED_HF_TOKEN)
@@ -182,7 +176,6 @@ def upload_file_to_drive(file_path, folder_id, retries=3):
     mimetype = "image/png" if file_name.endswith(".png") else "video/mp4"
     if file_name.endswith(".mp3"):
         mimetype = "audio/mpeg"
-
     for attempt in range(1, retries + 1):
         try:
             creds = get_oauth_credentials()
@@ -215,11 +208,7 @@ def send_n8n_webhook(status, total_scenes=0, final_file=None, drive_file_id=None
         print(f"❌ Webhook lỗi: {e}")
 
 def find_scene_image(drive_files, scene_index):
-    keys = [
-        f"scene_{scene_index:03d}",
-        f"image_{scene_index:03d}",
-        f"scene_{scene_index}",
-    ]
+    keys = [f"scene_{scene_index:03d}", f"image_{scene_index:03d}", f"scene_{scene_index}"]
     for f in drive_files:
         name = f["name"].lower()
         if any(k in name for k in keys) and name.endswith((".png", ".jpg", ".jpeg", ".webp")):
@@ -228,77 +217,74 @@ def find_scene_image(drive_files, scene_index):
 
 def pick_voice(char_name: str) -> str:
     name = (char_name or "").lower()
-    if any(k in name for k in ["nữ", "cô", "chị", "muội", "evo", "my", "linh"]):
+    if any(k in name for k in ["nữ", "cô", "chị", "muội", "my", "linh", "sera", "eva"]):
         return VOICE_MAP["nu"]
     return VOICE_MAP["nam"]
 
+def safe_get(row, *keys, default=""):
+    """Lấy giá trị từ row, hỗ trợ nhiều tên cột"""
+    for key in keys:
+        val = row.get(key)
+        if pd.notna(val) and str(val).strip().lower() not in ["nan", "none", "null", "", "[empty]"]:
+            return str(val).strip()
+    return default
+
 # -------------------------------------------------------------------
-# 3.1 AI MUSIC & AUDIO
+# 3.1 AI MUSIC & SFX
 # -------------------------------------------------------------------
 def generate_ai_bgm(prompt_text: str, duration_sec: int, output_path: str):
-    print(f"🎵 [AI BGM] Đang tạo: '{prompt_text}' ({duration_sec}s)...")
+    print(f"🎵 [AI BGM] Đang tạo: '{prompt_text}'...")
     try:
         clear_memory()
-        processor_bgm = AutoProcessor.from_pretrained("facebook/musicgen-small")
-        model_bgm = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").to(DEVICE)
-
-        inputs = processor_bgm(text=[prompt_text], padding=True, return_tensors="pt").to(DEVICE)
+        processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+        model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").to(DEVICE)
+        inputs = processor(text=[prompt_text], padding=True, return_tensors="pt").to(DEVICE)
         max_tokens = min(int(duration_sec * 50), 1500)
-
-        audio_outputs = model_bgm.generate(**inputs, max_new_tokens=max_tokens)
-        sampling_rate = model_bgm.config.audio_encoder.sampling_rate
-
+        audio = model.generate(**inputs, max_new_tokens=max_tokens)
+        sr = model.config.audio_encoder.sampling_rate
         wav_path = output_path.replace(".mp3", ".wav")
-        wavfile.write(wav_path, rate=sampling_rate, data=audio_outputs[0, 0].cpu().numpy())
-
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", wav_path, "-acodec", "libmp3lame", output_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        wavfile.write(wav_path, rate=sr, data=audio[0, 0].cpu().numpy())
+        subprocess.run(["ffmpeg", "-y", "-i", wav_path, "-acodec", "libmp3lame", output_path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if os.path.exists(wav_path):
             os.remove(wav_path)
-
-        del processor_bgm, model_bgm
+        del processor, model
         clear_memory()
-        print(f"✅ [AI BGM] Xong: {output_path}")
+        print(f"✅ [AI BGM] Xong")
         return True
     except Exception as e:
         print(f"⚠️ [AI BGM] Lỗi: {e}")
         return False
 
 def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
-    print(f"🔊 [AI SFX] '{prompt_text}'...")
+    print(f"🔊 [AI SFX] {prompt_text}...")
     try:
         clear_memory()
-        pipe_sfx = AudioLDMPipeline.from_pretrained(
+        pipe = AudioLDMPipeline.from_pretrained(
             "cvssp/audioldm-m-full",
             torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
         ).to(DEVICE)
-
-        audio = pipe_sfx(
-            prompt_text,
-            num_inference_steps=15,
-            audio_length_in_s=max(1.0, min(duration_sec, 8.0))
-        ).audios[0]
-
+        audio = pipe(prompt_text, num_inference_steps=15,
+                     audio_length_in_s=max(1.0, min(duration_sec, 8.0))).audios[0]
         wavfile.write(output_path, rate=16000, data=audio)
-        del pipe_sfx
+        del pipe
         clear_memory()
-        print(f"✅ [AI SFX] Xong")
+        print("✅ [AI SFX] Xong")
         return True
     except Exception as e:
         print(f"⚠️ [AI SFX] Lỗi: {e}")
         return False
 
 # -------------------------------------------------------------------
-# 4. ĐỌC GOOGLE SHEET
+# 4. ĐỌC GOOGLE SHEET (KHỚP CẤU TRÚC MỚI)
 # -------------------------------------------------------------------
 print("\n📊 Đọc Google Sheet...")
 try:
     df = pd.read_csv(GOOGLE_SHEET_CSV_URL)
     df.columns = df.columns.str.strip().str.lower()
     total_scenes = len(df)
-    print(f"✅ {total_scenes} cảnh | Cột: {df.columns.tolist()}")
+    print(f"✅ {total_scenes} cảnh")
+    print(f"   Cột có: {df.columns.tolist()}")
 except Exception as e:
     print(f"❌ Lỗi Sheet: {e}")
     send_n8n_webhook("failed", error_message=str(e))
@@ -307,7 +293,7 @@ except Exception as e:
 project_info = {}
 if not df.empty:
     first = df.iloc[0]
-    for key in ["title", "genre", "visual_style", "world_setting", "bgm_prompt"]:
+    for key in ["title", "genre", "visual_style", "world_setting", "bgm_prompt", "project_title"]:
         if key in df.columns:
             val = str(first[key]).strip()
             if val.lower() not in ["nan", "", "[empty]"]:
@@ -320,8 +306,8 @@ async def process_video_pipeline():
     rendered_files = []
     image_paths = {}
 
-    # ========== GIAI ĐOẠN 1: TẢI ẢNH ==========
-    print("\n📥 [1] Tải ảnh cảnh từ Google Drive...")
+    # ========== 1. TẢI ẢNH TỪ DRIVE ==========
+    print("\n📥 [1] Tải ảnh cảnh từ Drive...")
     try:
         drive_files = list_files_in_folder(DRIVE_FOLDER_ID)
         print(f"✅ {len(drive_files)} file trên Drive")
@@ -331,8 +317,7 @@ async def process_video_pipeline():
         sys.exit(1)
 
     for index, row in df.iterrows():
-        scene_idx_val = row.get("scene_index")
-        scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
+        scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
         local_img = f"image_{scene_index:03d}_{RUN_DATE}.png"
 
         existing = list(Path(".").glob(f"image_{scene_index:03d}_*.png"))
@@ -349,21 +334,18 @@ async def process_video_pipeline():
         else:
             print(f"⚠️ Cảnh {scene_index}: không tìm thấy ảnh")
 
-    # ========== GIAI ĐOẠN 1.5: TẠO BGM ==========
-    bgm_desc = project_info.get("bgm_prompt", f"{project_info.get('genre', 'dramatic')} cinematic background music")
-    estimated_total_duration = total_scenes * 5
-    generate_ai_bgm(bgm_desc, duration_sec=estimated_total_duration, output_path=BGM_FILE)
+    # ========== 2. TẠO BGM ==========
+    bgm_desc = project_info.get("bgm_prompt") or f"{project_info.get('genre', 'dramatic')} cinematic background music"
+    generate_ai_bgm(bgm_desc, duration_sec=total_scenes * 5, output_path=BGM_FILE)
 
-    # ========== GIAI ĐOẠN 2: LTX ==========
-    print("\n🎬 [2] Load LTX Image-to-Video...")
+    # ========== 3. LOAD LTX ==========
+    print("\n🎬 [3] Load LTX...")
     try:
         ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
             "Lightricks/LTX-Video",
             torch_dtype=torch.bfloat16,
             token=hf_token_to_pass,
         )
-
-        # Tối ưu bộ nhớ
         try:
             from diffusers.hooks import apply_group_offloading
             ltx_pipe = apply_group_offloading(ltx_pipe, offload_type="block_level")
@@ -371,23 +353,21 @@ async def process_video_pipeline():
         except Exception:
             ltx_pipe.enable_model_cpu_offload()
             print("✅ enable_model_cpu_offload")
-
         try:
             ltx_pipe.vae.enable_tiling()
             print("✅ vae.enable_tiling()")
         except Exception:
             pass
-
         print("✅ LTX ready")
     except Exception as e:
         print(f"❌ Load LTX lỗi: {e}")
         send_n8n_webhook("failed", error_message=str(e))
         sys.exit(1)
 
+    # ========== 4. TẠO VIDEO TỪNG CẢNH ==========
     for index, row in df.iterrows():
         scene_start = time.time()
-        scene_idx_val = row.get("scene_index")
-        scene_index = int(scene_idx_val) if pd.notna(scene_idx_val) else index + 1
+        scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
 
         image_file = image_paths.get(scene_index)
         if not image_file or not os.path.exists(image_file):
@@ -395,88 +375,81 @@ async def process_video_pipeline():
             continue
 
         final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
-        existing_scenes = list(Path(".").glob(f"scene_{scene_index:03d}_*.mp4"))
-        if existing_scenes and os.path.getsize(str(existing_scenes[0])) > 15000:
-            rendered_files.append(str(existing_scenes[0]))
+        existing = list(Path(".").glob(f"scene_{scene_index:03d}_*.mp4"))
+        if existing and os.path.getsize(str(existing[0])) > 15000:
+            rendered_files.append(str(existing[0]))
             print(f"⏩ Cảnh {scene_index}: video đã có")
             continue
 
-        vid_prompt = str(row.get("video_prompt", "")).strip()
-        neg_prompt = str(row.get("negative_prompt", "")).strip()
-        dialogue_text = str(row.get("dialogue", "")).strip()
-        char_name = str(row.get("character_name", "")).strip()
-        sfx_prompt = str(row.get("sound_effect", row.get("sfx_prompt", ""))).strip()
-
-        if dialogue_text.lower() in ["nan", "[empty]", "none", "null"]:
-            dialogue_text = ""
-        if sfx_prompt.lower() in ["nan", "[empty]", "none", "null"]:
-            sfx_prompt = ""
+        # Lấy dữ liệu từ Sheet (hỗ trợ nhiều tên cột)
+        vid_prompt = safe_get(row, "video_prompt", "camera_motion", default="smooth cinematic movement")
+        neg_prompt = safe_get(row, "negative_prompt")
+        dialogue_text = safe_get(row, "dialogue")
+        char_name = safe_get(row, "character_name")
+        sfx_prompt = safe_get(row, "sfx_type", "sound_effect", "sfx_prompt")
+        scene_desc = safe_get(row, "scene_description", "image_prompt")
 
         raw_video_file = f"raw_scene_{scene_index:03d}_{RUN_DATE}.mp4"
         audio_tts_file = f"tts_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         audio_sfx_file = f"sfx_scene_{scene_index:03d}_{RUN_DATE}.wav"
 
-        print(f"\n🎬 [{scene_index}/{total_scenes}] LTX...")
+        print(f"\n🎬 [{scene_index}/{total_scenes}] LTX | {char_name[:30]}")
 
+        # --- LTX ---
         try:
             clear_memory()
-            image_input = load_image(image_file).resize((512, 288))
-
-            motion_prompt = vid_prompt if vid_prompt and vid_prompt.lower() not in ["nan", "none"] else "smooth cinematic movement, gentle camera motion"
-
+            image_input = load_image(image_file).resize((640, 360))
             video_frames = ltx_pipe(
                 image=image_input,
-                prompt=motion_prompt,
-                negative_prompt=neg_prompt if neg_prompt and neg_prompt.lower() not in ["nan", "none"] else None,
+                prompt=vid_prompt,
+                negative_prompt=neg_prompt if neg_prompt else None,
                 width=640,
                 height=360,
                 num_frames=25,
                 num_inference_steps=20,
                 generator=torch.Generator("cpu").manual_seed(42 + scene_index),
             ).frames[0]
-
-            export_to_video(video_frames, raw_video_file, fps=12)
-            print(f"   ✅ Video thô: {raw_video_file}")
+            export_to_video(video_frames, raw_video_file, fps=16)
             del video_frames
             clear_memory()
+            print(f"   ✅ Video thô xong")
         except Exception as e:
             print(f"❌ Lỗi LTX cảnh {scene_index}: {e}")
             clear_memory()
             continue
 
-        # TTS
+        # --- TTS ---
         a_dur = 2.0
         has_tts = False
         if dialogue_text:
             voice = pick_voice(char_name)
-            print(f"🎙️ TTS [{char_name}] ({voice}): {dialogue_text[:60]}...")
+            print(f"🎙️ TTS [{char_name}] ({voice}): {dialogue_text[:50]}...")
             communicate = edge_tts.Communicate(text=dialogue_text, voice=voice)
             await communicate.save(audio_tts_file)
             a_dur = get_media_duration(audio_tts_file)
             has_tts = True
 
-        # SFX
+        # --- SFX ---
         has_sfx = False
-        if sfx_prompt:
+        if sfx_prompt and sfx_prompt.lower() not in ["none", "nan"]:
             has_sfx = generate_ai_sfx(sfx_prompt, duration_sec=a_dur, output_path=audio_sfx_file)
 
-        # Mix
+        # --- Mix ---
         v_dur = get_media_duration(raw_video_file)
         pad_dur = max(0.0, a_dur - v_dur) if has_tts else 0.0
 
         inputs = [f'-i "{raw_video_file}"']
         filter_parts = []
         map_v = "0:v:0"
-        map_a = None
+        map_a = "1:a:0"
 
         if pad_dur > 0.05:
             filter_parts.append(f"[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]")
             map_v = "[v]"
 
         if has_tts and has_sfx:
-            inputs.append(f'-i "{audio_tts_file}"')
-            inputs.append(f'-i "{audio_sfx_file}"')
-            filter_parts.append("[1:a]volume=1.0[tts];[2:a]volume=0.45[sfx];[tts][sfx]amix=inputs=2:duration=first[a]")
+            inputs += [f'-i "{audio_tts_file}"', f'-i "{audio_sfx_file}"']
+            filter_parts.append("[1:a]volume=1.0[tts];[2:a]volume=0.4[sfx];[tts][sfx]amix=inputs=2:duration=first[a]")
             map_a = "[a]"
         elif has_tts:
             inputs.append(f'-i "{audio_tts_file}"')
@@ -486,45 +459,37 @@ async def process_video_pipeline():
             map_a = "1:a:0"
         else:
             inputs.append('-f lavfi -i anullsrc=r=44100:cl=stereo')
-            map_a = "1:a:0"
 
         filter_str = f'-filter_complex "{";".join(filter_parts)}"' if filter_parts else ""
-        inputs_str = " ".join(inputs)
-
         mix_cmd = (
-            f'ffmpeg -y {inputs_str} {filter_str} '
-            f'-map {map_v} -map {map_a} '
-            f'-c:v libx264 -pix_fmt yuv420p -r 12 '
-            f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest '
-            f'"{final_scene_file}"'
+            f'ffmpeg -y {" ".join(inputs)} {filter_str} '
+            f'-map {map_v} -map {map_a} -c:v libx264 -pix_fmt yuv420p -r 16 '
+            f'-c:a aac -ar 44100 -ac 2 -b:a 192k -shortest "{final_scene_file}"'
         )
         subprocess.run(mix_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         for f in [raw_video_file, audio_tts_file, audio_sfx_file]:
             if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
+                try: os.remove(f)
+                except: pass
 
         if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 15000:
             upload_file_to_drive(final_scene_file, DRIVE_FOLDER_ID)
             rendered_files.append(final_scene_file)
             print(f"✅ Cảnh {scene_index} xong ({time.time() - scene_start:.1f}s)")
         else:
-            print(f"⚠️ Cảnh {scene_index}: file video lỗi")
+            print(f"⚠️ Cảnh {scene_index}: file lỗi")
 
     del ltx_pipe
     clear_memory()
 
-    # ========== GIAI ĐOẠN 3: GỘP + BGM ==========
-    print("\n🎞️ [3] Gộp tất cả cảnh...")
+    # ========== 5. GỘP + BGM ==========
+    print("\n🎞️ [5] Gộp video...")
     if not rendered_files:
         send_n8n_webhook("failed", error_message="Không render được cảnh nào", extra=project_info)
         sys.exit(1)
 
     rendered_files = sorted(rendered_files)
-
     with open("file_list.txt", "w", encoding="utf-8") as f:
         for file in rendered_files:
             f.write(f"file '{file}'\n")
@@ -532,30 +497,23 @@ async def process_video_pipeline():
     concat_output = f"final_concat_{RUN_DATE}.mp4"
     final_output = f"final_movie_{RUN_DATE}.mp4"
 
-    subprocess.run(
-        f'ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy "{concat_output}"',
-        shell=True, check=True
-    )
+    subprocess.run(f'ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy "{concat_output}"', shell=True, check=True)
 
     if os.path.exists(BGM_FILE):
-        print("🎵 Ghép nhạc nền AI...")
+        print("🎵 Ghép BGM...")
         bgm_cmd = (
             f'ffmpeg -y -i "{concat_output}" -stream_loop -1 -i "{BGM_FILE}" '
-            f'-filter_complex "[0:a]volume=1.0[a_tts];[1:a]volume=0.13[a_bgm];'
-            f'[a_tts][a_bgm]amix=inputs=2:duration=first[a]" '
-            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k '
-            f'"{final_output}"'
+            f'-filter_complex "[0:a]volume=1.0[a1];[1:a]volume=0.12[a2];[a1][a2]amix=inputs=2:duration=first[a]" '
+            f'-map 0:v:0 -map "[a]" -c:v copy -c:a aac -ar 44100 -ac 2 -b:a 192k "{final_output}"'
         )
         try:
             subprocess.run(bgm_cmd, shell=True, check=True)
-        except Exception as e:
-            print(f"⚠️ Ghép BGM lỗi → dùng bản không BGM: {e}")
+        except Exception:
             final_output = concat_output
     else:
-        print("⚠️ Không có BGM")
         final_output = concat_output
 
-    print(f"\n☁️ Upload phim hoàn chỉnh: {final_output}")
+    print(f"\n☁️ Upload phim: {final_output}")
     drive_file_id = upload_file_to_drive(final_output, DRIVE_FOLDER_ID)
 
     send_n8n_webhook(
@@ -565,7 +523,6 @@ async def process_video_pipeline():
         drive_file_id=drive_file_id,
         extra=project_info,
     )
-
     print("\n🎉 HOÀN TẤT PIPELINE!")
 
 # -------------------------------------------------------------------
