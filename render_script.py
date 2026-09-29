@@ -1,7 +1,7 @@
 # ============================================================
 # PIPELINE KAGGLE - TẠO ẢNH NHÂN VẬT → ẢNH CẢNH → VIDEO
-# Đọc Characters + Scenes bằng CSV công khai
-# OAuth chỉ dùng để lưu ảnh/video lên Drive
+# Đọc Characters + Scenes bằng CSV
+# OAuth chỉ dùng khi có đủ token, không có thì chạy local
 # ============================================================
 import asyncio
 import gc
@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 # -------------------------------------------------------------------
-# 1. CÀI PACKAGE THÔNG MINH
+# 1. CÀI PACKAGE
 # -------------------------------------------------------------------
 def install_requirements():
     required = {
@@ -45,9 +45,9 @@ def install_requirements():
         except ImportError:
             missing.append(pip_name)
     if not missing:
-        print("✅ Tất cả package đã có sẵn → bỏ qua cài đặt")
+        print("✅ Tất cả package đã có sẵn")
         return
-    print(f"📦 Đang cài {len(missing)} package còn thiếu...")
+    print(f"📦 Đang cài {len(missing)} package...")
     packages = missing + ["protobuf<6.0.0,>=3.20.2", "imageio-ffmpeg"]
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
@@ -80,7 +80,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from huggingface_hub import login
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 LTX + TTS + BGM PIPELINE (tạo ảnh nhân vật + cảnh) - [{RUN_DATE}]")
+print(f"🚀 PIPELINE (tạo ảnh nhân vật + cảnh + video) - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -92,10 +92,10 @@ N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-don
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# ====================== CẤU HÌNH GID ======================
-GID_SCENES = "0"              # Tab Scenes (thường là 0)
-GID_CHARACTERS = "1382939846"          # <-- THAY BẰNG GID CỦA TAB CHARACTERS
-# ==========================================================
+# ====================== GID ======================
+GID_SCENES = "0"
+GID_CHARACTERS = "0"          # <-- nhớ thay bằng gid thật của tab Characters nếu khác
+# =================================================
 
 TOKEN_PART1 = os.environ.get("HF_TOKEN_PART1", "")
 TOKEN_PART2 = os.environ.get("HF_TOKEN_PART2", "")
@@ -109,25 +109,34 @@ if COMBINED_HF_TOKEN.startswith("hf_"):
     except Exception as e:
         print(f"⚠️ HF login fail: {e}")
 
-OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
-OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
-OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
+OAUTH_CLIENT_ID     = os.environ.get("OAUTH_CLIENT_ID", "").strip()
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
+OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "").strip()
 TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+# Kiểm tra secret ngay từ đầu
+print("\n🔐 Kiểm tra OAuth secrets:")
+print(f"   OAUTH_CLIENT_ID     : {'✅ có' if OAUTH_CLIENT_ID else '❌ thiếu'}")
+print(f"   OAUTH_CLIENT_SECRET : {'✅ có' if OAUTH_CLIENT_SECRET else '❌ thiếu'}")
+print(f"   OAUTH_REFRESH_TOKEN : {'✅ có' if OAUTH_REFRESH_TOKEN else '❌ thiếu'}")
+
+USE_DRIVE = bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REFRESH_TOKEN)
+if not USE_DRIVE:
+    print("⚠️ Thiếu OAuth secret → sẽ chạy hoàn toàn LOCAL (không upload Drive)")
 
 VOICE_MAP = {
     "nam": "vi-VN-NamMinhNeural",
     "nu": "vi-VN-HoaiMyNeural",
 }
 BGM_FILE = f"bgm_generated_{RUN_DATE}.mp3"
-
-# Model tạo ảnh (nhanh + nhẹ)
 IMAGE_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 
 # -------------------------------------------------------------------
 # 3. HELPERS
 # -------------------------------------------------------------------
 def get_oauth_credentials():
-    """Chỉ dùng cho Drive (upload/download)"""
+    if not USE_DRIVE:
+        return None
     return Credentials(
         token=None,
         refresh_token=OAUTH_REFRESH_TOKEN,
@@ -153,36 +162,52 @@ def get_media_duration(file_path):
         return 2.0
 
 def list_files_in_folder(folder_id):
-    creds = get_oauth_credentials()
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    files = []
-    page_token = None
-    while True:
-        resp = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id, name, mimeType)",
-            pageSize=200,
-            pageToken=page_token,
-        ).execute()
-        files.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return files
+    if not USE_DRIVE:
+        return []
+    try:
+        creds = get_oauth_credentials()
+        if creds is None:
+            return []
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        files = []
+        page_token = None
+        while True:
+            resp = service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields="nextPageToken, files(id, name, mimeType)",
+                pageSize=200,
+                pageToken=page_token,
+            ).execute()
+            files.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return files
+    except Exception as e:
+        print(f"⚠️ list Drive lỗi: {e}")
+        return []
 
 def download_drive_file(file_id, save_path):
-    creds = get_oauth_credentials()
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    request = service.files().get_media(fileId=file_id)
-    with open(save_path, "wb") as f:
-        downloader = MediaIoBaseDownload(f, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-    return save_path
+    if not USE_DRIVE:
+        return None
+    try:
+        creds = get_oauth_credentials()
+        if creds is None:
+            return None
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        request = service.files().get_media(fileId=file_id)
+        with open(save_path, "wb") as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+        return save_path
+    except Exception as e:
+        print(f"⚠️ download lỗi: {e}")
+        return None
 
-def upload_file_to_drive(file_path, folder_id, retries=3):
-    if not os.path.exists(file_path) or not folder_id:
+def upload_file_to_drive(file_path, folder_id, retries=2):
+    if not USE_DRIVE or not os.path.exists(file_path):
         return None
     file_name = os.path.basename(file_path)
     mimetype = "image/png" if file_name.endswith((".png", ".jpg", ".jpeg", ".webp")) else "video/mp4"
@@ -191,6 +216,8 @@ def upload_file_to_drive(file_path, folder_id, retries=3):
     for attempt in range(1, retries + 1):
         try:
             creds = get_oauth_credentials()
+            if creds is None:
+                return None
             service = build("drive", "v3", credentials=creds, cache_discovery=False)
             meta = {"name": file_name, "parents": [folder_id]}
             media = MediaFileUpload(file_path, mimetype=mimetype, resumable=True)
@@ -199,7 +226,7 @@ def upload_file_to_drive(file_path, folder_id, retries=3):
             return uploaded.get("id")
         except Exception as e:
             print(f"⚠️ Upload lần {attempt} lỗi: {e}")
-            time.sleep(2)
+            time.sleep(1)
     return None
 
 def send_n8n_webhook(status, total_scenes=0, final_file=None, drive_file_id=None, error_message=None, extra=None):
@@ -214,7 +241,7 @@ def send_n8n_webhook(status, total_scenes=0, final_file=None, drive_file_id=None
     if extra:
         payload.update(extra)
     try:
-        res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
+        res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=30)
         print(f"📡 Webhook [{status}] → {res.status_code}")
     except Exception as e:
         print(f"❌ Webhook lỗi: {e}")
@@ -241,7 +268,6 @@ def safe_get(row, *keys, default=""):
     return default
 
 def get_sheet_csv(gid: str) -> pd.DataFrame:
-    """Đọc sheet bằng CSV công khai - không cần OAuth"""
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
     try:
         df = pd.read_csv(url)
@@ -256,7 +282,7 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
 # 3.1 AI MUSIC & SFX
 # -------------------------------------------------------------------
 def generate_ai_bgm(prompt_text: str, duration_sec: int, output_path: str):
-    print(f"🎵 [AI BGM] Đang tạo: '{prompt_text}'...")
+    print(f"🎵 [AI BGM] '{prompt_text[:50]}...'")
     try:
         clear_memory()
         processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
@@ -273,14 +299,14 @@ def generate_ai_bgm(prompt_text: str, duration_sec: int, output_path: str):
             os.remove(wav_path)
         del processor, model
         clear_memory()
-        print(f"✅ [AI BGM] Xong")
+        print("✅ [AI BGM] Xong")
         return True
     except Exception as e:
         print(f"⚠️ [AI BGM] Lỗi: {e}")
         return False
 
 def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
-    print(f"🔊 [AI SFX] {prompt_text}...")
+    print(f"🔊 [AI SFX] {prompt_text}")
     try:
         clear_memory()
         pipe = AudioLDMPipeline.from_pretrained(
@@ -306,15 +332,11 @@ def load_image_pipeline(task="text2img"):
     dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
     if task == "text2img":
         pipe = AutoPipelineForText2Image.from_pretrained(
-            IMAGE_MODEL_ID,
-            torch_dtype=dtype,
-            token=hf_token_to_pass,
+            IMAGE_MODEL_ID, torch_dtype=dtype, token=hf_token_to_pass
         )
     else:
         pipe = AutoPipelineForImage2Image.from_pretrained(
-            IMAGE_MODEL_ID,
-            torch_dtype=dtype,
-            token=hf_token_to_pass,
+            IMAGE_MODEL_ID, torch_dtype=dtype, token=hf_token_to_pass
         )
     if DEVICE == "cuda":
         try:
@@ -338,10 +360,10 @@ def generate_character_image(prompt: str, output_path: str, width=1280, height=7
         image.save(output_path)
         del pipe
         clear_memory()
-        print(f"   ✅ Đã tạo: {output_path}")
+        print(f"   ✅ {output_path}")
         return True
     except Exception as e:
-        print(f"   ❌ Lỗi tạo ảnh nhân vật: {e}")
+        print(f"   ❌ Lỗi: {e}")
         clear_memory()
         return False
 
@@ -372,10 +394,10 @@ def generate_scene_image(prompt: str, output_path: str, ref_image_path: str = No
         image.save(output_path)
         del pipe
         clear_memory()
-        print(f"   ✅ Đã tạo: {output_path}")
+        print(f"   ✅ {output_path}")
         return True
     except Exception as e:
-        print(f"   ❌ Lỗi tạo ảnh cảnh: {e}")
+        print(f"   ❌ Lỗi: {e}")
         clear_memory()
         return False
 
@@ -387,14 +409,13 @@ async def process_video_pipeline():
     character_images = {}
     scene_image_paths = {}
 
-    # ========== 0. ĐỌC GOOGLE SHEET BẰNG CSV ==========
-    print("\n📊 Đọc Google Sheet bằng CSV...")
+    print("\n📊 Đọc Google Sheet...")
     df_scenes = get_sheet_csv(GID_SCENES)
     df_chars  = get_sheet_csv(GID_CHARACTERS)
 
     if df_scenes.empty:
-        send_n8n_webhook("failed", error_message="Không đọc được sheet Scenes")
-        sys.exit(1)
+        send_n8n_webhook("failed", error_message="Không đọc được Scenes")
+        return
 
     total_scenes = len(df_scenes)
     print(f"✅ Scenes: {total_scenes} cảnh")
@@ -404,9 +425,8 @@ async def process_video_pipeline():
         print(f"✅ Characters: {len(df_chars)} nhân vật")
         print(f"   Cột: {df_chars.columns.tolist()}")
     else:
-        print("⚠️ Không đọc được Characters (kiểm tra GID_CHARACTERS)")
+        print("⚠️ Không đọc được Characters")
 
-    # Lấy thông tin project
     project_info = {}
     if not df_scenes.empty:
         first = df_scenes.iloc[0]
@@ -415,17 +435,16 @@ async def process_video_pipeline():
             if val:
                 project_info[key] = val
 
-    # ========== 1. LẤY DANH SÁCH FILE TRÊN DRIVE ==========
-    print("\n📥 [1] Lấy danh sách file trên Drive...")
-    try:
+    # ========== 1. DRIVE (nếu có) ==========
+    drive_files = []
+    if USE_DRIVE:
+        print("\n📥 [1] Lấy danh sách file trên Drive...")
         drive_files = list_files_in_folder(DRIVE_FOLDER_ID)
         print(f"✅ {len(drive_files)} file trên Drive")
-    except Exception as e:
-        print(f"❌ Lỗi list Drive: {e}")
-        send_n8n_webhook("failed", error_message=str(e))
-        sys.exit(1)
+    else:
+        print("\n⚠️ [1] Chạy LOCAL (không dùng Drive)")
 
-    # ========== 2. TẠO / TẢI ẢNH NHÂN VẬT ==========
+    # ========== 2. ẢNH NHÂN VẬT ==========
     print("\n🧑‍🎨 [2] Xử lý ảnh nhân vật...")
     if not df_chars.empty:
         for idx, row in df_chars.iterrows():
@@ -438,62 +457,51 @@ async def process_video_pipeline():
             local_path = f"char_{char_id}_{RUN_DATE}.png"
             name_key = char_name.lower().strip()
 
-            # Đã có local?
-            existing_local = list(Path(".").glob(f"char_{char_id}_*.png")) + list(Path(".").glob(f"*{file_name}"))
+            existing_local = list(Path(".").glob(f"char_{char_id}_*.png"))
             if existing_local:
                 character_images[name_key] = str(existing_local[0])
-                print(f"⏩ {char_name}: dùng ảnh local")
+                print(f"⏩ {char_name}: local")
                 continue
 
-            # Tìm trên Drive
             found = find_file_in_drive(drive_files, [char_id, file_name.replace(".png", ""), char_name.lower().replace(" ", "_")])
             if found:
                 download_drive_file(found["id"], local_path)
                 character_images[name_key] = local_path
-                print(f"✅ {char_name}: tải từ Drive")
+                print(f"✅ {char_name}: từ Drive")
                 continue
 
-            # Chưa có → tạo mới
             if not image_prompt:
                 image_prompt = f"full body character reference sheet of {design}, 3d chinese donghua style, unreal engine 5, highly detailed"
 
-            success = generate_character_image(image_prompt, local_path)
-            if success:
+            if generate_character_image(image_prompt, local_path):
                 upload_file_to_drive(local_path, DRIVE_FOLDER_ID)
                 character_images[name_key] = local_path
             else:
-                print(f"⚠️ {char_name}: tạo ảnh thất bại")
-    else:
-        print("⚠️ Bỏ qua bước tạo ảnh nhân vật")
+                print(f"⚠️ {char_name}: tạo thất bại")
+    print(f"✅ Có {len(character_images)} ảnh nhân vật")
 
-    print(f"✅ Có {len(character_images)} ảnh nhân vật sẵn sàng")
-
-    # ========== 3. TẠO / TẢI ẢNH CẢNH ==========
+    # ========== 3. ẢNH CẢNH ==========
     print("\n🖼️  [3] Xử lý ảnh cảnh...")
     for index, row in df_scenes.iterrows():
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
         local_img = f"image_{scene_index:03d}_{RUN_DATE}.png"
 
-        # Đã có local?
         existing = list(Path(".").glob(f"image_{scene_index:03d}_*.png"))
         if existing:
             scene_image_paths[scene_index] = str(existing[0])
-            print(f"⏩ Cảnh {scene_index}: ảnh local đã có")
+            print(f"⏩ Cảnh {scene_index}: local")
             continue
 
-        # Tìm trên Drive
-        found = find_file_in_drive(drive_files, [f"scene_{scene_index:03d}", f"image_{scene_index:03d}", f"scene_{scene_index}"])
+        found = find_file_in_drive(drive_files, [f"scene_{scene_index:03d}", f"image_{scene_index:03d}"])
         if found:
             download_drive_file(found["id"], local_img)
             scene_image_paths[scene_index] = local_img
-            print(f"✅ Cảnh {scene_index}: tải từ Drive")
+            print(f"✅ Cảnh {scene_index}: từ Drive")
             continue
 
-        # Chưa có → tạo mới
         image_prompt = safe_get(row, "image_prompt", "scene_description", "prompt")
         char_name_raw = safe_get(row, "character_name")
 
-        # Tìm ảnh nhân vật reference
         ref_path = None
         if char_name_raw:
             for name in char_name_raw.split(","):
@@ -511,20 +519,15 @@ async def process_video_pipeline():
         if not image_prompt:
             image_prompt = "3d chinese donghua style scene, unreal engine 5, cinematic lighting"
 
-        success = generate_scene_image(
-            prompt=image_prompt,
-            output_path=local_img,
-            ref_image_path=ref_path,
-        )
-        if success:
+        if generate_scene_image(image_prompt, local_img, ref_path):
             upload_file_to_drive(local_img, DRIVE_FOLDER_ID)
             scene_image_paths[scene_index] = local_img
         else:
-            print(f"⚠️ Cảnh {scene_index}: tạo ảnh thất bại")
+            print(f"⚠️ Cảnh {scene_index}: tạo thất bại")
 
-    print(f"✅ Có {len(scene_image_paths)} ảnh cảnh sẵn sàng")
+    print(f"✅ Có {len(scene_image_paths)} ảnh cảnh")
 
-    # ========== 4. TẠO BGM ==========
+    # ========== 4. BGM ==========
     bgm_desc = project_info.get("bgm_prompt") or f"{project_info.get('genre', 'dramatic')} cinematic background music"
     generate_ai_bgm(bgm_desc, duration_sec=total_scenes * 5, output_path=BGM_FILE)
 
@@ -539,10 +542,8 @@ async def process_video_pipeline():
         try:
             from diffusers.hooks import apply_group_offloading
             ltx_pipe = apply_group_offloading(ltx_pipe, offload_type="block_level")
-            print("✅ apply_group_offloading")
         except Exception:
             ltx_pipe.enable_model_cpu_offload()
-            print("✅ enable_model_cpu_offload")
         try:
             ltx_pipe.vae.enable_tiling()
         except Exception:
@@ -551,9 +552,9 @@ async def process_video_pipeline():
     except Exception as e:
         print(f"❌ Load LTX lỗi: {e}")
         send_n8n_webhook("failed", error_message=str(e))
-        sys.exit(1)
+        return
 
-    # ========== 6. TẠO VIDEO TỪNG CẢNH ==========
+    # ========== 6. TẠO VIDEO ==========
     for index, row in df_scenes.iterrows():
         scene_start = time.time()
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
@@ -580,9 +581,8 @@ async def process_video_pipeline():
         audio_tts_file = f"tts_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         audio_sfx_file = f"sfx_scene_{scene_index:03d}_{RUN_DATE}.wav"
 
-        print(f"\n🎬 [{scene_index}/{total_scenes}] LTX | {char_name[:40]}")
+        print(f"\n🎬 [{scene_index}/{total_scenes}] {char_name[:40]}")
 
-        # --- LTX ---
         try:
             clear_memory()
             image_input = load_image(image_file).resize((640, 360))
@@ -590,8 +590,7 @@ async def process_video_pipeline():
                 image=image_input,
                 prompt=vid_prompt,
                 negative_prompt=neg_prompt if neg_prompt else None,
-                width=640,
-                height=360,
+                width=640, height=360,
                 num_frames=25,
                 num_inference_steps=20,
                 generator=torch.Generator("cpu").manual_seed(42 + scene_index),
@@ -599,29 +598,26 @@ async def process_video_pipeline():
             export_to_video(video_frames, raw_video_file, fps=16)
             del video_frames
             clear_memory()
-            print(f"   ✅ Video thô xong")
+            print("   ✅ Video thô")
         except Exception as e:
-            print(f"❌ Lỗi LTX cảnh {scene_index}: {e}")
+            print(f"❌ LTX lỗi: {e}")
             clear_memory()
             continue
 
-        # --- TTS ---
         a_dur = 2.0
         has_tts = False
         if dialogue_text:
             voice = pick_voice(char_name)
-            print(f"🎙️ TTS [{char_name}] ({voice}): {dialogue_text[:50]}...")
+            print(f"🎙️ TTS: {dialogue_text[:40]}...")
             communicate = edge_tts.Communicate(text=dialogue_text, voice=voice)
             await communicate.save(audio_tts_file)
             a_dur = get_media_duration(audio_tts_file)
             has_tts = True
 
-        # --- SFX ---
         has_sfx = False
         if sfx_prompt and sfx_prompt.lower() not in ["none", "nan", ""]:
             has_sfx = generate_ai_sfx(sfx_prompt, duration_sec=a_dur, output_path=audio_sfx_file)
 
-        # --- Mix ---
         v_dur = get_media_duration(raw_video_file)
         pad_dur = max(0.0, a_dur - v_dur) if has_tts else 0.0
 
@@ -640,10 +636,8 @@ async def process_video_pipeline():
             map_a = "[a]"
         elif has_tts:
             inputs.append(f'-i "{audio_tts_file}"')
-            map_a = "1:a:0"
         elif has_sfx:
             inputs.append(f'-i "{audio_sfx_file}"')
-            map_a = "1:a:0"
         else:
             inputs.append('-f lavfi -i anullsrc=r=44100:cl=stereo')
 
@@ -657,10 +651,8 @@ async def process_video_pipeline():
 
         for f in [raw_video_file, audio_tts_file, audio_sfx_file]:
             if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
+                try: os.remove(f)
+                except: pass
 
         if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 15000:
             upload_file_to_drive(final_scene_file, DRIVE_FOLDER_ID)
@@ -676,7 +668,7 @@ async def process_video_pipeline():
     print("\n🎞️ [7] Gộp video...")
     if not rendered_files:
         send_n8n_webhook("failed", error_message="Không render được cảnh nào", extra=project_info)
-        sys.exit(1)
+        return
 
     rendered_files = sorted(rendered_files)
     with open("file_list.txt", "w", encoding="utf-8") as f:
@@ -702,7 +694,7 @@ async def process_video_pipeline():
     else:
         final_output = concat_output
 
-    print(f"\n☁️ Upload phim: {final_output}")
+    print(f"\n☁️ Upload phim cuối: {final_output}")
     drive_file_id = upload_file_to_drive(final_output, DRIVE_FOLDER_ID)
 
     send_n8n_webhook(
@@ -712,10 +704,10 @@ async def process_video_pipeline():
         drive_file_id=drive_file_id,
         extra=project_info,
     )
-    print("\n🎉 HOÀN TẤT PIPELINE!")
+    print("\n🎉 HOÀN TẤT!")
 
 # -------------------------------------------------------------------
-# 8. RUN
+# RUN
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     try:
