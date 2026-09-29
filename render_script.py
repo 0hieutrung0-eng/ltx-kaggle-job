@@ -428,10 +428,10 @@ async def process_video_pipeline():
                 image=image_input,
                 prompt=motion_prompt,
                 negative_prompt=neg_prompt if neg_prompt and neg_prompt.lower() not in ["nan", "none"] else None,
-                width=512,
-                height=288,
-                num_frames=20,
-                num_inference_steps=15,
+                width=640,
+                height=360,
+                num_frames=25,
+                num_inference_steps=20,
                 generator=torch.Generator("cpu").manual_seed(42 + scene_index),
             ).frames[0]
 
