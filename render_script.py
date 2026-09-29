@@ -1,9 +1,7 @@
 # ============================================================
 # PIPELINE KAGGLE - TẠO ẢNH NHÂN VẬT → ẢNH CẢNH → VIDEO
-# Đọc Characters + Scenes từ Google Sheet
-# 1. Tạo ảnh nhân vật (reference)
-# 2. Tạo ảnh cảnh (dùng ảnh nhân vật làm reference)
-# 3. LTX → TTS → SFX → BGM → Gộp video
+# Đọc Characters + Scenes bằng CSV công khai
+# OAuth chỉ dùng để lưu ảnh/video lên Drive
 # ============================================================
 import asyncio
 import gc
@@ -82,7 +80,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from huggingface_hub import login
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 LTX + TTS + BGM PIPELINE (có tạo ảnh nhân vật + cảnh) - [{RUN_DATE}]")
+print(f"🚀 LTX + TTS + BGM PIPELINE (tạo ảnh nhân vật + cảnh) - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -94,9 +92,10 @@ N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-don
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# Tên sheet trong Google Spreadsheet
-CHARACTERS_SHEET = "Characters"
-SCENES_SHEET = "Scenes"
+# ====================== CẤU HÌNH GID ======================
+GID_SCENES = "0"              # Tab Scenes (thường là 0)
+GID_CHARACTERS = "1382939846"          # <-- THAY BẰNG GID CỦA TAB CHARACTERS
+# ==========================================================
 
 TOKEN_PART1 = os.environ.get("HF_TOKEN_PART1", "")
 TOKEN_PART2 = os.environ.get("HF_TOKEN_PART2", "")
@@ -121,23 +120,21 @@ VOICE_MAP = {
 }
 BGM_FILE = f"bgm_generated_{RUN_DATE}.mp3"
 
-# Model tạo ảnh (nhẹ + nhanh trên Kaggle)
-IMAGE_MODEL_ID = "black-forest-labs/FLUX.1-schnell"   # hoặc "stabilityai/sdxl-turbo"
+# Model tạo ảnh (nhanh + nhẹ)
+IMAGE_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 
 # -------------------------------------------------------------------
 # 3. HELPERS
 # -------------------------------------------------------------------
 def get_oauth_credentials():
+    """Chỉ dùng cho Drive (upload/download)"""
     return Credentials(
         token=None,
         refresh_token=OAUTH_REFRESH_TOKEN,
         token_uri=TOKEN_URI,
         client_id=OAUTH_CLIENT_ID,
         client_secret=OAUTH_CLIENT_SECRET,
-        scopes=[
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-        ],
+        scopes=["https://www.googleapis.com/auth/drive"],
     )
 
 def clear_memory():
@@ -243,29 +240,16 @@ def safe_get(row, *keys, default=""):
             return str(val).strip()
     return default
 
-def get_sheet_as_df(sheet_name: str) -> pd.DataFrame:
-    """Đọc một sheet cụ thể từ Google Spreadsheet"""
+def get_sheet_csv(gid: str) -> pd.DataFrame:
+    """Đọc sheet bằng CSV công khai - không cần OAuth"""
+    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
     try:
-        creds = get_oauth_credentials()
-        service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID,
-            range=f"{sheet_name}!A:Z"
-        ).execute()
-        values = result.get("values", [])
-        if not values:
-            print(f"⚠️ Sheet '{sheet_name}' trống")
-            return pd.DataFrame()
-        header = [str(h).strip().lower() for h in values[0]]
-        data = values[1:]
-        # Đồng bộ số cột
-        max_cols = len(header)
-        data = [row + [""] * (max_cols - len(row)) for row in data]
-        df = pd.DataFrame(data, columns=header)
-        print(f"✅ Đọc sheet '{sheet_name}': {len(df)} dòng | Cột: {df.columns.tolist()}")
+        df = pd.read_csv(url)
+        df.columns = df.columns.str.strip().str.lower()
+        df = df.dropna(how="all")
         return df
     except Exception as e:
-        print(f"❌ Lỗi đọc sheet '{sheet_name}': {e}")
+        print(f"❌ Lỗi đọc CSV (gid={gid}): {e}")
         return pd.DataFrame()
 
 # -------------------------------------------------------------------
@@ -315,10 +299,9 @@ def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
         return False
 
 # -------------------------------------------------------------------
-# 3.2 TẠO ẢNH (NHÂN VẬT + CẢNH)
+# 3.2 TẠO ẢNH
 # -------------------------------------------------------------------
 def load_image_pipeline(task="text2img"):
-    """Load pipeline tạo ảnh, tự offload để tiết kiệm VRAM"""
     clear_memory()
     dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
     if task == "text2img":
@@ -338,11 +321,9 @@ def load_image_pipeline(task="text2img"):
             pipe.enable_model_cpu_offload()
         except Exception:
             pipe = pipe.to(DEVICE)
-    print(f"✅ Loaded image pipeline ({task})")
     return pipe
 
 def generate_character_image(prompt: str, output_path: str, width=1280, height=720):
-    """Tạo ảnh nhân vật (4-view hoặc full body)"""
     print(f"🎨 [Character] {os.path.basename(output_path)}")
     try:
         pipe = load_image_pipeline("text2img")
@@ -365,23 +346,20 @@ def generate_character_image(prompt: str, output_path: str, width=1280, height=7
         return False
 
 def generate_scene_image(prompt: str, output_path: str, ref_image_path: str = None, width=1280, height=720):
-    """Tạo ảnh cảnh. Nếu có ref_image_path (1 nhân vật) thì dùng img2img để giữ consistency"""
     print(f"🖼️  [Scene] {os.path.basename(output_path)}")
     try:
         if ref_image_path and os.path.exists(ref_image_path):
-            # img2img với ảnh nhân vật làm reference
             pipe = load_image_pipeline("img2img")
             init_image = load_image(ref_image_path).resize((width, height))
             image = pipe(
                 prompt=prompt,
                 image=init_image,
-                strength=0.65,          # giữ khuôn mặt + trang phục
+                strength=0.65,
                 num_inference_steps=4 if "schnell" in IMAGE_MODEL_ID else 20,
                 guidance_scale=0.0 if "schnell" in IMAGE_MODEL_ID else 7.5,
                 generator=torch.Generator("cpu").manual_seed(42),
             ).images[0]
         else:
-            # text2img thuần
             pipe = load_image_pipeline("text2img")
             image = pipe(
                 prompt=prompt,
@@ -406,22 +384,29 @@ def generate_scene_image(prompt: str, output_path: str, ref_image_path: str = No
 # -------------------------------------------------------------------
 async def process_video_pipeline():
     rendered_files = []
-    character_images = {}   # {character_name_lower: local_path}
+    character_images = {}
     scene_image_paths = {}
 
-    # ========== 0. ĐỌC GOOGLE SHEET ==========
-    print("\n📊 Đọc Google Sheet...")
-    df_chars = get_sheet_as_df(CHARACTERS_SHEET)
-    df_scenes = get_sheet_as_df(SCENES_SHEET)
+    # ========== 0. ĐỌC GOOGLE SHEET BẰNG CSV ==========
+    print("\n📊 Đọc Google Sheet bằng CSV...")
+    df_scenes = get_sheet_csv(GID_SCENES)
+    df_chars  = get_sheet_csv(GID_CHARACTERS)
 
     if df_scenes.empty:
-        send_n8n_webhook("failed", error_message="Sheet Scenes trống hoặc không đọc được")
+        send_n8n_webhook("failed", error_message="Không đọc được sheet Scenes")
         sys.exit(1)
 
     total_scenes = len(df_scenes)
-    print(f"✅ {total_scenes} cảnh cần xử lý")
+    print(f"✅ Scenes: {total_scenes} cảnh")
+    print(f"   Cột: {df_scenes.columns.tolist()}")
 
-    # Lấy thông tin project (nếu có)
+    if not df_chars.empty:
+        print(f"✅ Characters: {len(df_chars)} nhân vật")
+        print(f"   Cột: {df_chars.columns.tolist()}")
+    else:
+        print("⚠️ Không đọc được Characters (kiểm tra GID_CHARACTERS)")
+
+    # Lấy thông tin project
     project_info = {}
     if not df_scenes.empty:
         first = df_scenes.iloc[0]
@@ -430,7 +415,7 @@ async def process_video_pipeline():
             if val:
                 project_info[key] = val
 
-    # ========== 1. TẢI DANH SÁCH FILE TRÊN DRIVE ==========
+    # ========== 1. LẤY DANH SÁCH FILE TRÊN DRIVE ==========
     print("\n📥 [1] Lấy danh sách file trên Drive...")
     try:
         drive_files = list_files_in_folder(DRIVE_FOLDER_ID)
@@ -479,7 +464,7 @@ async def process_video_pipeline():
             else:
                 print(f"⚠️ {char_name}: tạo ảnh thất bại")
     else:
-        print("⚠️ Không có dữ liệu Characters → bỏ qua bước tạo ảnh nhân vật")
+        print("⚠️ Bỏ qua bước tạo ảnh nhân vật")
 
     print(f"✅ Có {len(character_images)} ảnh nhân vật sẵn sàng")
 
@@ -507,9 +492,8 @@ async def process_video_pipeline():
         # Chưa có → tạo mới
         image_prompt = safe_get(row, "image_prompt", "scene_description", "prompt")
         char_name_raw = safe_get(row, "character_name")
-        neg_prompt = safe_get(row, "negative_prompt")
 
-        # Tìm ảnh nhân vật reference (ưu tiên nhân vật đầu tiên)
+        # Tìm ảnh nhân vật reference
         ref_path = None
         if char_name_raw:
             for name in char_name_raw.split(","):
@@ -517,7 +501,6 @@ async def process_video_pipeline():
                 if key in character_images:
                     ref_path = character_images[key]
                     break
-                # fuzzy
                 for ck, cp in character_images.items():
                     if key in ck or ck in key:
                         ref_path = cp
@@ -537,7 +520,7 @@ async def process_video_pipeline():
             upload_file_to_drive(local_img, DRIVE_FOLDER_ID)
             scene_image_paths[scene_index] = local_img
         else:
-            print(f"⚠️ Cảnh {scene_index}: tạo ảnh thất bại → bỏ qua video")
+            print(f"⚠️ Cảnh {scene_index}: tạo ảnh thất bại")
 
     print(f"✅ Có {len(scene_image_paths)} ảnh cảnh sẵn sàng")
 
@@ -562,7 +545,6 @@ async def process_video_pipeline():
             print("✅ enable_model_cpu_offload")
         try:
             ltx_pipe.vae.enable_tiling()
-            print("✅ vae.enable_tiling()")
         except Exception:
             pass
         print("✅ LTX ready")
