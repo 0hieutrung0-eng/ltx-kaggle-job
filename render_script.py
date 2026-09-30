@@ -120,9 +120,9 @@ if not hf_token_to_pass:
     print("\n🛑 DỪNG vì thiếu HF Token")
     raise SystemExit("Missing Hugging Face token")
 
-OAUTH_CLIENT_ID     = os.environ.get("OAUTH_CLIENT_ID", "").strip()
-OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
-OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "").strip()
+OAUTH_CLIENT_ID     = "948179937421-o55enfl61lb8ou0ms2jmrr4dlf1fhgip.apps.googleusercontent.com"
+OAUTH_CLIENT_SECRET = "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"
+OAUTH_REFRESH_TOKEN = "1//06GnOlI9wdLJ-CgYIARAAGAYSNwF-L9Ir5sxbZNKU6xqWnjWPP2jFwNaI8UnENzUrHgdc52RO-QIDl3NG8RQA6J_fzGe-vAR3zgA"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 print("\n🔐 Kiểm tra OAuth secrets:")
