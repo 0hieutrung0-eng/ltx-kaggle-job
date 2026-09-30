@@ -1,7 +1,7 @@
 # ============================================================
 # PIPELINE KAGGLE
 # - Đọc dữ liệu từ Google Sheet
-# - Ảnh nhân vật: chỉ lấy từ Google Drive
+# - Ảnh nhân vật: tải từ image_url trong Sheet
 # - Tạo ảnh cảnh → upload Drive
 # - Tạo video + TTS + SFX + BGM
 # ============================================================
@@ -333,7 +333,7 @@ def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
         return False
 
 # -------------------------------------------------------------------
-# 3.2 TẠO ẢNH CẢNH (chỉ tạo scene, không tạo character)
+# 3.2 TẠO ẢNH CẢNH
 # -------------------------------------------------------------------
 def load_image_pipeline(task="text2img"):
     clear_memory()
@@ -427,34 +427,45 @@ async def process_video_pipeline():
     else:
         print("\n⚠️ [1] Chạy LOCAL (không dùng Drive)")
 
-    # ========== 2. ẢNH NHÂN VẬT - CHỈ LẤY TỪ DRIVE ==========
-    print("\n🧑‍🎨 [2] Lấy ảnh nhân vật từ Drive...")
+    # ========== 2. ẢNH NHÂN VẬT - TẢI TỪ image_url TRONG SHEET ==========
+    print("\n🧑‍🎨 [2] Tải ảnh nhân vật từ URL trong Google Sheet...")
     if not df_chars.empty:
         for idx, row in df_chars.iterrows():
             char_id = safe_get(row, "character_id", default=f"char_{idx+1:02d}")
             char_name = safe_get(row, "character_name", default=f"Character_{idx+1}")
-            local_path = f"char_{char_id}_{RUN_DATE}.png"
+            image_url = safe_get(row, "image_url")
+            file_name = safe_get(row, "file_name", default=f"char_{char_id}.png")
+
+            if not file_name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                file_name = file_name + ".png"
+            local_path = file_name
             name_key = char_name.lower().strip()
 
-            # Tìm trên Drive
-            found = find_file_in_drive(
-                drive_files,
-                keywords=[char_id, char_name, f"char_{char_id}", f"character_{char_id}"],
-                extensions=(".png", ".jpg", ".jpeg", ".webp")
-            )
-            if found:
-                download_drive_file(found["id"], local_path)
-                if os.path.exists(local_path):
+            if not image_url:
+                print(f"⚠️ {char_name}: không có image_url → bỏ qua")
+                continue
+
+            if os.path.exists(local_path):
+                character_images[name_key] = local_path
+                print(f"⏩ {char_name}: đã có local → {local_path}")
+                continue
+
+            try:
+                print(f"⬇️  {char_name}: đang tải từ URL...")
+                resp = requests.get(image_url, timeout=60)
+                if resp.status_code == 200:
+                    with open(local_path, "wb") as f:
+                        f.write(resp.content)
                     character_images[name_key] = local_path
-                    print(f"✅ {char_name}: lấy từ Drive → {found['name']}")
+                    print(f"✅ {char_name}: tải thành công → {local_path}")
                 else:
-                    print(f"⚠️ {char_name}: download thất bại")
-            else:
-                print(f"⚠️ {char_name}: không tìm thấy ảnh trên Drive")
+                    print(f"⚠️ {char_name}: tải lỗi HTTP {resp.status_code}")
+            except Exception as e:
+                print(f"⚠️ {char_name}: lỗi tải → {e}")
     else:
         print("⚠️ Không có dữ liệu Characters")
 
-    print(f"✅ Có {len(character_images)} ảnh nhân vật từ Drive")
+    print(f"✅ Có {len(character_images)} ảnh nhân vật")
 
     # ========== 3. TẠO ẢNH CẢNH + UPLOAD DRIVE ==========
     print("\n🖼️  [3] Tạo ảnh cảnh...")
@@ -462,14 +473,12 @@ async def process_video_pipeline():
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
         local_img = f"image_{scene_index:03d}_{RUN_DATE}.png"
 
-        # Đã có local?
         existing = list(Path(".").glob(f"image_{scene_index:03d}_*.png"))
         if existing:
             scene_image_paths[scene_index] = str(existing[0])
             print(f"⏩ Cảnh {scene_index}: local")
             continue
 
-        # Đã có trên Drive?
         found = find_file_in_drive(drive_files, [f"scene_{scene_index:03d}", f"image_{scene_index:03d}"])
         if found:
             download_drive_file(found["id"], local_img)
@@ -477,7 +486,6 @@ async def process_video_pipeline():
             print(f"✅ Cảnh {scene_index}: từ Drive")
             continue
 
-        # Tạo mới
         image_prompt = safe_get(row, "image_prompt", "scene_description", "prompt")
         char_name_raw = safe_get(row, "character_name")
         ref_path = None
