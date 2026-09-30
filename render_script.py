@@ -1,7 +1,7 @@
 # ============================================================
 # PIPELINE KAGGLE - TẠO ẢNH NHÂN VẬT → ẢNH CẢNH → VIDEO
-# Đọc Characters + Scenes bằng CSV
-# OAuth chỉ dùng khi có đủ token, không có thì chạy local
+# - HF_TOKEN hardcode
+# - Characters không có URL → luôn tạo ảnh mới + upload Drive
 # ============================================================
 import asyncio
 import gc
@@ -84,6 +84,7 @@ print(f"🚀 PIPELINE (tạo ảnh nhân vật + cảnh + video) - [{RUN_DATE}]"
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🖥️  Device: {DEVICE}")
 
 # -------------------------------------------------------------------
 # 2. CONFIG
@@ -94,27 +95,36 @@ DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
 # ====================== GID ======================
 GID_SCENES = "0"
-GID_CHARACTERS = "0"          # <-- nhớ thay bằng gid thật của tab Characters nếu khác
+# ⚠️ PHẢI ĐỔI thành GID thật của tab Characters
+# Cách lấy: Mở sheet → click tab Characters → nhìn URL ...gid=XXXXXX
+GID_CHARACTERS = "1382939846"          # <-- THAY BẰNG GID THẬT
 # =================================================
 
-TOKEN_PART1 = os.environ.get("HF_TOKEN_PART1", "")
-TOKEN_PART2 = os.environ.get("HF_TOKEN_PART2", "")
-COMBINED_HF_TOKEN = f"{TOKEN_PART1.strip()}{TOKEN_PART2.strip()}".strip()
+# ----- HF TOKEN (hardcode theo yêu cầu) -----
+HF1="hf_GJeIMPtqGWNZJInJn"
+HF2="TCVlxljdWnUzudVQH"
+HF_TOKEN = HF1+HF2
+
 hf_token_to_pass = None
-if COMBINED_HF_TOKEN.startswith("hf_"):
+if HF_TOKEN.startswith("hf_"):
     try:
-        login(token=COMBINED_HF_TOKEN)
-        hf_token_to_pass = COMBINED_HF_TOKEN
+        login(token=HF_TOKEN)
+        hf_token_to_pass = HF_TOKEN
         print("🔑 HF login OK")
     except Exception as e:
         print(f"⚠️ HF login fail: {e}")
+else:
+    print("❌ HF_TOKEN không hợp lệ")
+
+if not hf_token_to_pass:
+    print("\n🛑 DỪNG vì thiếu HF Token")
+    raise SystemExit("Missing Hugging Face token")
 
 OAUTH_CLIENT_ID     = os.environ.get("OAUTH_CLIENT_ID", "").strip()
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
 OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "").strip()
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
-# Kiểm tra secret ngay từ đầu
 print("\n🔐 Kiểm tra OAuth secrets:")
 print(f"   OAUTH_CLIENT_ID     : {'✅ có' if OAUTH_CLIENT_ID else '❌ thiếu'}")
 print(f"   OAUTH_CLIENT_SECRET : {'✅ có' if OAUTH_CLIENT_SECRET else '❌ thiếu'}")
@@ -330,14 +340,11 @@ def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
 def load_image_pipeline(task="text2img"):
     clear_memory()
     dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+    kwargs = {"torch_dtype": dtype, "token": hf_token_to_pass}
     if task == "text2img":
-        pipe = AutoPipelineForText2Image.from_pretrained(
-            IMAGE_MODEL_ID, torch_dtype=dtype, token=hf_token_to_pass
-        )
+        pipe = AutoPipelineForText2Image.from_pretrained(IMAGE_MODEL_ID, **kwargs)
     else:
-        pipe = AutoPipelineForImage2Image.from_pretrained(
-            IMAGE_MODEL_ID, torch_dtype=dtype, token=hf_token_to_pass
-        )
+        pipe = AutoPipelineForImage2Image.from_pretrained(IMAGE_MODEL_ID, **kwargs)
     if DEVICE == "cuda":
         try:
             pipe.enable_model_cpu_offload()
@@ -424,8 +431,10 @@ async def process_video_pipeline():
     if not df_chars.empty:
         print(f"✅ Characters: {len(df_chars)} nhân vật")
         print(f"   Cột: {df_chars.columns.tolist()}")
+        if "scene_index" in df_chars.columns and "dialogue" in df_chars.columns:
+            print("⚠️ CẢNH BÁO: Tab Characters đang có cột giống Scenes → GID_CHARACTERS có thể SAI!")
     else:
-        print("⚠️ Không đọc được Characters")
+        print("⚠️ Không đọc được Characters (kiểm tra GID_CHARACTERS)")
 
     project_info = {}
     if not df_scenes.empty:
@@ -435,7 +444,7 @@ async def process_video_pipeline():
             if val:
                 project_info[key] = val
 
-    # ========== 1. DRIVE (nếu có) ==========
+    # ========== 1. DRIVE ==========
     drive_files = []
     if USE_DRIVE:
         print("\n📥 [1] Lấy danh sách file trên Drive...")
@@ -444,40 +453,28 @@ async def process_video_pipeline():
     else:
         print("\n⚠️ [1] Chạy LOCAL (không dùng Drive)")
 
-    # ========== 2. ẢNH NHÂN VẬT ==========
-    print("\n🧑‍🎨 [2] Xử lý ảnh nhân vật...")
+    # ========== 2. ẢNH NHÂN VẬT (LUÔN TẠO MỚI - không dùng URL / file cũ) ==========
+    print("\n🧑‍🎨 [2] Xử lý ảnh nhân vật (luôn tạo mới)...")
     if not df_chars.empty:
         for idx, row in df_chars.iterrows():
             char_id = safe_get(row, "character_id", default=f"char_{idx+1:02d}")
             char_name = safe_get(row, "character_name", default=f"Character_{idx+1}")
-            design = safe_get(row, "design_detail", "appearance", "design")
-            image_prompt = safe_get(row, "image_prompt", "design_detail")
-            file_name = safe_get(row, "file_name", default=f"character_{idx+1:02d}_{char_name.lower().replace(' ', '_')}.png")
-
+            design = safe_get(row, "design_detail", "appearance", "design", "image_prompt")
+            image_prompt = safe_get(row, "image_prompt", "design_detail", "appearance", "design")
             local_path = f"char_{char_id}_{RUN_DATE}.png"
             name_key = char_name.lower().strip()
 
-            existing_local = list(Path(".").glob(f"char_{char_id}_*.png"))
-            if existing_local:
-                character_images[name_key] = str(existing_local[0])
-                print(f"⏩ {char_name}: local")
-                continue
-
-            found = find_file_in_drive(drive_files, [char_id, file_name.replace(".png", ""), char_name.lower().replace(" ", "_")])
-            if found:
-                download_drive_file(found["id"], local_path)
-                character_images[name_key] = local_path
-                print(f"✅ {char_name}: từ Drive")
-                continue
-
+            # Bỏ qua kiểm tra local + Drive → luôn tạo mới theo yêu cầu
             if not image_prompt:
-                image_prompt = f"full body character reference sheet of {design}, 3d chinese donghua style, unreal engine 5, highly detailed"
+                image_prompt = f"full body character reference sheet of {design or char_name}, 3d chinese donghua style, unreal engine 5, highly detailed, clean white background"
 
             if generate_character_image(image_prompt, local_path):
                 upload_file_to_drive(local_path, DRIVE_FOLDER_ID)
                 character_images[name_key] = local_path
+                print(f"✅ {char_name}: đã tạo + upload")
             else:
                 print(f"⚠️ {char_name}: tạo thất bại")
+
     print(f"✅ Có {len(character_images)} ảnh nhân vật")
 
     # ========== 3. ẢNH CẢNH ==========
@@ -501,7 +498,6 @@ async def process_video_pipeline():
 
         image_prompt = safe_get(row, "image_prompt", "scene_description", "prompt")
         char_name_raw = safe_get(row, "character_name")
-
         ref_path = None
         if char_name_raw:
             for name in char_name_raw.split(","):
@@ -559,7 +555,6 @@ async def process_video_pipeline():
         scene_start = time.time()
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
         image_file = scene_image_paths.get(scene_index)
-
         if not image_file or not os.path.exists(image_file):
             print(f"⚠️ Cảnh {scene_index}: thiếu ảnh → bỏ qua")
             continue
@@ -581,7 +576,7 @@ async def process_video_pipeline():
         audio_tts_file = f"tts_scene_{scene_index:03d}_{RUN_DATE}.mp3"
         audio_sfx_file = f"sfx_scene_{scene_index:03d}_{RUN_DATE}.wav"
 
-        print(f"\n🎬 [{scene_index}/{total_scenes}] {char_name[:40]}")
+        print(f"\n🎬 [{scene_index}/{total_scenes}] {char_name[:40] if char_name else ''}")
 
         try:
             clear_memory()
