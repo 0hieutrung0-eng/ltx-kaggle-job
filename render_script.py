@@ -1,7 +1,9 @@
 # ============================================================
-# PIPELINE KAGGLE - TẠO ẢNH NHÂN VẬT → ẢNH CẢNH → VIDEO
-# - HF_TOKEN hardcode
-# - Characters không có URL → luôn tạo ảnh mới + upload Drive
+# PIPELINE KAGGLE
+# - Đọc dữ liệu từ Google Sheet
+# - Ảnh nhân vật: chỉ lấy từ Google Drive
+# - Tạo ảnh cảnh → upload Drive
+# - Tạo video + TTS + SFX + BGM
 # ============================================================
 import asyncio
 import gc
@@ -80,7 +82,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from huggingface_hub import login
 
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
-print(f"🚀 PIPELINE (tạo ảnh nhân vật + cảnh + video) - [{RUN_DATE}]")
+print(f"🚀 PIPELINE - [{RUN_DATE}]")
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -93,17 +95,13 @@ N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-don
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
 DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 
-# ====================== GID ======================
 GID_SCENES = "0"
-# ⚠️ PHẢI ĐỔI thành GID thật của tab Characters
-# Cách lấy: Mở sheet → click tab Characters → nhìn URL ...gid=XXXXXX
-GID_CHARACTERS = "1382939846"          # <-- THAY BẰNG GID THẬT
-# =================================================
+GID_CHARACTERS = "1382939846"
 
-# ----- HF TOKEN (hardcode theo yêu cầu) -----
-HF1="hf_GJeIMPtqGWNZJInJn"
-HF2="TCVlxljdWnUzudVQH"
-HF_TOKEN = HF1+HF2
+# HF Token
+HF1 = "hf_GJeIMPtqGWNZJInJn"
+HF2 = "TCVlxljdWnUzudVQH"
+HF_TOKEN = HF1 + HF2
 
 hf_token_to_pass = None
 if HF_TOKEN.startswith("hf_"):
@@ -113,26 +111,26 @@ if HF_TOKEN.startswith("hf_"):
         print("🔑 HF login OK")
     except Exception as e:
         print(f"⚠️ HF login fail: {e}")
-else:
-    print("❌ HF_TOKEN không hợp lệ")
 
 if not hf_token_to_pass:
-    print("\n🛑 DỪNG vì thiếu HF Token")
     raise SystemExit("Missing Hugging Face token")
 
+# OAuth
 OAUTH_CLIENT_ID     = "948179937421-o55enfl61lb8ou0ms2jmrr4dlf1fhgip.apps.googleusercontent.com"
 OAUTH_CLIENT_SECRET = "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"
 OAUTH_REFRESH_TOKEN = "1//06GnOlI9wdLJ-CgYIARAAGAYSNwF-L9Ir5sxbZNKU6xqWnjWPP2jFwNaI8UnENzUrHgdc52RO-QIDl3NG8RQA6J_fzGe-vAR3zgA"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
-print("\n🔐 Kiểm tra OAuth secrets:")
-print(f"   OAUTH_CLIENT_ID     : {'✅ có' if OAUTH_CLIENT_ID else '❌ thiếu'}")
-print(f"   OAUTH_CLIENT_SECRET : {'✅ có' if OAUTH_CLIENT_SECRET else '❌ thiếu'}")
-print(f"   OAUTH_REFRESH_TOKEN : {'✅ có' if OAUTH_REFRESH_TOKEN else '❌ thiếu'}")
+print("\n🔐 Kiểm tra OAuth:")
+print(f"   CLIENT_ID     : {'✅' if OAUTH_CLIENT_ID else '❌'}")
+print(f"   CLIENT_SECRET : {'✅' if OAUTH_CLIENT_SECRET else '❌'}")
+print(f"   REFRESH_TOKEN : {'✅' if OAUTH_REFRESH_TOKEN else '❌'}")
 
 USE_DRIVE = bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REFRESH_TOKEN)
 if not USE_DRIVE:
-    print("⚠️ Thiếu OAuth secret → sẽ chạy hoàn toàn LOCAL (không upload Drive)")
+    print("⚠️ Thiếu OAuth → chạy LOCAL")
+else:
+    print("✅ OAuth OK → sẽ dùng Drive")
 
 VOICE_MAP = {
     "nam": "vi-VN-NamMinhNeural",
@@ -257,7 +255,7 @@ def send_n8n_webhook(status, total_scenes=0, final_file=None, drive_file_id=None
         print(f"❌ Webhook lỗi: {e}")
 
 def find_file_in_drive(drive_files, keywords, extensions=(".png", ".jpg", ".jpeg", ".webp")):
-    keywords = [k.lower() for k in keywords]
+    keywords = [k.lower() for k in keywords if k]
     for f in drive_files:
         name = f["name"].lower()
         if any(k in name for k in keywords) and name.endswith(extensions):
@@ -335,7 +333,7 @@ def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
         return False
 
 # -------------------------------------------------------------------
-# 3.2 TẠO ẢNH
+# 3.2 TẠO ẢNH CẢNH (chỉ tạo scene, không tạo character)
 # -------------------------------------------------------------------
 def load_image_pipeline(task="text2img"):
     clear_memory()
@@ -351,28 +349,6 @@ def load_image_pipeline(task="text2img"):
         except Exception:
             pipe = pipe.to(DEVICE)
     return pipe
-
-def generate_character_image(prompt: str, output_path: str, width=1280, height=720):
-    print(f"🎨 [Character] {os.path.basename(output_path)}")
-    try:
-        pipe = load_image_pipeline("text2img")
-        image = pipe(
-            prompt=prompt,
-            width=width,
-            height=height,
-            num_inference_steps=4 if "schnell" in IMAGE_MODEL_ID else 20,
-            guidance_scale=0.0 if "schnell" in IMAGE_MODEL_ID else 7.5,
-            generator=torch.Generator("cpu").manual_seed(42),
-        ).images[0]
-        image.save(output_path)
-        del pipe
-        clear_memory()
-        print(f"   ✅ {output_path}")
-        return True
-    except Exception as e:
-        print(f"   ❌ Lỗi: {e}")
-        clear_memory()
-        return False
 
 def generate_scene_image(prompt: str, output_path: str, ref_image_path: str = None, width=1280, height=720):
     print(f"🖼️  [Scene] {os.path.basename(output_path)}")
@@ -431,10 +407,8 @@ async def process_video_pipeline():
     if not df_chars.empty:
         print(f"✅ Characters: {len(df_chars)} nhân vật")
         print(f"   Cột: {df_chars.columns.tolist()}")
-        if "scene_index" in df_chars.columns and "dialogue" in df_chars.columns:
-            print("⚠️ CẢNH BÁO: Tab Characters đang có cột giống Scenes → GID_CHARACTERS có thể SAI!")
     else:
-        print("⚠️ Không đọc được Characters (kiểm tra GID_CHARACTERS)")
+        print("⚠️ Không đọc được Characters")
 
     project_info = {}
     if not df_scenes.empty:
@@ -444,7 +418,7 @@ async def process_video_pipeline():
             if val:
                 project_info[key] = val
 
-    # ========== 1. DRIVE ==========
+    # ========== 1. LẤY DANH SÁCH FILE TRÊN DRIVE ==========
     drive_files = []
     if USE_DRIVE:
         print("\n📥 [1] Lấy danh sách file trên Drive...")
@@ -453,42 +427,49 @@ async def process_video_pipeline():
     else:
         print("\n⚠️ [1] Chạy LOCAL (không dùng Drive)")
 
-    # ========== 2. ẢNH NHÂN VẬT (LUÔN TẠO MỚI - không dùng URL / file cũ) ==========
-    print("\n🧑‍🎨 [2] Xử lý ảnh nhân vật (luôn tạo mới)...")
+    # ========== 2. ẢNH NHÂN VẬT - CHỈ LẤY TỪ DRIVE ==========
+    print("\n🧑‍🎨 [2] Lấy ảnh nhân vật từ Drive...")
     if not df_chars.empty:
         for idx, row in df_chars.iterrows():
             char_id = safe_get(row, "character_id", default=f"char_{idx+1:02d}")
             char_name = safe_get(row, "character_name", default=f"Character_{idx+1}")
-            design = safe_get(row, "design_detail", "appearance", "design", "image_prompt")
-            image_prompt = safe_get(row, "image_prompt", "design_detail", "appearance", "design")
             local_path = f"char_{char_id}_{RUN_DATE}.png"
             name_key = char_name.lower().strip()
 
-            # Bỏ qua kiểm tra local + Drive → luôn tạo mới theo yêu cầu
-            if not image_prompt:
-                image_prompt = f"full body character reference sheet of {design or char_name}, 3d chinese donghua style, unreal engine 5, highly detailed, clean white background"
-
-            if generate_character_image(image_prompt, local_path):
-                upload_file_to_drive(local_path, DRIVE_FOLDER_ID)
-                character_images[name_key] = local_path
-                print(f"✅ {char_name}: đã tạo + upload")
+            # Tìm trên Drive
+            found = find_file_in_drive(
+                drive_files,
+                keywords=[char_id, char_name, f"char_{char_id}", f"character_{char_id}"],
+                extensions=(".png", ".jpg", ".jpeg", ".webp")
+            )
+            if found:
+                download_drive_file(found["id"], local_path)
+                if os.path.exists(local_path):
+                    character_images[name_key] = local_path
+                    print(f"✅ {char_name}: lấy từ Drive → {found['name']}")
+                else:
+                    print(f"⚠️ {char_name}: download thất bại")
             else:
-                print(f"⚠️ {char_name}: tạo thất bại")
+                print(f"⚠️ {char_name}: không tìm thấy ảnh trên Drive")
+    else:
+        print("⚠️ Không có dữ liệu Characters")
 
-    print(f"✅ Có {len(character_images)} ảnh nhân vật")
+    print(f"✅ Có {len(character_images)} ảnh nhân vật từ Drive")
 
-    # ========== 3. ẢNH CẢNH ==========
-    print("\n🖼️  [3] Xử lý ảnh cảnh...")
+    # ========== 3. TẠO ẢNH CẢNH + UPLOAD DRIVE ==========
+    print("\n🖼️  [3] Tạo ảnh cảnh...")
     for index, row in df_scenes.iterrows():
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
         local_img = f"image_{scene_index:03d}_{RUN_DATE}.png"
 
+        # Đã có local?
         existing = list(Path(".").glob(f"image_{scene_index:03d}_*.png"))
         if existing:
             scene_image_paths[scene_index] = str(existing[0])
             print(f"⏩ Cảnh {scene_index}: local")
             continue
 
+        # Đã có trên Drive?
         found = find_file_in_drive(drive_files, [f"scene_{scene_index:03d}", f"image_{scene_index:03d}"])
         if found:
             download_drive_file(found["id"], local_img)
@@ -496,6 +477,7 @@ async def process_video_pipeline():
             print(f"✅ Cảnh {scene_index}: từ Drive")
             continue
 
+        # Tạo mới
         image_prompt = safe_get(row, "image_prompt", "scene_description", "prompt")
         char_name_raw = safe_get(row, "character_name")
         ref_path = None
