@@ -1,9 +1,8 @@
 # ============================================================
 # PIPELINE KAGGLE
-# - Đọc dữ liệu từ Google Sheet
-# - Ảnh nhân vật: tải từ image_url trong Sheet
-# - Tạo ảnh cảnh → upload Drive
-# - Tạo video + TTS + SFX + BGM
+# - Đọc Sheet | Ảnh NV từ image_url
+# - Ảnh cảnh + Video: CPU Offload + phân mảnh tính toán
+# - Upload Drive
 # ============================================================
 import asyncio
 import gc
@@ -13,9 +12,6 @@ import sys
 import time
 from pathlib import Path
 
-# -------------------------------------------------------------------
-# 1. CÀI PACKAGE
-# -------------------------------------------------------------------
 def install_requirements():
     required = {
         "nest_asyncio": "nest_asyncio",
@@ -84,12 +80,13 @@ from huggingface_hub import login
 RUN_DATE = time.strftime("%Y%m%d_%H%M%S")
 print(f"🚀 PIPELINE - [{RUN_DATE}]")
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+# Ép phân mảnh bộ nhớ CUDA
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"🖥️  Device: {DEVICE}")
 
 # -------------------------------------------------------------------
-# 2. CONFIG
+# CONFIG
 # -------------------------------------------------------------------
 N8N_WEBHOOK_URL = "https://n8n-latest-namx.onrender.com/webhook/kaggle-video-done"
 SHEET_ID = "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8"
@@ -98,7 +95,6 @@ DRIVE_FOLDER_ID = "1oXS7LweDNK2fYsWonQay3U-hUmEIsgCF"
 GID_SCENES = "0"
 GID_CHARACTERS = "1382939846"
 
-# HF Token
 HF1 = "hf_GJeIMPtqGWNZJInJn"
 HF2 = "TCVlxljdWnUzudVQH"
 HF_TOKEN = HF1 + HF2
@@ -115,32 +111,34 @@ if HF_TOKEN.startswith("hf_"):
 if not hf_token_to_pass:
     raise SystemExit("Missing Hugging Face token")
 
-# OAuth
 OAUTH_CLIENT_ID     = "948179937421-o55enfl61lb8ou0ms2jmrr4dlf1fhgip.apps.googleusercontent.com"
 OAUTH_CLIENT_SECRET = "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"
 OAUTH_REFRESH_TOKEN = "1//06GnOlI9wdLJ-CgYIARAAGAYSNwF-L9Ir5sxbZNKU6xqWnjWPP2jFwNaI8UnENzUrHgdc52RO-QIDl3NG8RQA6J_fzGe-vAR3zgA"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
-print("\n🔐 Kiểm tra OAuth:")
+print("\n🔐 OAuth:")
 print(f"   CLIENT_ID     : {'✅' if OAUTH_CLIENT_ID else '❌'}")
 print(f"   CLIENT_SECRET : {'✅' if OAUTH_CLIENT_SECRET else '❌'}")
 print(f"   REFRESH_TOKEN : {'✅' if OAUTH_REFRESH_TOKEN else '❌'}")
 
 USE_DRIVE = bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REFRESH_TOKEN)
-if not USE_DRIVE:
-    print("⚠️ Thiếu OAuth → chạy LOCAL")
-else:
-    print("✅ OAuth OK → sẽ dùng Drive")
+print("✅ OAuth OK → dùng Drive" if USE_DRIVE else "⚠️ Thiếu OAuth → LOCAL")
 
-VOICE_MAP = {
-    "nam": "vi-VN-NamMinhNeural",
-    "nu": "vi-VN-HoaiMyNeural",
-}
+VOICE_MAP = {"nam": "vi-VN-NamMinhNeural", "nu": "vi-VN-HoaiMyNeural"}
 BGM_FILE = f"bgm_generated_{RUN_DATE}.mp3"
 IMAGE_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
 
+# Resolution tiết kiệm VRAM (offload vẫn cần đủ chỗ cho activation)
+SCENE_W, SCENE_H = 768, 432
+VIDEO_W, VIDEO_H = 640, 360
+
+# Pipeline giữ 1 lần (offload từng layer khi chạy)
+_scene_pipe_t2i = None
+_scene_pipe_i2i = None
+_ltx_pipe = None
+
 # -------------------------------------------------------------------
-# 3. HELPERS
+# HELPERS
 # -------------------------------------------------------------------
 def get_oauth_credentials():
     if not USE_DRIVE:
@@ -159,7 +157,43 @@ def clear_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-        torch.cuda.synchronize()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+def prepare_offload_pipe(pipe):
+    """CPU Offloading + phân mảnh tính toán"""
+    if DEVICE != "cuda":
+        return pipe.to(DEVICE)
+    # 1) Đẩy weights sang RAM, khi chạy chỉ đưa từng phần lên GPU
+    try:
+        pipe.enable_sequential_cpu_offload()
+        print("   → sequential_cpu_offload ON")
+    except Exception:
+        try:
+            pipe.enable_model_cpu_offload()
+            print("   → model_cpu_offload ON")
+        except Exception:
+            pipe = pipe.to(DEVICE)
+            print("   → fallback .to(cuda)")
+    # 2) Phân mảnh attention / VAE
+    try:
+        pipe.enable_attention_slicing("max")
+    except Exception:
+        try:
+            pipe.enable_attention_slicing()
+        except Exception:
+            pass
+    try:
+        pipe.enable_vae_slicing()
+    except Exception:
+        pass
+    try:
+        pipe.enable_vae_tiling()
+    except Exception:
+        pass
+    return pipe
 
 def get_media_duration(file_path):
     cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{file_path}"'
@@ -177,8 +211,7 @@ def list_files_in_folder(folder_id):
         if creds is None:
             return []
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        files = []
-        page_token = None
+        files, page_token = [], None
         while True:
             resp = service.files().list(
                 q=f"'{folder_id}' in parents and trashed=false",
@@ -208,7 +241,7 @@ def download_drive_file(file_id, save_path):
             downloader = MediaIoBaseDownload(f, request)
             done = False
             while not done:
-                status, done = downloader.next_chunk()
+                _, done = downloader.next_chunk()
         return save_path
     except Exception as e:
         print(f"⚠️ download lỗi: {e}")
@@ -280,22 +313,30 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
     try:
         df = pd.read_csv(url)
         df.columns = df.columns.str.strip().str.lower()
-        df = df.dropna(how="all")
-        return df
+        return df.dropna(how="all")
     except Exception as e:
         print(f"❌ Lỗi đọc CSV (gid={gid}): {e}")
         return pd.DataFrame()
 
 # -------------------------------------------------------------------
-# 3.1 AI MUSIC & SFX
+# AI MUSIC / SFX
 # -------------------------------------------------------------------
 def generate_ai_bgm(prompt_text: str, duration_sec: int, output_path: str):
     print(f"🎵 [AI BGM] '{prompt_text[:50]}...'")
     try:
         clear_memory()
         processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-        model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small").to(DEVICE)
-        inputs = processor(text=[prompt_text], padding=True, return_tensors="pt").to(DEVICE)
+        model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small")
+        if DEVICE == "cuda":
+            try:
+                model.enable_model_cpu_offload()
+            except Exception:
+                model = model.to(DEVICE)
+        else:
+            model = model.to(DEVICE)
+        inputs = processor(text=[prompt_text], padding=True, return_tensors="pt")
+        if DEVICE == "cuda":
+            inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
         max_tokens = min(int(duration_sec * 50), 1500)
         audio = model.generate(**inputs, max_new_tokens=max_tokens)
         sr = model.config.audio_encoder.sampling_rate
@@ -305,12 +346,13 @@ def generate_ai_bgm(prompt_text: str, duration_sec: int, output_path: str):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if os.path.exists(wav_path):
             os.remove(wav_path)
-        del processor, model
+        del processor, model, audio
         clear_memory()
         print("✅ [AI BGM] Xong")
         return True
     except Exception as e:
         print(f"⚠️ [AI BGM] Lỗi: {e}")
+        clear_memory()
         return False
 
 def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
@@ -319,63 +361,85 @@ def generate_ai_sfx(prompt_text: str, duration_sec: float, output_path: str):
         clear_memory()
         pipe = AudioLDMPipeline.from_pretrained(
             "cvssp/audioldm-m-full",
-            torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
-        ).to(DEVICE)
-        audio = pipe(prompt_text, num_inference_steps=15,
-                     audio_length_in_s=max(1.0, min(duration_sec, 8.0))).audios[0]
+            torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+        )
+        pipe = prepare_offload_pipe(pipe)
+        audio = pipe(
+            prompt_text,
+            num_inference_steps=15,
+            audio_length_in_s=max(1.0, min(duration_sec, 8.0)),
+        ).audios[0]
         wavfile.write(output_path, rate=16000, data=audio)
-        del pipe
+        del pipe, audio
         clear_memory()
         print("✅ [AI SFX] Xong")
         return True
     except Exception as e:
         print(f"⚠️ [AI SFX] Lỗi: {e}")
+        clear_memory()
         return False
 
 # -------------------------------------------------------------------
-# 3.2 TẠO ẢNH CẢNH
+# ẢNH CẢNH — load 1 lần + sequential offload + slicing
 # -------------------------------------------------------------------
-def load_image_pipeline(task="text2img"):
-    clear_memory()
+def get_scene_pipe(task="text2img"):
+    global _scene_pipe_t2i, _scene_pipe_i2i
     dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
-    kwargs = {"torch_dtype": dtype, "token": hf_token_to_pass}
+    kwargs = {
+        "torch_dtype": dtype,
+        "token": hf_token_to_pass,
+        "low_cpu_mem_usage": True,
+    }
     if task == "text2img":
-        pipe = AutoPipelineForText2Image.from_pretrained(IMAGE_MODEL_ID, **kwargs)
+        if _scene_pipe_t2i is None:
+            print("📦 Load FLUX text2img (1 lần) + CPU offload + slicing...")
+            clear_memory()
+            _scene_pipe_t2i = AutoPipelineForText2Image.from_pretrained(IMAGE_MODEL_ID, **kwargs)
+            _scene_pipe_t2i = prepare_offload_pipe(_scene_pipe_t2i)
+            print("✅ FLUX text2img ready")
+        return _scene_pipe_t2i
     else:
-        pipe = AutoPipelineForImage2Image.from_pretrained(IMAGE_MODEL_ID, **kwargs)
-    if DEVICE == "cuda":
-        try:
-            pipe.enable_model_cpu_offload()
-        except Exception:
-            pipe = pipe.to(DEVICE)
-    return pipe
+        if _scene_pipe_i2i is None:
+            print("📦 Load FLUX img2img (1 lần) + CPU offload + slicing...")
+            clear_memory()
+            _scene_pipe_i2i = AutoPipelineForImage2Image.from_pretrained(IMAGE_MODEL_ID, **kwargs)
+            _scene_pipe_i2i = prepare_offload_pipe(_scene_pipe_i2i)
+            print("✅ FLUX img2img ready")
+        return _scene_pipe_i2i
 
-def generate_scene_image(prompt: str, output_path: str, ref_image_path: str = None, width=1280, height=720):
-    print(f"🖼️  [Scene] {os.path.basename(output_path)}")
+def generate_scene_image(prompt: str, output_path: str, ref_image_path: str = None,
+                         width=SCENE_W, height=SCENE_H):
+    print(f"🖼️  [Scene] {os.path.basename(output_path)} ({width}x{height})")
     try:
+        clear_memory()
         if ref_image_path and os.path.exists(ref_image_path):
-            pipe = load_image_pipeline("img2img")
+            pipe = get_scene_pipe("img2img")
             init_image = load_image(ref_image_path).resize((width, height))
-            image = pipe(
+            out = pipe(
                 prompt=prompt,
                 image=init_image,
                 strength=0.65,
-                num_inference_steps=4 if "schnell" in IMAGE_MODEL_ID else 20,
-                guidance_scale=0.0 if "schnell" in IMAGE_MODEL_ID else 7.5,
+                num_inference_steps=4,
+                guidance_scale=0.0,
                 generator=torch.Generator("cpu").manual_seed(42),
-            ).images[0]
+            )
+            image = out.images[0]
+            del init_image, out
         else:
-            pipe = load_image_pipeline("text2img")
-            image = pipe(
+            pipe = get_scene_pipe("text2img")
+            out = pipe(
                 prompt=prompt,
                 width=width,
                 height=height,
-                num_inference_steps=4 if "schnell" in IMAGE_MODEL_ID else 20,
-                guidance_scale=0.0 if "schnell" in IMAGE_MODEL_ID else 7.5,
+                num_inference_steps=4,
+                guidance_scale=0.0,
                 generator=torch.Generator("cpu").manual_seed(42),
-            ).images[0]
+            )
+            image = out.images[0]
+            del out
+
         image.save(output_path)
-        del pipe
+        del image
         clear_memory()
         print(f"   ✅ {output_path}")
         return True
@@ -385,27 +449,59 @@ def generate_scene_image(prompt: str, output_path: str, ref_image_path: str = No
         return False
 
 # -------------------------------------------------------------------
-# 4. PIPELINE CHÍNH
+# LTX VIDEO — load 1 lần + offload + tiling
+# -------------------------------------------------------------------
+def get_ltx_pipe():
+    global _ltx_pipe
+    if _ltx_pipe is None:
+        print("📦 Load LTX (1 lần) + CPU offload + tiling...")
+        clear_memory()
+        _ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
+            "Lightricks/LTX-Video",
+            torch_dtype=torch.bfloat16,
+            token=hf_token_to_pass,
+            low_cpu_mem_usage=True,
+        )
+        if DEVICE == "cuda":
+            try:
+                from diffusers.hooks import apply_group_offloading
+                _ltx_pipe = apply_group_offloading(_ltx_pipe, offload_type="block_level")
+                print("   → group block_level offload ON")
+            except Exception:
+                _ltx_pipe = prepare_offload_pipe(_ltx_pipe)
+            try:
+                _ltx_pipe.vae.enable_tiling()
+            except Exception:
+                pass
+            try:
+                _ltx_pipe.vae.enable_slicing()
+            except Exception:
+                pass
+        print("✅ LTX ready")
+    return _ltx_pipe
+
+# -------------------------------------------------------------------
+# PIPELINE CHÍNH
 # -------------------------------------------------------------------
 async def process_video_pipeline():
+    global _scene_pipe_t2i, _scene_pipe_i2i, _ltx_pipe
     rendered_files = []
     character_images = {}
     scene_image_paths = {}
 
     print("\n📊 Đọc Google Sheet...")
     df_scenes = get_sheet_csv(GID_SCENES)
-    df_chars  = get_sheet_csv(GID_CHARACTERS)
+    df_chars = get_sheet_csv(GID_CHARACTERS)
 
     if df_scenes.empty:
         send_n8n_webhook("failed", error_message="Không đọc được Scenes")
         return
 
     total_scenes = len(df_scenes)
-    print(f"✅ Scenes: {total_scenes} cảnh")
+    print(f"✅ Scenes: {total_scenes}")
     print(f"   Cột: {df_scenes.columns.tolist()}")
-
     if not df_chars.empty:
-        print(f"✅ Characters: {len(df_chars)} nhân vật")
+        print(f"✅ Characters: {len(df_chars)}")
         print(f"   Cột: {df_chars.columns.tolist()}")
     else:
         print("⚠️ Không đọc được Characters")
@@ -418,57 +514,51 @@ async def process_video_pipeline():
             if val:
                 project_info[key] = val
 
-    # ========== 1. LẤY DANH SÁCH FILE TRÊN DRIVE ==========
+    # 1. Drive list
     drive_files = []
     if USE_DRIVE:
-        print("\n📥 [1] Lấy danh sách file trên Drive...")
+        print("\n📥 [1] Danh sách Drive...")
         drive_files = list_files_in_folder(DRIVE_FOLDER_ID)
-        print(f"✅ {len(drive_files)} file trên Drive")
+        print(f"✅ {len(drive_files)} file")
     else:
-        print("\n⚠️ [1] Chạy LOCAL (không dùng Drive)")
+        print("\n⚠️ [1] LOCAL")
 
-    # ========== 2. ẢNH NHÂN VẬT - TẢI TỪ image_url TRONG SHEET ==========
-    print("\n🧑‍🎨 [2] Tải ảnh nhân vật từ URL trong Google Sheet...")
+    # 2. Ảnh NV từ image_url
+    print("\n🧑‍🎨 [2] Tải ảnh nhân vật từ image_url...")
     if not df_chars.empty:
         for idx, row in df_chars.iterrows():
             char_id = safe_get(row, "character_id", default=f"char_{idx+1:02d}")
             char_name = safe_get(row, "character_name", default=f"Character_{idx+1}")
             image_url = safe_get(row, "image_url")
             file_name = safe_get(row, "file_name", default=f"char_{char_id}.png")
-
             if not file_name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-                file_name = file_name + ".png"
+                file_name += ".png"
             local_path = file_name
             name_key = char_name.lower().strip()
 
             if not image_url:
-                print(f"⚠️ {char_name}: không có image_url → bỏ qua")
+                print(f"⚠️ {char_name}: không có image_url")
                 continue
-
             if os.path.exists(local_path):
                 character_images[name_key] = local_path
-                print(f"⏩ {char_name}: đã có local → {local_path}")
+                print(f"⏩ {char_name}: local")
                 continue
-
             try:
-                print(f"⬇️  {char_name}: đang tải từ URL...")
+                print(f"⬇️  {char_name}...")
                 resp = requests.get(image_url, timeout=60)
                 if resp.status_code == 200:
                     with open(local_path, "wb") as f:
                         f.write(resp.content)
                     character_images[name_key] = local_path
-                    print(f"✅ {char_name}: tải thành công → {local_path}")
+                    print(f"✅ {char_name}")
                 else:
-                    print(f"⚠️ {char_name}: tải lỗi HTTP {resp.status_code}")
+                    print(f"⚠️ {char_name}: HTTP {resp.status_code}")
             except Exception as e:
-                print(f"⚠️ {char_name}: lỗi tải → {e}")
-    else:
-        print("⚠️ Không có dữ liệu Characters")
+                print(f"⚠️ {char_name}: {e}")
+    print(f"✅ {len(character_images)} ảnh nhân vật")
 
-    print(f"✅ Có {len(character_images)} ảnh nhân vật")
-
-    # ========== 3. TẠO ẢNH CẢNH + UPLOAD DRIVE ==========
-    print("\n🖼️  [3] Tạo ảnh cảnh...")
+    # 3. Ảnh cảnh (pipe load 1 lần, offload từng layer khi generate)
+    print("\n🖼️  [3] Tạo ảnh cảnh (CPU offload + slicing)...")
     for index, row in df_scenes.iterrows():
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
         local_img = f"image_{scene_index:03d}_{RUN_DATE}.png"
@@ -483,7 +573,7 @@ async def process_video_pipeline():
         if found:
             download_drive_file(found["id"], local_img)
             scene_image_paths[scene_index] = local_img
-            print(f"✅ Cảnh {scene_index}: từ Drive")
+            print(f"✅ Cảnh {scene_index}: Drive")
             continue
 
         image_prompt = safe_get(row, "image_prompt", "scene_description", "prompt")
@@ -509,51 +599,44 @@ async def process_video_pipeline():
             upload_file_to_drive(local_img, DRIVE_FOLDER_ID)
             scene_image_paths[scene_index] = local_img
         else:
-            print(f"⚠️ Cảnh {scene_index}: tạo thất bại")
+            print(f"⚠️ Cảnh {scene_index}: thất bại")
 
-    print(f"✅ Có {len(scene_image_paths)} ảnh cảnh")
+    print(f"✅ {len(scene_image_paths)} ảnh cảnh")
 
-    # ========== 4. BGM ==========
+    # Giải phóng FLUX trước khi load LTX
+    print("\n🧹 Giải phóng FLUX trước khi load LTX...")
+    _scene_pipe_t2i = None
+    _scene_pipe_i2i = None
+    clear_memory()
+
+    # 4. BGM
     bgm_desc = project_info.get("bgm_prompt") or f"{project_info.get('genre', 'dramatic')} cinematic background music"
     generate_ai_bgm(bgm_desc, duration_sec=total_scenes * 5, output_path=BGM_FILE)
+    clear_memory()
 
-    # ========== 5. LOAD LTX ==========
+    # 5. LTX
     print("\n🎬 [5] Load LTX...")
     try:
-        ltx_pipe = LTXImageToVideoPipeline.from_pretrained(
-            "Lightricks/LTX-Video",
-            torch_dtype=torch.bfloat16,
-            token=hf_token_to_pass,
-        )
-        try:
-            from diffusers.hooks import apply_group_offloading
-            ltx_pipe = apply_group_offloading(ltx_pipe, offload_type="block_level")
-        except Exception:
-            ltx_pipe.enable_model_cpu_offload()
-        try:
-            ltx_pipe.vae.enable_tiling()
-        except Exception:
-            pass
-        print("✅ LTX ready")
+        ltx_pipe = get_ltx_pipe()
     except Exception as e:
         print(f"❌ Load LTX lỗi: {e}")
         send_n8n_webhook("failed", error_message=str(e))
         return
 
-    # ========== 6. TẠO VIDEO ==========
+    # 6. Video từng cảnh
     for index, row in df_scenes.iterrows():
         scene_start = time.time()
         scene_index = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else index + 1
         image_file = scene_image_paths.get(scene_index)
         if not image_file or not os.path.exists(image_file):
-            print(f"⚠️ Cảnh {scene_index}: thiếu ảnh → bỏ qua")
+            print(f"⚠️ Cảnh {scene_index}: thiếu ảnh")
             continue
 
         final_scene_file = f"scene_{scene_index:03d}_{RUN_DATE}.mp4"
         existing = list(Path(".").glob(f"scene_{scene_index:03d}_*.mp4"))
         if existing and os.path.getsize(str(existing[0])) > 15000:
             rendered_files.append(str(existing[0]))
-            print(f"⏩ Cảnh {scene_index}: video đã có")
+            print(f"⏩ Cảnh {scene_index}: video có sẵn")
             continue
 
         vid_prompt = safe_get(row, "video_prompt", "camera_motion", default="smooth cinematic movement")
@@ -570,18 +653,19 @@ async def process_video_pipeline():
 
         try:
             clear_memory()
-            image_input = load_image(image_file).resize((640, 360))
+            image_input = load_image(image_file).resize((VIDEO_W, VIDEO_H))
             video_frames = ltx_pipe(
                 image=image_input,
                 prompt=vid_prompt,
                 negative_prompt=neg_prompt if neg_prompt else None,
-                width=640, height=360,
+                width=VIDEO_W,
+                height=VIDEO_H,
                 num_frames=25,
                 num_inference_steps=20,
                 generator=torch.Generator("cpu").manual_seed(42 + scene_index),
             ).frames[0]
             export_to_video(video_frames, raw_video_file, fps=16)
-            del video_frames
+            del video_frames, image_input
             clear_memory()
             print("   ✅ Video thô")
         except Exception as e:
@@ -594,8 +678,7 @@ async def process_video_pipeline():
         if dialogue_text:
             voice = pick_voice(char_name)
             print(f"🎙️ TTS: {dialogue_text[:40]}...")
-            communicate = edge_tts.Communicate(text=dialogue_text, voice=voice)
-            await communicate.save(audio_tts_file)
+            await edge_tts.Communicate(text=dialogue_text, voice=voice).save(audio_tts_file)
             a_dur = get_media_duration(audio_tts_file)
             has_tts = True
 
@@ -608,8 +691,7 @@ async def process_video_pipeline():
 
         inputs = [f'-i "{raw_video_file}"']
         filter_parts = []
-        map_v = "0:v:0"
-        map_a = "1:a:0"
+        map_v, map_a = "0:v:0", "1:a:0"
 
         if pad_dur > 0.05:
             filter_parts.append(f"[0:v]tpad=stop_mode=clone:stop_duration={pad_dur:.3f}[v]")
@@ -624,7 +706,7 @@ async def process_video_pipeline():
         elif has_sfx:
             inputs.append(f'-i "{audio_sfx_file}"')
         else:
-            inputs.append('-f lavfi -i anullsrc=r=44100:cl=stereo')
+            inputs.append("-f lavfi -i anullsrc=r=44100:cl=stereo")
 
         filter_str = f'-filter_complex "{";".join(filter_parts)}"' if filter_parts else ""
         mix_cmd = (
@@ -636,20 +718,22 @@ async def process_video_pipeline():
 
         for f in [raw_video_file, audio_tts_file, audio_sfx_file]:
             if os.path.exists(f):
-                try: os.remove(f)
-                except: pass
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
 
         if os.path.exists(final_scene_file) and os.path.getsize(final_scene_file) > 15000:
             upload_file_to_drive(final_scene_file, DRIVE_FOLDER_ID)
             rendered_files.append(final_scene_file)
-            print(f"✅ Cảnh {scene_index} xong ({time.time() - scene_start:.1f}s)")
+            print(f"✅ Cảnh {scene_index} ({time.time() - scene_start:.1f}s)")
         else:
             print(f"⚠️ Cảnh {scene_index}: file lỗi")
 
-    del ltx_pipe
+    _ltx_pipe = None
     clear_memory()
 
-    # ========== 7. GỘP + BGM ==========
+    # 7. Ghép + BGM
     print("\n🎞️ [7] Gộp video...")
     if not rendered_files:
         send_n8n_webhook("failed", error_message="Không render được cảnh nào", extra=project_info)
@@ -662,8 +746,10 @@ async def process_video_pipeline():
 
     concat_output = f"final_concat_{RUN_DATE}.mp4"
     final_output = f"final_movie_{RUN_DATE}.mp4"
-
-    subprocess.run(f'ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy "{concat_output}"', shell=True, check=True)
+    subprocess.run(
+        f'ffmpeg -y -f concat -safe 0 -i file_list.txt -c copy "{concat_output}"',
+        shell=True, check=True,
+    )
 
     if os.path.exists(BGM_FILE):
         print("🎵 Ghép BGM...")
@@ -679,9 +765,8 @@ async def process_video_pipeline():
     else:
         final_output = concat_output
 
-    print(f"\n☁️ Upload phim cuối: {final_output}")
+    print(f"\n☁️ Upload phim: {final_output}")
     drive_file_id = upload_file_to_drive(final_output, DRIVE_FOLDER_ID)
-
     send_n8n_webhook(
         status="completed_all",
         total_scenes=len(rendered_files),
@@ -691,9 +776,6 @@ async def process_video_pipeline():
     )
     print("\n🎉 HOÀN TẤT!")
 
-# -------------------------------------------------------------------
-# RUN
-# -------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         asyncio.run(process_video_pipeline())
