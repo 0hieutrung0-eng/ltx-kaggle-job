@@ -1,13 +1,16 @@
 {
   "id": "0hieutrung0-eng/ltx-video-render",
-  "title": "LTX Render",
+  "id_no": null,
+  "title": "LTX Video Render",
   "code_file": "render_script.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
   "enable_gpu": true,
+  "enable_tpu": false,
   "enable_internet": true,
   "dataset_sources": [],
   "kernel_sources": [],
-  "competition_sources": []
+  "competition_sources": [],
+  "model_sources": []
 }
