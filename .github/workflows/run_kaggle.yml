@@ -3,6 +3,12 @@ name: Trigger Kaggle Render
 on:
   repository_dispatch:
     types: [run-kaggle]
+  workflow_dispatch:
+    inputs:
+      drive_folder_id:
+        description: "Google Drive folder ID (folder ngày)"
+        required: false
+        default: ""
 
 jobs:
   run-kaggle:
@@ -14,52 +20,145 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install Kaggle CLI
         run: pip install --upgrade kaggle
 
-      - name: Configure Credentials & Generate Dynamic Slug
+      - name: Resolve drive_folder_id
+        id: folder
+        env:
+          # n8n gửi qua repository_dispatch → client_payload
+          PAYLOAD_FOLDER: ${{ github.event.client_payload.drive_folder_id }}
+          INPUT_FOLDER: ${{ github.event.inputs.drive_folder_id }}
+        run: |
+          FOLDER="${PAYLOAD_FOLDER:-$INPUT_FOLDER}"
+          if [ -z "$FOLDER" ]; then
+            echo "⚠️ Không có drive_folder_id từ n8n/input"
+            FOLDER=""
+          fi
+          echo "drive_folder_id=$FOLDER" >> $GITHUB_OUTPUT
+          echo "📁 drive_folder_id=$FOLDER"
+
+      - name: Write runtime config + update kernel-metadata
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          DRIVE_FOLDER_ID: ${{ steps.folder.outputs.drive_folder_id }}
         run: |
-          # 1. Tạo thư mục và ghi file xác thực Kaggle API đơn giản
           mkdir -p ~/.kaggle
           echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
 
-          # 2. Tạo TIMESTAMP & Dynamic Slug
           TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
-          DYNAMIC_SLUG="wan-render-$TIMESTAMP"
-          
-          echo "--> Generating new notebook ID: $KAGGLE_USERNAME/$DYNAMIC_SLUG"
-          
-          # 3. Ghi đè thông số ID, Title và kiểm tra code_file trong kernel-metadata.json
-          python -c "
+          # Giữ slug CỐ ĐỊNH để kernel secrets/GPU ổn định
+          # Đổi dynamic chỉ khi bạn muốn mỗi lần 1 kernel mới
+          FIXED_SLUG="ltx-video-render"
+          DYNAMIC_SLUG="ltx-render-$TIMESTAMP"
+
+          # Dùng fixed slug (khuyên dùng)
+          SLUG="$FIXED_SLUG"
+
+          echo "--> Kernel ID: $KAGGLE_USERNAME/$SLUG"
+
+          # Ghi config runtime cho render_script.py đọc
+          python - <<'PY'
           import json, os
+          cfg = {
+              "drive_folder_id": os.environ.get("DRIVE_FOLDER_ID", "").strip(),
+              "run_date": os.environ.get("TIMESTAMP", ""),
+              "source": "github_actions",
+          }
+          with open("runtime_config.json", "w", encoding="utf-8") as f:
+              json.dump(cfg, f, indent=2, ensure_ascii=False)
+          print("runtime_config.json:", cfg)
+          PY
 
-          username = os.environ['KAGGLE_USERNAME']
-          slug = '$DYNAMIC_SLUG'
-          timestamp = '$TIMESTAMP'
+          # Cập nhật kernel-metadata.json
+          python - <<'PY'
+          import json, os
+          username = os.environ["KAGGLE_USERNAME"]
+          slug = os.environ.get("SLUG", "ltx-video-render")
+          timestamp = os.environ.get("TIMESTAMP", "")
 
-          with open('kernel-metadata.json', 'r') as f:
+          with open("kernel-metadata.json", "r", encoding="utf-8") as f:
               data = json.load(f)
 
-          data['id'] = f'{username}/{slug}'
-          data['title'] = f'LTX Render {timestamp}'
-          
-          # Đảm bảo đường dẫn file script chính xác ở thư mục gốc
-          if 'code_file' in data and '/' in data['code_file']:
-              data['code_file'] = os.path.basename(data['code_file'])
+          data["id"] = f"{username}/{slug}"
+          data["title"] = f"LTX Video Render"
+          data["language"] = "python"
+          data["kernel_type"] = "script"
+          data["is_private"] = True
+          data["enable_gpu"] = True
+          data["enable_internet"] = True
+          data["enable_tpu"] = False
 
-          with open('kernel-metadata.json', 'w') as f:
+          # Đảm bảo code_file chỉ là tên file ở root
+          code = data.get("code_file", "render_script.py")
+          data["code_file"] = os.path.basename(code)
+
+          if "model_sources" not in data:
+              data["model_sources"] = []
+
+          with open("kernel-metadata.json", "w", encoding="utf-8") as f:
               json.dump(data, f, indent=2)
-          "
 
-      - name: Push New Code to Kaggle
+          print("kernel-metadata.json:")
+          print(json.dumps(data, indent=2))
+          PY
+        env:
+          TIMESTAMP: ${{ github.run_id }}
+          SLUG: ltx-video-render
+          DRIVE_FOLDER_ID: ${{ steps.folder.outputs.drive_folder_id }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+
+      - name: Ensure render_script reads runtime_config
+        run: |
+          # Chèn/ghi đè đọc config đầu file nếu chưa có (an toàn, không phá logic)
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("render_script.py")
+          if not p.exists():
+              raise SystemExit("Thiếu render_script.py")
+          text = p.read_text(encoding="utf-8")
+          marker = "# --- runtime_config inject ---"
+          inject = '''
+# --- runtime_config inject ---
+import json as _json, os as _os
+try:
+    with open("runtime_config.json", "r", encoding="utf-8") as _f:
+        _cfg = _json.load(_f)
+    if _cfg.get("drive_folder_id"):
+        _os.environ["DRIVE_FOLDER_ID"] = str(_cfg["drive_folder_id"])
+        print("📁 DRIVE_FOLDER_ID from runtime_config:", _os.environ["DRIVE_FOLDER_ID"])
+except Exception as _e:
+    print("⚠️ runtime_config:", _e)
+# --- end inject ---
+'''
+          if marker not in text:
+              # chèn sau các import đầu (sau dòng install hoặc ngay đầu)
+              p.write_text(inject + "\n" + text, encoding="utf-8")
+              print("Đã inject đọc runtime_config.json")
+          else:
+              print("Đã có inject, bỏ qua")
+          PY
+
+      - name: Push kernel to Kaggle
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
+          echo "=== kernel-metadata.json ==="
+          cat kernel-metadata.json
+          echo "=== runtime_config.json ==="
+          cat runtime_config.json
           kaggle kernels push -p .
+          echo "✅ Push xong"
+
+      - name: Notify status (optional)
+        if: always()
+        run: |
+          echo "Kernel: ${{ secrets.KAGGLE_USERNAME }}/ltx-video-render"
+          echo "Folder: ${{ steps.folder.outputs.drive_folder_id }}"
+          echo "Mở Kaggle → Run All (GPU) nếu kernel không tự chạy."
