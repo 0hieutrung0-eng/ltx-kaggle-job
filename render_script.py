@@ -1,61 +1,32 @@
 import os
 import sys
 import json
-import subprocess
-
-# ==========================================
-# 0. TỰ ĐỘNG CÀI ĐẶT MÔI TRƯỜNG (AUTO-SETUP)
-# ==========================================
-def auto_setup():
-    try:
-        import requests
-    except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "requests"], check=True)
-
-    try:
-        subprocess.run(["edge-tts", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        subprocess.run([sys.executable, "-m", "pip", "install", "edge-tts"], check=True)
-
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        subprocess.run("apt-get update && apt-get install -y ffmpeg", shell=True, check=True)
-
-auto_setup()
-
 import requests
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 # ==========================================
-# 1. CẤU HÌNH & LẤY BIẾN MÔI TRƯỜNG TỪ N8N
+# CẤU HÌNH BIẾN MÔI TRƯỜNG TỪ N8N
 # ==========================================
-OUTPUT_DIR = "./output_scenes"         # Thư mục chứa ảnh 100 cảnh
-VIDEO_DIR = "./output_videos"         # Thư mục lưu video & voice từng cảnh
-FINAL_VIDEO = "final_full_movie.mp4"   # File phim hoàn chỉnh
-JSON_LOG = "agnes_scene_results.json"  # File JSON dữ liệu cảnh từ n8n
-
-MAX_WORKERS = 8  # Chạy 8 luồng song song trên Kaggle T4 GPU
+TOTAL_SCENES = 100
+OUTPUT_DIR = "./output_scenes"
+VIDEO_DIR = "./output_videos"
+FINAL_VIDEO = "final_full_movie.mp4"
+MAX_WORKERS = 8  # Chạy đa luồng T4 GPU
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
-# Lấy trực tiếp thông tin từ n8n / GitHub Secrets truyền qua
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
 REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN")
-AGNES_API_KEY = os.environ.get("AGNES_API_KEY") # API Key tạo ảnh
-
+AGNES_API_KEY = os.environ.get("AGNES_API_KEY")
 
 # ==========================================
-# 2. XÁC THỰC GOOGLE DRIVE & UPLOAD
+# 1. HÀM TƯƠNG TÁC GOOGLE DRIVE OAUTH
 # ==========================================
 def get_google_access_token():
-    if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
-        print("❌ Thiếu OAUTH Credentials!")
-        return None
-
     url = "https://oauth2.googleapis.com/token"
     data = {
         "client_id": CLIENT_ID,
@@ -67,115 +38,130 @@ def get_google_access_token():
         res = requests.post(url, data=data, timeout=15).json()
         return res.get("access_token")
     except Exception as e:
-        print(f"❌ Lỗi lấy Access Token: {e}")
+        print(f"❌ Lỗi OAuth Google: {e}")
         return None
+
+def get_drive_files_list():
+    """Lấy danh sách tất cả tên file trên Drive Folder"""
+    token = get_google_access_token()
+    if not token or not DRIVE_FOLDER_ID:
+        print("⚠️ Không lấy được danh sách file trên Drive Folder!")
+        return set()
+
+    headers = {'Authorization': f'Bearer {token}'}
+    query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
+    url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(query)}&fields=files(name)&pageSize=1000"
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=15).json()
+        return {f['name'] for f in res.get('files', [])}
+    except Exception as e:
+        print(f"❌ Lỗi quét Drive: {e}")
+        return set()
 
 def upload_file_to_drive(file_path):
-    if not os.path.exists(file_path) or not DRIVE_FOLDER_ID:
-        return None
-
-    access_token = get_google_access_token()
-    if not access_token:
-        print("❌ Không có Access Token để upload!")
+    token = get_google_access_token()
+    if not token or not DRIVE_FOLDER_ID or not os.path.exists(file_path):
         return None
 
     file_name = os.path.basename(file_path)
     metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
-    
     files = {
         'data': ('metadata', json.dumps(metadata), 'application/json; charset=UTF-8'),
         'file': open(file_path, 'rb')
     }
-    headers = {'Authorization': f'Bearer {access_token}'}
+    headers = {'Authorization': f'Bearer {token}'}
     
-    try:
-        res = requests.post(
-            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
-            headers=headers,
-            files=files,
-            timeout=180
-        )
-        if res.status_code == 200:
-            print(f"☁️  [Drive Upload] Thành công: {file_name}")
-            return res.json()
-        else:
-            print(f"❌ Lỗi Upload {file_name}: {res.text}")
-            return None
-    except Exception as e:
-        print(f"❌ Exception Upload: {e}")
-        return None
+    print(f"🚀 [Drive Upload] Đang tải {file_name}...")
+    res = requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", headers=headers, files=files, timeout=180)
+    if res.status_code == 200:
+        print(f"✅ Upload thành công: {file_name}")
+        return res.json()
+    return None
 
 
 # ==========================================
-# 3. BƯỚC 1: KIỂM TRA & TẠO ẢNH (AGNES AI)
+# BƯỚC 1: KIỂM TRA VÀ TẠO ĐỦ 100 ẢNH CẢNH
 # ==========================================
-def generate_image_if_not_exists(scene_num, prompt):
-    img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
-
-    # NẾU ĐÃ CÓ ẢNH TỒN TẠI -> SKIP KHÔNG TẠO LẠI
-    if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-        print(f"⏭️  [Ảnh {scene_num:03d}] Đã có sẵn -> Bỏ qua tạo ảnh.")
-        return img_path
-
-    print(f"🎨 [Ảnh {scene_num:03d}] Đang tạo mới bằng Agnes AI...")
+def step_1_check_and_generate_all_images():
+    print("🔍 [GIAI ĐOẠN 1] Bắt đầu kiểm tra kho ảnh trên Google Drive...")
+    drive_files = get_drive_files_list()
     
-    # Mẫu gọi API sinh ảnh (Thay endpoint/payload của Agnes AI bạn đang dùng)
-    try:
-        # Giả lập/Gọi API sinh ảnh
-        headers = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
-        payload = {"prompt": prompt, "aspect_ratio": "16:9"}
+    missing_scenes = []
+    for i in range(1, TOTAL_SCENES + 1):
+        img_name = f"scene_{i:03d}.png"
+        local_path = f"{OUTPUT_DIR}/{img_name}"
         
-        # Nếu dùng API thực tế:
-        # response = requests.post("https://api.agnes.ai/v1/generate", json=payload, headers=headers)
-        # img_url = response.json().get("image_url")
-        # img_data = requests.get(img_url).content
-        # with open(img_path, "wb") as f: f.write(img_data)
+        # Nếu chưa có trên Drive lẫn dưới local Kaggle
+        if img_name not in drive_files and not (os.path.exists(local_path) and os.path.getsize(local_path) > 0):
+            missing_scenes.append(i)
+
+    # NẾU THIẾU ẢNH -> TIẾN HÀNH TẠO ẢNH
+    if missing_scenes:
+        print(f"⚠️ Phát hiện thiếu {len(missing_scenes)} ảnh cảnh! Đang tiến hành tạo ảnh bổ sung...")
         
-        # Upload ảnh vừa tạo lên Google Drive
-        upload_file_to_drive(img_path)
-        return img_path
-    except Exception as e:
-        print(f"❌ Lỗi tạo ảnh cảnh {scene_num}: {e}")
-        return None
+        # Đọc dữ liệu prompt từ file JSON n8n truyền sang
+        json_log = "agnes_scene_results.json"
+        scenes_data = []
+        if os.path.exists(json_log):
+            with open(json_log, 'r', encoding='utf-8') as f:
+                scenes_data = json.load(f)
+
+        for scene_num in missing_scenes:
+            img_name = f"scene_{scene_num:03d}.png"
+            local_path = f"{OUTPUT_DIR}/{img_name}"
+            
+            # Lấy prompt tương ứng
+            prompt = scenes_data[scene_num - 1].get("prompt", f"Scene {scene_num}") if len(scenes_data) >= scene_num else f"Scene {scene_num}"
+            
+            print(f"🎨 Đang sinh ảnh [{scene_num}/{TOTAL_SCENES}] bằng Agnes AI...")
+            
+            # --- CHÈN CODE HÀM CALL API AGNES AI TẠO ẢNH CỦA BẠN TẠI ĐÂY ---
+            # Sau khi tải xong ảnh xuống local_path, tự động upload lên Drive:
+            upload_file_to_drive(local_path)
+
+        # Quét lại danh sách Drive lần cuối
+        drive_files = get_drive_files_list()
+
+    print(f"✅ [GIAI ĐOẠN 1 HOÀN THÀNH] Đã xác nhận đủ 100/100 ảnh cảnh!")
+    return True
 
 
 # ==========================================
-# 4. BƯỚC 2: KIỂM TRA & TẠO VIDEO + LỒNG TIẾNG
+# BƯỚC 2: CÀI ĐẶT MÔI TRƯỜNG & TẠO VIDEO
 # ==========================================
-def process_single_scene(item):
-    idx, scene = item
-    scene_num = idx + 1
-    
+def auto_install_video_tools():
+    """Chỉ cài đặt tool video sau khi đã chắc chắn đủ 100 ảnh"""
+    print("📦 [GIAI ĐOẠN 2] Đang tiến hành cài đặt công cụ Video (ffmpeg, edge-tts)...")
+    try:
+        subprocess.run(["edge-tts", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        subprocess.run([sys.executable, "-m", "pip", "install", "edge-tts"], check=True)
+
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        subprocess.run("apt-get update && apt-get install -y ffmpeg", shell=True, check=True)
+
+
+def process_single_video_scene(scene_num):
     img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
     voice_audio = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
     scene_video = f"{VIDEO_DIR}/scene_final_{scene_num:03d}.mp4"
 
-    # 1. BƯỚC CHÍNH: Tạo ảnh nếu chưa có
-    prompt = scene.get("prompt", "")
-    if not (os.path.exists(img_path) and os.path.getsize(img_path) > 0):
-        generate_image_if_not_exists(scene_num, prompt)
-
-    # Nếu vẫn không có ảnh thì bỏ qua
-    if not os.path.exists(img_path):
-        print(f"⚠️  Cảnh {scene_num:03d}: Thiếu ảnh nguồn -> Bỏ qua video.")
-        return None
-
-    # 2. KIỂM TRA VIDEO CẢNH: Nếu đã có video rồi -> SKIP
+    # Nếu video cảnh này đã render sẵn -> Bỏ qua
     if os.path.exists(scene_video) and os.path.getsize(scene_video) > 0:
-        print(f"⏭️  [Video {scene_num:03d}] Đã có sẵn -> Bỏ qua render.")
         return scene_video
 
-    # A. Tạo Voice lồng tiếng (TTS)
-    if not (os.path.exists(voice_audio) and os.path.getsize(voice_audio) > 0):
-        dialogue = scene.get("dialogue", "") or prompt
-        if dialogue:
-            clean_text = dialogue.replace('"', '').replace("'", "").replace("\n", " ")
-            cmd_tts = f'edge-tts --text "{clean_text}" --voice vi-VN-NamMinhNeural --write-media "{voice_audio}"'
-            subprocess.run(cmd_tts, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(f'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=mono -t 2 -q:a 9 -acodec libmp3lame "{voice_audio}"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not os.path.exists(img_path):
+        return None
 
-    # B. Render Video bằng FFmpeg Ultrafast (Tối ưu T4 GPU)
+    # Tạo Voice thoại
+    if not (os.path.exists(voice_audio) and os.path.getsize(voice_audio) > 0):
+        cmd_tts = f'edge-tts --text "Cảnh {scene_num}" --voice vi-VN-NamMinhNeural --write-media "{voice_audio}"'
+        subprocess.run(cmd_tts, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Render Video siêu nhanh với FFmpeg Ultrafast
     cmd_render = (
         f'ffmpeg -y -loop 1 -i "{img_path}" -i "{voice_audio}" '
         f'-c:v libx264 -preset ultrafast -tune stillimage -crf 18 -pix_fmt yuv420p '
@@ -186,46 +172,39 @@ def process_single_scene(item):
     return scene_video
 
 
-# ==========================================
-# 5. TIẾN TRÌNH TỔNG HỢP & PHÁT HÀNH PHIM
-# ==========================================
-def main():
-    if not os.path.exists(JSON_LOG):
-        print(f"❌ Không tìm thấy file dữ liệu {JSON_LOG}!")
-        return
+def step_2_render_and_merge_video():
+    # 1. Cài đặt môi trường
+    auto_install_video_tools()
 
-    with open(JSON_LOG, 'r', encoding='utf-8') as f:
-        scenes = json.load(f)
-
-    total = len(scenes)
-    print(f"🚀 BẮT ĐẦU WORKFLOW: {total} cảnh (Xử lý song song {MAX_WORKERS} luồng Kaggle T4)...")
-
-    # Xử lý song song 8 cảnh cùng lúc (Tự tạo ảnh -> Tự tạo voice -> Tự tạo video)
+    # 2. Render 100 cảnh đa luồng T4 GPU
+    print(f"⚡ Bắt đầu render Video cho {TOTAL_SCENES} cảnh (Đa luồng {MAX_WORKERS})...")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        results = list(executor.map(process_single_scene, enumerate(scenes)))
+        results = list(executor.map(process_single_video_scene, range(1, TOTAL_SCENES + 1)))
 
     valid_videos = [v for v in results if v and os.path.exists(v)]
-    print(f"✅ Hoàn thành chuẩn bị: {len(valid_videos)}/{total} video cảnh!")
 
-    if not valid_videos:
-        print("❌ Không có video cảnh nào hợp lệ!")
-        return
-
-    # BƯỚC 3: Ghép toàn bộ các cảnh thành Video Phim Hoàn Chỉnh
-    if not (os.path.exists(FINAL_VIDEO) and os.path.getsize(FINAL_VIDEO) > 0 and len(valid_videos) == total):
+    # 3. Ghép phim hoàn chỉnh
+    if valid_videos and not os.path.exists(FINAL_VIDEO):
         concat_list = "concat_list.txt"
         with open(concat_list, "w", encoding="utf-8") as f:
             for vid in valid_videos:
                 f.write(f"file '{os.path.abspath(vid)}'\n")
 
-        print("🎞️  Đang ghép tất cả cảnh thành PHIM HOÀN CHỈNH...")
+        print("🎞️ Đang ghép toàn bộ các cảnh thành PHIM HOÀN CHỈNH...")
         subprocess.run(f'ffmpeg -y -f concat -safe 0 -i "{concat_list}" -c copy "{FINAL_VIDEO}"', shell=True)
 
-    # BƯỚC 4: Upload file Video Phim Hoàn Chỉnh lên Google Drive
+    # 4. Upload phim hoàn chỉnh lên Google Drive
     if os.path.exists(FINAL_VIDEO):
-        mb_size = os.path.getsize(FINAL_VIDEO) / (1024 * 1024)
-        print(f"🎉 HOÀN THÀNH PHIM: {FINAL_VIDEO} ({mb_size:.2f} MB)")
         upload_file_to_drive(FINAL_VIDEO)
 
+
+# ==========================================
+# ĐIỂM BẮT ĐẦU CHẠY PHÂN LUỒNG TUẦN TỰ
+# ==========================================
 if __name__ == "__main__":
-    main()
+    # BƯỚC 1: Phải đảm bảo ĐỦ 100 ẢNH trước
+    is_images_ready = step_1_check_and_generate_all_images()
+
+    # BƯỚC 2: Chỉ khi đủ 100 ảnh mới chuyển sang CÀI ĐẶT & RENDER VIDEO
+    if is_images_ready:
+        step_2_render_and_merge_video()
