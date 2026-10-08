@@ -51,16 +51,16 @@ jobs:
           echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
 
-          # runtime_config.json cho render_script.py
+          # kernel-metadata.json cho render_script.py
           python - <<'PY'
           import json, os
           cfg = {
               "drive_folder_id": os.environ.get("DRIVE_FOLDER_ID", "").strip(),
               "source": "github_actions",
           }
-          with open("runtime_config.json", "w", encoding="utf-8") as f:
+          with open("kernel-metadata.json", "w", encoding="utf-8") as f:
               json.dump(cfg, f, indent=2, ensure_ascii=False)
-          print("runtime_config.json:", cfg)
+          print("kernel-metadata.json:", cfg)
           PY
 
           # Cập nhật kernel-metadata.json
@@ -99,7 +99,7 @@ jobs:
           inject = '''# --- runtime_config inject ---
           import json as _json, os as _os
           try:
-              with open("runtime_config.json", "r", encoding="utf-8") as _f:
+              with open("kernel-metadata.json", "r", encoding="utf-8") as _f:
                   _cfg = _json.load(_f)
               if _cfg.get("drive_folder_id"):
                   _os.environ["DRIVE_FOLDER_ID"] = str(_cfg["drive_folder_id"])
@@ -122,8 +122,8 @@ jobs:
         run: |
           echo "=== kernel-metadata.json ==="
           cat kernel-metadata.json
-          echo "=== runtime_config.json ==="
-          cat runtime_config.json
+          echo "=== kernel-metadata.json ==="
+          cat kernel-metadata.json
           kaggle kernels push -p .
           echo "✅ Push xong"
 
