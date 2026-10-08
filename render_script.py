@@ -3,6 +3,7 @@
 # - Đọc scenes + character images từ Google Sheet
 # - Gọi Agnes API (agnes-image-2.0-flash)
 # - Có reference nhân vật thì dùng, không có thì text-to-image
+# - Tải ảnh về local & UPLOAD NGAY LÊN GOOGLE DRIVE
 # ============================================================
 
 import os
@@ -14,28 +15,30 @@ import pandas as pd
 from pathlib import Path
 
 # ==================== CONFIG ====================
-AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "sk-ix43BxLdae2nhuPomn1j39qvUGQd2DDXrXv3DSrPdCITnPRX")         # bắt buộc
+AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "sk-ix43BxLdae2nhuPomn1j39qvUGQd2DDXrXv3DSrPdCITnPRX").strip()
 AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 MODEL = "agnes-image-2.0-flash"
 SIZE = "1024x768"
 
-SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
-GID_SCENES = os.environ.get("GID_SCENES", "0")          # sheet chứa 100 cảnh
-GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846") # sheet chứa nhân vật + image_url
+SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8").strip()
+GID_SCENES = os.environ.get("GID_SCENES", "0").strip()          # sheet chứa 100 cảnh
+GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846").strip() # sheet chứa nhân vật + image_url
 
 # Folder Drive (nếu muốn upload)
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 
 # OAuth Google Drive (nếu upload)
-OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
-OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
-OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "").strip()
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
+OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "").strip()
+
+# Kiểm tra điều kiện upload Drive
 USE_DRIVE = bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REFRESH_TOKEN and DRIVE_FOLDER_ID)
 
 # Webhook báo về n8n (tuỳ chọn)
-N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "").strip()
 
-# Giới hạn tốc độ (tránh rate limit + tràn RAM)
+# Giới hạn tốc độ
 WAIT_BETWEEN_SCENES = 4          # giây
 MAX_RETRIES = 3
 
@@ -85,23 +88,23 @@ def find_character_urls(names: list, image_map: dict) -> list:
         if name_clean in ["nhân vật nền", "background", "extra", "crowd", "quần chúng"]:
             continue
 
-        # khớp chính xác
+        # Khớp chính xác
         if name_clean in image_map:
             urls.append(image_map[name_clean])
             continue
 
-        # khớp tương đối
+        # Khớp tương đối
         found = None
         for key, url in image_map.items():
             key_clean = key.lower()
-            if key_clean.includes(name_clean) if False else (name_clean in key_clean or key_clean in name_clean):
+            if name_clean in key_clean or key_clean in name_clean:
                 found = url
                 break
         if found:
             urls.append(found)
             continue
 
-        # khớp theo từ
+        # Khớp theo từ
         words = [w for w in name_clean.split() if len(w) >= 2]
         for word in words:
             for key, url in image_map.items():
@@ -112,7 +115,7 @@ def find_character_urls(names: list, image_map: dict) -> list:
                 urls.append(found)
                 break
 
-    # loại trùng, giữ thứ tự
+    # Loại trùng, giữ thứ tự
     seen = set()
     result = []
     for u in urls:
@@ -125,7 +128,6 @@ def parse_character_names(row) -> list:
     raw = safe_get(row, "character_name", "character_names")
     if not raw:
         return []
-    # hỗ trợ "A, B, C" hoặc "A & B"
     parts = [p.strip() for p in raw.replace("&", ",").replace("|", ",").split(",") if p.strip()]
     return parts
 
@@ -146,7 +148,7 @@ def build_prompt(row, has_reference: bool, names: list) -> str:
     return f"{base}. {STYLE_LOCK}. {ANTI_CHIBI}"
 
 def call_agnes(prompt: str, image_urls: list = None) -> str | None:
-    """Gọi Agnes, trả về image URL hoặc None"""
+    """Gọi Agnes API"""
     if not AGNES_API_KEY:
         print("❌ Thiếu AGNES_API_KEY")
         return None
@@ -190,36 +192,62 @@ def call_agnes(prompt: str, image_urls: list = None) -> str | None:
                 time.sleep(5)
     return None
 
+def get_google_access_token() -> str | None:
+    """Tự động đổi Refresh Token lấy Access Token mới nhất từ Google"""
+    url = "https://oauth2.googleapis.com/token"
+    payload = {
+        "client_id": OAUTH_CLIENT_ID,
+        "client_secret": OAUTH_CLIENT_SECRET,
+        "refresh_token": OAUTH_REFRESH_TOKEN,
+        "grant_type": "refresh_token"
+    }
+    try:
+        r = requests.post(url, data=payload, timeout=20)
+        if r.status_code == 200:
+            return r.json().get("access_token")
+        else:
+            print(f"⚠️ Lỗi lấy Google Access Token ({r.status_code}): {r.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ Lỗi kết nối OAuth Google: {e}")
+    return None
+
 def upload_to_drive(file_path: str, folder_id: str):
-    """Upload file local lên Drive (cần oauth)"""
+    """Upload file local trực tiếp lên Drive qua REST API v3"""
     if not USE_DRIVE or not os.path.exists(file_path):
         return None
-    try:
-        from google.oauth2.credentials import Credentials
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaFileUpload
 
-        creds = Credentials(
-            token=None,
-            refresh_token=OAUTH_REFRESH_TOKEN,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=OAUTH_CLIENT_ID,
-            client_secret=OAUTH_CLIENT_SECRET,
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
-        service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        media = MediaFileUpload(file_path, mimetype="image/png", resumable=True)
-        name = os.path.basename(file_path)
-        f = service.files().create(
-            body={"name": name, "parents": [folder_id]},
-            media_body=media,
-            fields="id"
-        ).execute()
-        print(f"☁️ Uploaded {name}")
-        return f.get("id")
-    except Exception as e:
-        print(f"⚠️ Upload Drive: {e}")
+    token = get_google_access_token()
+    if not token:
+        print("❌ Upload bị hủy do không lấy được Google Access Token")
         return None
+
+    try:
+        file_name = os.path.basename(file_path)
+        metadata = {
+            "name": file_name,
+            "parents": [folder_id]
+        }
+        files = {
+            'data': ('metadata', json.dumps(metadata), 'application/json; charset=UTF-8'),
+            'file': (file_name, open(file_path, 'rb'), 'image/png')
+        }
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r = requests.post(
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+            headers=headers,
+            files=files,
+            timeout=120
+        )
+        if r.status_code == 200:
+            file_id = r.json().get("id")
+            print(f"☁️ Uploaded {file_name} lên Google Drive")
+            return file_id
+        else:
+            print(f"⚠️ Lỗi Upload Drive ({r.status_code}): {r.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ Lỗi Upload Drive: {e}")
+    return None
 
 def download_image(url: str, save_path: str) -> bool:
     try:
@@ -251,6 +279,10 @@ def notify_n8n(status: str, total: int = 0, extra: dict = None):
 # ==================== MAIN ====================
 def main():
     print("🚀 Agnes - Tạo 100 ảnh cảnh")
+    print(f"ℹ️ Trạng thái Drive Upload: {USE_DRIVE}")
+    if not USE_DRIVE:
+        print(f"   ↳ Trạng thái biến: CLIENT_ID={bool(OAUTH_CLIENT_ID)}, SECRET={bool(OAUTH_CLIENT_SECRET)}, REFRESH={bool(OAUTH_REFRESH_TOKEN)}, FOLDER={bool(DRIVE_FOLDER_ID)}")
+
     if not AGNES_API_KEY:
         raise SystemExit("Thiếu AGNES_API_KEY")
 
@@ -279,21 +311,27 @@ def main():
         prompt = build_prompt(row, has_ref, names)
         print(f"\n🎬 [{scene_index}/{total}] {names or 'no-char'} | ref={len(char_urls)}")
 
-        # Bỏ qua nếu đã có file local
         local_name = f"scene_{scene_index:03d}.png"
+
+        # Nếu file đã tồn tại ở local, vẫn upload lên Drive nếu chưa up
         if os.path.exists(local_name) and os.path.getsize(local_name) > 5000:
-            print(f"⏩ Đã có {local_name}")
+            print(f"⏩ Đã có local {local_name}")
+            if USE_DRIVE:
+                upload_to_drive(local_name, DRIVE_FOLDER_ID)
             results.append({"scene_index": scene_index, "image_url": local_name, "status": "exists"})
             success += 1
             continue
 
+        # Gọi API Agnes tạo ảnh
         image_url = call_agnes(prompt, char_urls if has_ref else None)
 
         if image_url:
-            # Tải về local
+            # 1. Tải ảnh về local
             if download_image(image_url, local_name):
+                # 2. Ngay lập tức Upload ảnh này lên Google Drive
                 if USE_DRIVE:
                     upload_to_drive(local_name, DRIVE_FOLDER_ID)
+
                 results.append({
                     "scene_index": scene_index,
                     "image_url": image_url,
@@ -303,7 +341,7 @@ def main():
                     "status": "ok"
                 })
                 success += 1
-                print(f"✅ {local_name}")
+                print(f"✅ Đã xử lý xong {local_name}")
             else:
                 results.append({"scene_index": scene_index, "status": "download_fail", "url": image_url})
                 print("❌ Download fail")
@@ -311,16 +349,16 @@ def main():
             results.append({"scene_index": scene_index, "status": "generate_fail", "characters": names})
             print("❌ Generate fail")
 
-        # Giải phóng + chờ
+        # Dọn dẹp RAM + Chờ trước khi sang ảnh tiếp theo
         gc.collect()
         time.sleep(WAIT_BETWEEN_SCENES)
 
-    # Lưu kết quả
+    # Lưu kết quả tổng
     out_path = "agnes_scene_results.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    print(f"\n🎉 Xong: {success}/{total} ảnh")
-    print(f"📄 Kết quả: {out_path}")
+    print(f"\n🎉 Hoàn thành: {success}/{total} ảnh")
+    print(f"📄 File log kết quả: {out_path}")
 
     notify_n8n("completed", total=success, extra={"result_file": out_path})
     return results
