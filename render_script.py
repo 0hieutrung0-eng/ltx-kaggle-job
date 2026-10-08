@@ -14,7 +14,7 @@ import pandas as pd
 from pathlib import Path
 
 # ==================== CONFIG ====================
-AGNES_API_KEY = os.environ.get("sk-ix43BxLdae2nhuPomn1j39qvUGQd2DDXrXv3DSrPdCITnPRX", "")          # bắt buộc
+AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "sk-ix43BxLdae2nhuPomn1j39qvUGQd2DDXrXv3DSrPdCITnPRX")         # bắt buộc
 AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 MODEL = "agnes-image-2.0-flash"
 SIZE = "1024x768"
