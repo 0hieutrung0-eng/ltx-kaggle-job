@@ -21,7 +21,7 @@ SIZE = "1024x768"
 
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")          # sheet chứa 100 cảnh
-GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1") # sheet chứa nhân vật + image_url
+GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846") # sheet chứa nhân vật + image_url
 
 # Folder Drive (nếu muốn upload)
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
