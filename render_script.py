@@ -6,7 +6,13 @@ import gc
 import requests
 import subprocess
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+
+# Thiết lập chế độ spawn ngay khi import để tránh lỗi CUDA trên Kaggle/Linux
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 
 # ==========================================
 # CẤU HÌNH CƠ BẢN
@@ -34,8 +40,8 @@ GID_SCENES = os.environ.get("GID_SCENES", "0")
 LTX_MODEL = "Lightricks/LTX-Video"
 LTX_WIDTH = 1216       # 720p (16:9) chia hết cho 32
 LTX_HEIGHT = 704
-LTX_NUM_FRAMES = 121    # 121 frames / 24fps = đúng 5s
-LTX_STEPS = 18          # Tối ưu 18 steps
+LTX_NUM_FRAMES = 121    # 121 frames / 24fps = 5 giây
+LTX_STEPS = 18          # Tối ưu 18 steps cho T4 render ~20s
 LTX_FPS = 24
 LTX_NEG = "worst quality, inconsistent motion, blurry, jittery, distorted, morphing, text, watermark"
 
@@ -286,12 +292,13 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
         return video_out
     return video_in
 
-# LỚP HÀM RENDER RIÊNG CHO TỪNG PROCESS (GPU)
+# LỚP HÀM RENDER CHẠY ĐỘC LẬP TRÊN TỪNG PROCESS/GPU
 def worker_render_scenes(gpu_id: int, scene_rows: list):
     import torch
     from diffusers import LTXImageToVideoPipeline
-    from diffusers.utils import export_to_video, load_image
+    from diffusers.utils import export_to_video, load_image, logging
 
+    logging.set_verbosity_error()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     device = "cuda:0"
 
@@ -360,7 +367,7 @@ def worker_render_scenes(gpu_id: int, scene_rows: list):
 
     return results
 
-# GIAI ĐOẠN 2 CHÍNH - PHÂN CHIA GPU
+# GIAI ĐOẠN 2 CHÍNH - PHÂN CHIA GPU SONG SONG
 def step_2_ltx_render_merge():
     import torch
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -387,7 +394,7 @@ def step_2_ltx_render_merge():
         scene_name = f"scene_{scene_num:03d}.mp4"
         final_scene = f"{VIDEO_DIR}/{scene_name}"
 
-        # Nếu đã có trên Drive thì tải về
+        # Tải từ Drive về nếu đã có sẵn
         if scene_name in drive_map and not (os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000):
             download_from_drive(drive_map[scene_name], final_scene)
 
@@ -400,7 +407,7 @@ def step_2_ltx_render_merge():
 
     print(f"📌 Tổng số cảnh cần Render: {len(scenes_to_process)}/{TOTAL_SCENES}")
 
-    # Chia việc cho các GPU
+    # Chạy song song nếu có từ 2 GPU
     if num_gpus >= 2:
         gpu_0_tasks = [task for task in scenes_to_process if task["scene_num"] % 2 != 0] # Lẻ
         gpu_1_tasks = [task for task in scenes_to_process if task["scene_num"] % 2 == 0] # Chẵn
@@ -408,14 +415,16 @@ def step_2_ltx_render_merge():
         print(f"🚀 Phân tải: GPU 0 gánh {len(gpu_0_tasks)} cảnh | GPU 1 gánh {len(gpu_1_tasks)} cảnh")
 
         t0 = time.time()
-        with ProcessPoolExecutor(max_workers=2) as executor:
-            f0 = executor.submit(worker_render_scenes, 0, gpu_0_tasks)
-            f1 = executor.submit(worker_render_scenes, 1, gpu_1_tasks)
-            res0 = f0.result()
-            res1 = f1.result()
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=2) as pool:
+            f0 = pool.apply_async(worker_render_scenes, (0, gpu_0_tasks))
+            f1 = pool.apply_async(worker_render_scenes, (1, gpu_1_tasks))
+            
+            res0 = f0.get()
+            res1 = f1.get()
+
         print(f"⏱️ Hoàn thành tất cả các cảnh trong {(time.time()-t0)/60:.1f} phút!")
     else:
-        # Trường hợp chỉ có 1 GPU
         worker_render_scenes(0, scenes_to_process)
 
     # Tổng hợp các scene hoàn chỉnh
