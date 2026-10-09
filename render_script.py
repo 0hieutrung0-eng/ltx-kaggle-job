@@ -6,16 +6,6 @@ import gc
 import requests
 import subprocess
 import pandas as pd
-import multiprocessing as mp
-
-# Thiết lập chế độ spawn ngay từ đầu
-try:
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    pass
-
-# Cấu hình PYTORCH ALLOCATOR tránh phân mảnh VRAM
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ==========================================
 # CẤU HÌNH CƠ BẢN
@@ -38,13 +28,13 @@ SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af35
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
 # ==========================================
-# CẤU HÌNH LTX-VIDEO (TỐI ƯU VRAM T4 - KHÔNG LỖI OOM)
+# CẤU HÌNH LTX-VIDEO (CHẠY 1 GPU - ĐỘ PHÂN GIẢI 720P)
 # ==========================================
 LTX_MODEL = "Lightricks/LTX-Video"
-LTX_WIDTH = 960         # Kích thước tối ưu nhất cho T4 15GB (Chuẩn 16:9, chia hết cho 32)
-LTX_HEIGHT = 544
-LTX_NUM_FRAMES = 121    # 121 frames / 24fps = 5 giây
-LTX_STEPS = 18          # Tối ưu 18 steps cho T4 render ~20s
+LTX_WIDTH = 1216       # Chuẩn 720p (16:9) chia hết cho 32
+LTX_HEIGHT = 704
+LTX_NUM_FRAMES = 121    # 121 frames / 24fps = đúng 5 giây
+LTX_STEPS = 18          # Render ~20s/scene trên T4
 LTX_FPS = 24
 LTX_NEG = "worst quality, inconsistent motion, blurry, jittery, distorted, morphing, text, watermark"
 
@@ -192,7 +182,7 @@ def download_url(url: str, path: str) -> bool:
     return False
 
 # ==========================================
-# GIAI ĐOẠN 1: TẠO/ĐỦ 100 CẢNH ÁNH
+# GIAI ĐOẠN 1: ĐỦ 100 ẢNH SCENE
 # ==========================================
 def step_1_ensure_images():
     print("\n" + "=" * 50)
@@ -240,7 +230,7 @@ def step_1_ensure_images():
     return ok >= max(1, int(len(df_scenes) * 0.8))
 
 # ==========================================
-# GIAI ĐOẠN 2: LTX ENGINE DUAL GPU
+# GIAI ĐOẠN 2: LTX ENGINE (SINGLE GPU - SINGLE PROCESS)
 # ==========================================
 def install_ltx_deps():
     print("📦 Fix môi trường LTX...")
@@ -254,6 +244,27 @@ def install_ltx_deps():
         ],
         check=False,
     )
+
+def load_ltx_pipe():
+    import torch
+    from diffusers import LTXImageToVideoPipeline
+    from diffusers.utils import logging
+
+    logging.set_verbosity_error()
+
+    print(f"🧠 Load LTX Model: {LTX_MODEL}")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    pipe = LTXImageToVideoPipeline.from_pretrained(LTX_MODEL, torch_dtype=dtype)
+
+    if torch.cuda.is_available():
+        pipe.enable_model_cpu_offload()  # Tự động đẩy phần thừa về RAM, chống OOM 100%
+        try:
+            pipe.vae.enable_tiling()
+        except Exception:
+            pass
+
+    print("✅ LTX Pipeline sẵn sàng trên Single GPU!")
+    return pipe
 
 def get_video_prompt(row) -> str:
     vp = safe_get(row, "video_prompt")
@@ -295,55 +306,60 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
         return video_out
     return video_in
 
-# HÀM KHỞI TẠO CÁCH LY DEVICE CHO MỖI SUBPROCESS
-def init_gpu_worker(gpu_id: int):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-# WORKER CHẠY RENDER RIÊNG TRÊN GPU ĐÃ CÁCH LY
-def worker_render_scenes(gpu_id: int, scene_rows: list):
+def step_2_ltx_render_merge():
     import torch
-    from diffusers import LTXImageToVideoPipeline
-    from diffusers.utils import export_to_video, load_image, logging
+    from diffusers.utils import export_to_video, load_image
 
-    logging.set_verbosity_error()
-    device = "cuda:0"
+    print("\n" + "=" * 50)
+    print("🎬 GIAI ĐOẠN 2: LTX Render trên 1 GPU (Độ phân giải 720p)")
+    print("=" * 50)
 
-    print(f"⚡ Launching GPU {gpu_id} (Phụ trách {len(scene_rows)} scenes)...")
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    pipe = LTXImageToVideoPipeline.from_pretrained(LTX_MODEL, torch_dtype=dtype)
-    
-    # TIẾT KIỆM VRAM CHỐNG LỖI OOM
-    if torch.cuda.is_available():
-        pipe.enable_model_cpu_offload()
-        try:
-            pipe.vae.enable_tiling()
-        except Exception:
-            pass
+    install_ltx_deps()
+    pipe = load_ltx_pipe()
 
-    results = []
-    for row in scene_rows:
-        scene_num = int(row["scene_num"])
+    df_scenes = get_sheet_csv(GID_SCENES)
+    drive_map = get_drive_files_map()
+
+    # Tải ảnh thiếu từ Drive về local
+    for i in range(1, TOTAL_SCENES + 1):
+        local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
+        name = f"scene_{i:03d}.png"
+        if not (os.path.exists(local) and os.path.getsize(local) > 2000):
+            if name in drive_map:
+                download_from_drive(drive_map[name], local)
+
+    rendered = []
+    t0 = time.time()
+
+    for idx, row in df_scenes.iterrows():
+        scene_num = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else idx + 1
         scene_name = f"scene_{scene_num:03d}.mp4"
         img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
         raw_video = f"{VIDEO_DIR}/ltx_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/{scene_name}"
 
-        if os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000:
-            print(f"⏩ GPU {gpu_id} | [{scene_num}] Đã có video local.")
-            results.append(final_scene)
+        # Nếu cảnh video đã có trên Drive thì tải về và bỏ qua
+        if scene_name in drive_map:
+            if not (os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000):
+                download_from_drive(drive_map[scene_name], final_scene)
+            rendered.append(final_scene)
+            print(f"⏩ [{scene_num}/{TOTAL_SCENES}] Đã có trên Drive, bỏ qua.")
             continue
 
         if not (os.path.exists(img_path) and os.path.getsize(img_path) > 2000):
-            print(f"⚠️ GPU {gpu_id} | [{scene_num}] Thiếu ảnh gốc")
+            print(f"⚠️ [{scene_num}/{TOTAL_SCENES}] Thiếu ảnh gốc")
             continue
 
-        prompt = row["prompt"]
-        dialogue = row["dialogue"]
+        prompt = get_video_prompt(row)
+        dialogue = get_dialogue(row)
 
-        print(f"🎥 GPU {gpu_id} | [{scene_num}] Rendering LTX...")
+        print(f"\n🎥 [{scene_num}/{TOTAL_SCENES}] Rendering LTX 720p...")
+        print(f"   prompt: {prompt[:80]}...")
+
         try:
             image = load_image(img_path)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
             t_start = time.time()
@@ -363,103 +379,33 @@ def worker_render_scenes(gpu_id: int, scene_rows: list):
             make_tts(dialogue, voice_mp3)
             out_file = mix_video_audio(raw_video, voice_mp3, final_scene)
 
-            print(f"✅ GPU {gpu_id} | [{scene_num}] Xong ({time.time()-t_start:.1f}s)")
+            print(f"✅ [{scene_num}] Render xong trong {time.time()-t_start:.1f}s")
+            
+            # Tải ngay cảnh vừa làm lên Google Drive
             upload_file_to_drive(out_file)
-            results.append(out_file)
+            rendered.append(out_file)
 
             del res, frames
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"❌ GPU {gpu_id} | [{scene_num}] Lỗi: {e}")
+            print(f"❌ [{scene_num}] Lỗi LTX: {e}")
 
-    return results
-
-# GIAI ĐOẠN 2 CHÍNH - PHÂN CHIA GPU SONG SONG
-def step_2_ltx_render_merge():
-    import torch
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    print("\n" + "=" * 50)
-    print(f"🎬 GIAI ĐOẠN 2: LTX Render trên {num_gpus} GPU (Song Song)")
-    print("=" * 50)
-
-    install_ltx_deps()
-    df_scenes = get_sheet_csv(GID_SCENES)
-    drive_map = get_drive_files_map()
-
-    # Tải ảnh thiếu về local
-    for i in range(1, TOTAL_SCENES + 1):
-        local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
-        name = f"scene_{i:03d}.png"
-        if not (os.path.exists(local) and os.path.getsize(local) > 2000):
-            if name in drive_map:
-                download_from_drive(drive_map[name], local)
-
-    # Gom danh sách scene cần render
-    scenes_to_process = []
-    for idx, row in df_scenes.iterrows():
-        scene_num = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else idx + 1
-        scene_name = f"scene_{scene_num:03d}.mp4"
-        final_scene = f"{VIDEO_DIR}/{scene_name}"
-
-        # Tải từ Drive về nếu đã có sẵn
-        if scene_name in drive_map and not (os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000):
-            download_from_drive(drive_map[scene_name], final_scene)
-
-        if not (os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000):
-            scenes_to_process.append({
-                "scene_num": scene_num,
-                "prompt": get_video_prompt(row),
-                "dialogue": get_dialogue(row),
-            })
-
-    print(f"📌 Tổng số cảnh cần Render: {len(scenes_to_process)}/{TOTAL_SCENES}")
-
-    # Chạy song song nếu có từ 2 GPU
-    if num_gpus >= 2:
-        gpu_0_tasks = [task for task in scenes_to_process if task["scene_num"] % 2 != 0] # Lẻ
-        gpu_1_tasks = [task for task in scenes_to_process if task["scene_num"] % 2 == 0] # Chẵn
-
-        print(f"🚀 Phân tải: GPU 0 gánh {len(gpu_0_tasks)} cảnh | GPU 1 gánh {len(gpu_1_tasks)} cảnh")
-
-        t0 = time.time()
-        
-        # Tạo Process 0 cho GPU 0
-        p0 = mp.Process(target=worker_render_scenes, args=(0, gpu_0_tasks))
-        # Tạo Process 1 cho GPU 1
-        p1 = mp.Process(target=worker_render_scenes, args=(1, gpu_1_tasks))
-
-        # Khởi chạy đồng thời cả 2 GPU
-        p0.start()
-        p1.start()
-
-        # Chờ cả 2 GPU hoàn thành
-        p0.join()
-        p1.join()
-
-        print(f"⏱️ Hoàn thành tất cả các cảnh trong {(time.time()-t0)/60:.1f} phút!")
-    else:
-        worker_render_scenes(0, scenes_to_process)
-
-    # Tổng hợp các scene hoàn chỉnh
-    rendered = [
-        f"{VIDEO_DIR}/scene_{i:03d}.mp4" 
-        for i in range(1, TOTAL_SCENES + 1) 
-        if os.path.exists(f"{VIDEO_DIR}/scene_{i:03d}.mp4")
-    ]
+    print(f"\n✅ LTX hoàn tất {len(rendered)}/{TOTAL_SCENES} cảnh trong {(time.time()-t0)/60:.1f} phút")
 
     if not rendered:
         print("❌ Không có video để ghép")
         return False
 
-    # Ghép Phim
+    # Ghép phim hoàn chỉnh
     concat_file = "concat_list.txt"
     with open(concat_file, "w", encoding="utf-8") as f:
         for v in sorted(rendered):
             f.write(f"file '{os.path.abspath(v)}'\n")
 
-    print("🎞️ Đang ghép phim final_full_movie.mp4...")
+    print("\n🎞️ Đang ghép toàn bộ phim final_full_movie.mp4...")
     subprocess.run(
         f'ffmpeg -y -hide_banner -loglevel error '
         f'-f concat -safe 0 -i "{concat_file}" -c copy -movflags +faststart "{FINAL_VIDEO}"',
@@ -483,12 +429,12 @@ if __name__ == "__main__":
     try:
         import torch
         print("CUDA Available:", torch.cuda.is_available(),
-              "| Số GPU:", torch.cuda.device_count())
+              "| Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
     except Exception as e:
         print("Torch:", e)
 
     if step_1_ensure_images():
         step_2_ltx_render_merge()
-        print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH SONG SONG!")
+        print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
     else:
         print("\n❌ Dừng: chưa đủ ảnh ở Giai đoạn 1")
