@@ -8,11 +8,14 @@ import subprocess
 import pandas as pd
 import multiprocessing as mp
 
-# Thiết lập chế độ spawn ngay khi import để tránh lỗi CUDA trên Kaggle/Linux
+# Thiết lập chế độ spawn ngay từ đầu
 try:
     mp.set_start_method("spawn", force=True)
 except RuntimeError:
     pass
+
+# Cấu hình PYTORCH ALLOCATOR tránh phân mảnh VRAM
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ==========================================
 # CẤU HÌNH CƠ BẢN
@@ -35,11 +38,11 @@ SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af35
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
 # ==========================================
-# CẤU HÌNH LTX-VIDEO (TỐI ƯU 720P)
+# CẤU HÌNH LTX-VIDEO (TỐI ƯU VRAM T4 - KHÔNG LỖI OOM)
 # ==========================================
 LTX_MODEL = "Lightricks/LTX-Video"
-LTX_WIDTH = 1216       # 720p (16:9) chia hết cho 32
-LTX_HEIGHT = 704
+LTX_WIDTH = 960         # Kích thước tối ưu nhất cho T4 15GB (Chuẩn 16:9, chia hết cho 32)
+LTX_HEIGHT = 544
 LTX_NUM_FRAMES = 121    # 121 frames / 24fps = 5 giây
 LTX_STEPS = 18          # Tối ưu 18 steps cho T4 render ~20s
 LTX_FPS = 24
@@ -292,24 +295,30 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
         return video_out
     return video_in
 
-# LỚP HÀM RENDER CHẠY ĐỘC LẬP TRÊN TỪNG PROCESS/GPU
+# HÀM KHỞI TẠO CÁCH LY DEVICE CHO MỖI SUBPROCESS
+def init_gpu_worker(gpu_id: int):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+# WORKER CHẠY RENDER RIÊNG TRÊN GPU ĐÃ CÁCH LY
 def worker_render_scenes(gpu_id: int, scene_rows: list):
     import torch
     from diffusers import LTXImageToVideoPipeline
     from diffusers.utils import export_to_video, load_image, logging
 
     logging.set_verbosity_error()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     device = "cuda:0"
 
-    print(f"⚡ Launching GPU {gpu_id} for {len(scene_rows)} scenes...")
+    print(f"⚡ Launching GPU {gpu_id} (Phụ trách {len(scene_rows)} scenes)...")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    pipe = LTXImageToVideoPipeline.from_pretrained(LTX_MODEL, torch_dtype=dtype).to(device)
-
-    try:
-        pipe.vae.enable_tiling()
-    except Exception:
-        pass
+    pipe = LTXImageToVideoPipeline.from_pretrained(LTX_MODEL, torch_dtype=dtype)
+    
+    # TIẾT KIỆM VRAM CHỐNG LỖI OOM
+    if torch.cuda.is_available():
+        pipe.enable_model_cpu_offload()
+        try:
+            pipe.vae.enable_tiling()
+        except Exception:
+            pass
 
     results = []
     for row in scene_rows:
@@ -332,10 +341,10 @@ def worker_render_scenes(gpu_id: int, scene_rows: list):
         prompt = row["prompt"]
         dialogue = row["dialogue"]
 
-        print(f"🎥 GPU {gpu_id} | [{scene_num}] Rendering LTX 720p...")
+        print(f"🎥 GPU {gpu_id} | [{scene_num}] Rendering LTX...")
         try:
             image = load_image(img_path)
-            generator = torch.Generator(device=device).manual_seed(42 + scene_num)
+            generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
             t_start = time.time()
             res = pipe(
@@ -415,13 +424,19 @@ def step_2_ltx_render_merge():
         print(f"🚀 Phân tải: GPU 0 gánh {len(gpu_0_tasks)} cảnh | GPU 1 gánh {len(gpu_1_tasks)} cảnh")
 
         t0 = time.time()
-        ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=2) as pool:
-            f0 = pool.apply_async(worker_render_scenes, (0, gpu_0_tasks))
-            f1 = pool.apply_async(worker_render_scenes, (1, gpu_1_tasks))
-            
-            res0 = f0.get()
-            res1 = f1.get()
+        
+        # Tạo Process 0 cho GPU 0
+        p0 = mp.Process(target=worker_render_scenes, args=(0, gpu_0_tasks))
+        # Tạo Process 1 cho GPU 1
+        p1 = mp.Process(target=worker_render_scenes, args=(1, gpu_1_tasks))
+
+        # Khởi chạy đồng thời cả 2 GPU
+        p0.start()
+        p1.start()
+
+        # Chờ cả 2 GPU hoàn thành
+        p0.join()
+        p1.join()
 
         print(f"⏱️ Hoàn thành tất cả các cảnh trong {(time.time()-t0)/60:.1f} phút!")
     else:
