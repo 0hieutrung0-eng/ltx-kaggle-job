@@ -28,7 +28,7 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# LTX — an toàn T4 16GB (test OK rồi tăng dần)
+# LTX — an toàn T4 (test OK rồi tăng dần)
 LTX_MODEL = "Lightricks/LTX-Video"
 LTX_WIDTH = 768
 LTX_HEIGHT = 512
@@ -232,38 +232,41 @@ def step_1_ensure_images():
 # GIAI ĐOẠN 2: LTX 1 GPU
 # ==========================================
 def install_ltx_deps():
-    print("📦 Gỡ + cài lại diffusers sạch (fix is_flax_available / torchao)...")
+    """Cài nhẹ — không đụng PyTorch / CUDA."""
+    print("📦 Cài nhẹ LTX (xóa sạch diffusers lẫn version)...")
 
-    # 1) Gỡ bản lỗi / lẫn version
     subprocess.run(
-        [
-            sys.executable, "-m", "pip", "uninstall", "-y",
-            "torchao", "diffusers", "huggingface-hub",
-        ],
+        [sys.executable, "-m", "pip", "uninstall", "-y", "torchao", "diffusers"],
         check=False,
     )
 
-    # 2) Cài đồng bộ, không cache
+    # Xóa file sót trên disk
+    subprocess.run(
+        "rm -rf /usr/local/lib/python3.13/dist-packages/diffusers "
+        "/usr/local/lib/python3.13/dist-packages/diffusers-*.dist-info "
+        "/usr/local/lib/python3.*/dist-packages/diffusers "
+        "/usr/local/lib/python3.*/dist-packages/diffusers-*.dist-info",
+        shell=True,
+        check=False,
+    )
+
+    # Cài diffusers không kéo torch
     subprocess.run(
         [
             sys.executable, "-m", "pip", "install", "-q",
-            "--no-cache-dir", "--force-reinstall",
-            "huggingface-hub==0.26.5",
+            "--no-cache-dir", "--no-deps",
             "diffusers==0.32.2",
-            "transformers==4.46.3",
-            "accelerate==1.1.1",
-            "tokenizers==0.20.3",
-            "sentencepiece",
-            "imageio",
-            "imageio-ffmpeg",
-            "edge-tts",
-            "safetensors",
-            "protobuf<6",
+        ],
+        check=False,
+    )
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir",
+            "safetensors", "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
         ],
         check=False,
     )
 
-    # 3) ffmpeg
     try:
         subprocess.run(
             ["ffmpeg", "-version"],
@@ -277,30 +280,26 @@ def install_ltx_deps():
             shell=True,
             check=False,
         )
+    print("✅ Cài package xong")
 
-    # 4) Kiểm tra import
-    try:
-        from diffusers import LTXImageToVideoPipeline  # noqa: F401
-        print("✅ diffusers + LTXImageToVideoPipeline OK")
-    except Exception as e:
-        print(f"⚠️ Import fail: {e}")
-        print("→ Thử cài diffusers từ GitHub tag v0.32.2...")
-        subprocess.run(
-            [
-                sys.executable, "-m", "pip", "install", "-q",
-                "--no-cache-dir",
-                "git+https://github.com/huggingface/diffusers.git@v0.32.2",
-            ],
-            check=False,
-        )
-        try:
-            from diffusers import LTXImageToVideoPipeline  # noqa: F401
-            print("✅ Import OK sau khi cài từ GitHub")
-        except Exception as e2:
-            print(f"❌ Vẫn lỗi import: {e2}")
-            print("👉 Hãy Restart Session Kaggle rồi chạy lại script")
+def _patch_diffusers_utils():
+    """Vá is_flax_available trước khi import pipelines."""
+    for k in list(sys.modules.keys()):
+        if k == "diffusers" or k.startswith("diffusers."):
+            del sys.modules[k]
+
+    import diffusers.utils as du
+    for name, fn in [
+        ("is_flax_available", lambda: False),
+        ("is_bs4_available", lambda: False),
+        ("is_ftfy_available", lambda: False),
+    ]:
+        if not hasattr(du, name):
+            setattr(du, name, fn)
 
 def load_ltx_pipe():
+    _patch_diffusers_utils()
+
     from diffusers import LTXImageToVideoPipeline
     from diffusers.utils import logging
 
@@ -366,8 +365,6 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
     return video_in
 
 def step_2_ltx_render_merge():
-    from diffusers.utils import export_to_video, load_image
-
     print("\n" + "=" * 50)
     print(f"🎬 GIAI ĐOẠN 2: LTX 1 GPU | {LTX_WIDTH}x{LTX_HEIGHT} | frames={LTX_NUM_FRAMES}")
     print("=" * 50)
@@ -375,10 +372,11 @@ def step_2_ltx_render_merge():
     install_ltx_deps()
     pipe = load_ltx_pipe()
 
+    from diffusers.utils import export_to_video, load_image
+
     df_scenes = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
 
-    # Tải ảnh local nếu thiếu
     for i in range(1, TOTAL_SCENES + 1):
         local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
         name = f"scene_{i:03d}.png"
@@ -397,13 +395,11 @@ def step_2_ltx_render_merge():
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/{scene_name}"
 
-        # Đã có local
         if os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000:
             print(f"⏩ [{scene_num}] đã có local")
             rendered.append(final_scene)
             continue
 
-        # Đã có trên Drive
         if scene_name in drive_map:
             ok_dl = download_from_drive(drive_map[scene_name], final_scene)
             if ok_dl and os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000:
@@ -458,13 +454,9 @@ def step_2_ltx_render_merge():
 
     print(f"\n✅ LTX xong {len(rendered)}/{TOTAL_SCENES} trong {(time.time() - t0) / 60:.1f} phút")
 
-    if not rendered:
-        print("❌ Không có video để ghép")
-        return False
-
     valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 5000]
     if not valid:
-        print("❌ Không có file video hợp lệ")
+        print("❌ Không có video để ghép")
         return False
 
     concat_file = "concat_list.txt"
