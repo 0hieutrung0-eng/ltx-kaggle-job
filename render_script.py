@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → CogVideoX-2B → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Agnes → CogVideoX-2B (fixed) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -27,23 +27,16 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- CogVideoX-2B (tối ưu T4) ---
+# --- CogVideoX-2B (cấu hình an toàn T4) ---
 COG_MODEL = "THUDM/CogVideoX-2b"
-COG_WIDTH = 720          # chia hết 16
+COG_WIDTH = 720
 COG_HEIGHT = 480
-COG_NUM_FRAMES = 49      # ~6s @ 8fps (sau đó đẩy lên 24fps)
-COG_STEPS = 30           # 25–35 là ngọt
+COG_NUM_FRAMES = 49          # bắt buộc 49 (tránh lỗi size tensor)
+COG_STEPS = 30
 COG_FPS = 8
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
-
-COG_NEG = (
-    "still image, frozen, static, no movement, slideshow, "
-    "morphing, face morphing, identity change, distorted face, "
-    "blurry, jittery, low quality, worst quality, "
-    "extra limbs, deformed hands, text, watermark"
-)
 
 # --- Agnes ---
 AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
@@ -256,7 +249,6 @@ def step_1_ensure_images():
 def install_deps():
     print("📦 Kiểm tra / cài dependency...")
     try:
-        import diffusers
         from diffusers import CogVideoXImageToVideoPipeline
         print("✅ diffusers + CogVideoX đã có")
     except Exception:
@@ -276,12 +268,9 @@ def install_deps():
         subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg", shell=True, check=False)
 
 def get_video_prompt(row) -> str:
-    """
-    Prompt ngắn, 1 động tác chính + consistent characters
-    """
+    """Prompt ngắn, 1 động tác chính, tránh 'then...then...'"""
     vp = safe_get(row, "video_prompt")
     if vp:
-        # Làm sạch prompt quá dài / nhiều "then"
         return vp[:220]
     ip = safe_get(row, "image_prompt", "scene_description")
     if ip:
@@ -323,9 +312,7 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
     return video_in
 
 def post_process_video(raw_path: str, out_path: str) -> str:
-    """
-    Upscale + đẩy fps lên 24 + làm nét (không dùng minterpolate nặng)
-    """
+    """Upscale + đẩy 24fps + làm nét"""
     if not os.path.exists(raw_path):
         return raw_path
 
@@ -350,8 +337,8 @@ def load_cog_pipe():
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load CogVideoX-2B (tối ưu T4)...")
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    print("🧠 Đang load CogVideoX-2B (fixed)...")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
 
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(
         COG_MODEL,
@@ -359,22 +346,16 @@ def load_cog_pipe():
     )
 
     if torch.cuda.is_available():
-        try:
-            pipe.enable_model_cpu_offload()
-            print("✅ model_cpu_offload")
-        except Exception:
-            pipe = pipe.to("cuda")
-            print("⚠️ Fallback .to('cuda')")
-
+        pipe.enable_model_cpu_offload()
+        print("✅ model_cpu_offload")
         try:
             pipe.vae.enable_tiling()
             print("✅ VAE tiling")
         except Exception:
             pass
-
         try:
-            pipe.enable_attention_slicing()
-            print("✅ Attention slicing")
+            pipe.vae.enable_slicing()
+            print("✅ VAE slicing")
         except Exception:
             pass
 
@@ -387,7 +368,7 @@ def load_cog_pipe():
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: RENDER CogVideoX (1 GPU)
+# GIAI ĐOẠN 2: RENDER CogVideoX
 # ==========================================
 def step_2_cog_render():
     import torch
@@ -451,22 +432,26 @@ def step_2_cog_render():
         try:
             t1 = time.time()
 
-            # Dọn VRAM
+            # Dọn VRAM trước mỗi cảnh
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
 
-            image = load_image(img_path).resize((COG_WIDTH, COG_HEIGHT), Image.LANCZOS)
+            # Ảnh phải RGB + đúng size
+            image = load_image(img_path).convert("RGB").resize(
+                (COG_WIDTH, COG_HEIGHT), Image.LANCZOS
+            )
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
+            # === ĐÃ SỬA: bỏ negative_prompt, cố định frames=49, thêm use_dynamic_cfg ===
             res = pipe(
                 image=image,
                 prompt=prompt,
-                negative_prompt=COG_NEG,
-                num_frames=COG_NUM_FRAMES,
+                num_frames=49,
                 num_inference_steps=COG_STEPS,
                 guidance_scale=6.0,
+                use_dynamic_cfg=True,
                 generator=generator,
             )
             export_to_video(res.frames[0], raw_video, fps=COG_FPS)
@@ -484,7 +469,7 @@ def step_2_cog_render():
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
-            # Xóa tạm
+            # Xóa file tạm
             for tmp in [raw_video, upscaled]:
                 if os.path.exists(tmp) and tmp != out_file:
                     try:
