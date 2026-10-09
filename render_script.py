@@ -28,8 +28,7 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# LTX — mặc định an toàn T4 16GB
-# (Muốn 720p hơn: WIDTH=1024 HEIGHT=576 FRAMES=73 sau khi test OK)
+# LTX — an toàn T4 16GB (test OK rồi tăng dần)
 LTX_MODEL = "Lightricks/LTX-Video"
 LTX_WIDTH = 768
 LTX_HEIGHT = 512
@@ -233,24 +232,38 @@ def step_1_ensure_images():
 # GIAI ĐOẠN 2: LTX 1 GPU
 # ==========================================
 def install_ltx_deps():
-    print("📦 Cài package LTX (gỡ torchao lỗi)...")
-    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
+    print("📦 Gỡ + cài lại diffusers sạch (fix is_flax_available / torchao)...")
+
+    # 1) Gỡ bản lỗi / lẫn version
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "uninstall", "-y",
+            "torchao", "diffusers", "huggingface-hub",
+        ],
+        check=False,
+    )
+
+    # 2) Cài đồng bộ, không cache
     subprocess.run(
         [
             sys.executable, "-m", "pip", "install", "-q",
+            "--no-cache-dir", "--force-reinstall",
+            "huggingface-hub==0.26.5",
             "diffusers==0.32.2",
             "transformers==4.46.3",
             "accelerate==1.1.1",
+            "tokenizers==0.20.3",
             "sentencepiece",
             "imageio",
             "imageio-ffmpeg",
             "edge-tts",
             "safetensors",
-            "huggingface_hub",
             "protobuf<6",
         ],
         check=False,
     )
+
+    # 3) ffmpeg
     try:
         subprocess.run(
             ["ffmpeg", "-version"],
@@ -264,6 +277,28 @@ def install_ltx_deps():
             shell=True,
             check=False,
         )
+
+    # 4) Kiểm tra import
+    try:
+        from diffusers import LTXImageToVideoPipeline  # noqa: F401
+        print("✅ diffusers + LTXImageToVideoPipeline OK")
+    except Exception as e:
+        print(f"⚠️ Import fail: {e}")
+        print("→ Thử cài diffusers từ GitHub tag v0.32.2...")
+        subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install", "-q",
+                "--no-cache-dir",
+                "git+https://github.com/huggingface/diffusers.git@v0.32.2",
+            ],
+            check=False,
+        )
+        try:
+            from diffusers import LTXImageToVideoPipeline  # noqa: F401
+            print("✅ Import OK sau khi cài từ GitHub")
+        except Exception as e2:
+            print(f"❌ Vẫn lỗi import: {e2}")
+            print("👉 Hãy Restart Session Kaggle rồi chạy lại script")
 
 def load_ltx_pipe():
     from diffusers import LTXImageToVideoPipeline
@@ -368,7 +403,7 @@ def step_2_ltx_render_merge():
             rendered.append(final_scene)
             continue
 
-        # Đã có trên Drive → tải về
+        # Đã có trên Drive
         if scene_name in drive_map:
             ok_dl = download_from_drive(drive_map[scene_name], final_scene)
             if ok_dl and os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000:
@@ -427,7 +462,6 @@ def step_2_ltx_render_merge():
         print("❌ Không có video để ghép")
         return False
 
-    # Chỉ ghép file thật sự tồn tại
     valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 5000]
     if not valid:
         print("❌ Không có file video hợp lệ")
