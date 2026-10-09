@@ -26,9 +26,7 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
-GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846")
 
-# LTX Image-to-Video (T4)
 LTX_MODEL = "Lightricks/LTX-Video"
 LTX_WIDTH = 704
 LTX_HEIGHT = 480
@@ -153,9 +151,9 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 # ==========================================
-# AGNES (khi thiếu ảnh)
+# AGNES
 # ==========================================
-def call_agnes(prompt: str) -> str | None:
+def call_agnes(prompt: str):
     if not AGNES_API_KEY:
         return None
     body = {
@@ -169,7 +167,6 @@ def call_agnes(prompt: str) -> str | None:
         r = requests.post(AGNES_URL, headers=headers, json=body, timeout=120)
         if r.status_code == 200:
             return r.json().get("data", [{}])[0].get("url")
-        print(f"❌ Agnes {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"❌ Agnes: {e}")
     return None
@@ -185,7 +182,7 @@ def download_url(url: str, path: str) -> bool:
     return False
 
 # ==========================================
-# GIAI ĐOẠN 1: ĐỦ ẢNH
+# GIAI ĐOẠN 1
 # ==========================================
 def step_1_ensure_images():
     print("\n" + "=" * 50)
@@ -220,8 +217,8 @@ def step_1_ensure_images():
             ok += 1
             continue
 
-        prompt = safe_get(row, "image_prompt", "scene_description") or f"Scene {scene_num}, 3d chinese donghua"
-        print(f"🎨 [{scene_num}] tạo ảnh Agnes...")
+        prompt = safe_get(row, "image_prompt", "scene_description") or f"Scene {scene_num}"
+        print(f"🎨 [{scene_num}] Agnes...")
         url = call_agnes(prompt)
         if url and download_url(url, local):
             upload_file_to_drive(local)
@@ -233,29 +230,35 @@ def step_1_ensure_images():
     return ok >= max(1, int(len(df_scenes) * 0.8))
 
 # ==========================================
-# GIAI ĐOẠN 2: LTX I2V
+# GIAI ĐOẠN 2: LTX (fix torchao)
 # ==========================================
 def install_ltx_deps():
-    print("📦 Cài / nâng cấp package cho LTX...")
-    # Fix FqnToConfig: nâng torchao TRƯỚC
+    print("📦 Fix môi trường LTX (gỡ torchao lỗi + cài diffusers ổn định)...")
+
+    # 1) Gỡ torchao bị lỗi ABI trên Python 3.13 Kaggle
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "-U", "torchao"],
+        [sys.executable, "-m", "pip", "uninstall", "-y", "torchao"],
         check=False,
     )
+
+    # 2) Cài bản diffusers ổn định (không phụ thuộc torchao quantizer mới)
     subprocess.run(
         [
-            sys.executable, "-m", "pip", "install", "-q", "-U",
-            "diffusers==0.33.1",
-            "transformers",
-            "accelerate",
+            sys.executable, "-m", "pip", "install", "-q",
+            "diffusers==0.32.2",
+            "transformers==4.46.3",
+            "accelerate==1.1.1",
             "sentencepiece",
             "imageio",
             "imageio-ffmpeg",
             "edge-tts",
+            "safetensors",
+            "huggingface_hub",
             "protobuf<6",
         ],
         check=False,
     )
+
     try:
         subprocess.run(
             ["ffmpeg", "-version"],
@@ -271,17 +274,14 @@ def install_ltx_deps():
         )
 
 def load_ltx_pipe():
-    # Kiểm tra torchao trước khi import diffusers
-    try:
-        from torchao.quantization import FqnToConfig  # noqa: F401
-    except ImportError:
-        print("⚠️ torchao thiếu FqnToConfig → cài lại...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "-U", "torchao"],
-            check=False,
-        )
-
     import torch
+
+    # Chặn import torchao lỗi nếu còn sót
+    try:
+        import torchao  # noqa: F401
+    except Exception:
+        pass
+
     from diffusers import LTXImageToVideoPipeline
 
     print(f"🧠 Load LTX: {LTX_MODEL}")
@@ -415,11 +415,11 @@ def step_2_ltx_render_merge():
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
 
         if not (os.path.exists(img_path) and os.path.getsize(img_path) > 2000):
-            print(f"⚠️ [{scene_num}] thiếu ảnh, bỏ qua")
+            print(f"⚠️ [{scene_num}] thiếu ảnh")
             continue
 
         if os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000:
-            print(f"⏩ [{scene_num}] video đã có")
+            print(f"⏩ [{scene_num}] đã có video")
             rendered.append(final_scene)
             continue
 
@@ -438,8 +438,7 @@ def step_2_ltx_render_merge():
         rendered.append(out)
         print(f"✅ [{scene_num}] {os.path.basename(out)}")
 
-    elapsed = time.time() - t0
-    print(f"\n✅ LTX xong {len(rendered)}/{TOTAL_SCENES} trong {elapsed/60:.1f} phút")
+    print(f"\n✅ LTX xong {len(rendered)}/{TOTAL_SCENES} trong {(time.time()-t0)/60:.1f} phút")
 
     if not rendered:
         print("❌ Không có video để ghép")
@@ -480,19 +479,15 @@ def step_2_ltx_render_merge():
 # ==========================================
 if __name__ == "__main__":
     print("DRIVE_FOLDER_ID =", DRIVE_FOLDER_ID or "(EMPTY)")
-    print("GPU check...")
     try:
         import torch
-        print(
-            "CUDA:",
-            torch.cuda.is_available(),
-            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "",
-        )
+        print("CUDA:", torch.cuda.is_available(),
+              torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
     except Exception as e:
         print("Torch:", e)
 
     if step_1_ensure_images():
         step_2_ltx_render_merge()
-        print("\n🎉 HOÀN TẤT LTX IMAGE-TO-VIDEO PIPELINE")
+        print("\n🎉 HOÀN TẤT LTX IMAGE-TO-VIDEO")
     else:
-        print("\n❌ Dừng: chưa đủ ảnh cảnh")
+        print("\n❌ Dừng: chưa đủ ảnh")
