@@ -28,7 +28,7 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# LTX — an toàn T4 (test OK rồi tăng dần)
+# LTX — an toàn T4 16GB
 LTX_MODEL = "Lightricks/LTX-Video"
 LTX_WIDTH = 768
 LTX_HEIGHT = 512
@@ -233,24 +233,19 @@ def step_1_ensure_images():
 # ==========================================
 def install_ltx_deps():
     """Cài nhẹ — không đụng PyTorch / CUDA."""
-    print("📦 Cài nhẹ LTX (xóa sạch diffusers lẫn version)...")
+    print("📦 Cài nhẹ LTX...")
 
     subprocess.run(
         [sys.executable, "-m", "pip", "uninstall", "-y", "torchao", "diffusers"],
         check=False,
     )
-
-    # Xóa file sót trên disk
     subprocess.run(
         "rm -rf /usr/local/lib/python3.13/dist-packages/diffusers "
-        "/usr/local/lib/python3.13/dist-packages/diffusers-*.dist-info "
-        "/usr/local/lib/python3.*/dist-packages/diffusers "
-        "/usr/local/lib/python3.*/dist-packages/diffusers-*.dist-info",
+        "/usr/local/lib/python3.13/dist-packages/diffusers-*.dist-info",
         shell=True,
         check=False,
     )
 
-    # Cài diffusers không kéo torch
     subprocess.run(
         [
             sys.executable, "-m", "pip", "install", "-q",
@@ -262,6 +257,7 @@ def install_ltx_deps():
     subprocess.run(
         [
             sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir",
+            "transformers==4.46.3",
             "safetensors", "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
         ],
         check=False,
@@ -282,11 +278,24 @@ def install_ltx_deps():
         )
     print("✅ Cài package xong")
 
-def _patch_diffusers_utils():
-    """Vá is_flax_available trước khi import pipelines."""
+def _patch_imports():
+    """Vá thiếu symbol trước khi import LTX."""
     for k in list(sys.modules.keys()):
-        if k == "diffusers" or k.startswith("diffusers."):
+        if (
+            k == "diffusers"
+            or k.startswith("diffusers.")
+            or k == "transformers"
+            or k.startswith("transformers.")
+        ):
             del sys.modules[k]
+
+    import transformers.utils as tu
+    if not hasattr(tu, "FLAX_WEIGHTS_NAME"):
+        tu.FLAX_WEIGHTS_NAME = "flax_model.msgpack"
+    if not hasattr(tu, "SAFE_WEIGHTS_NAME"):
+        tu.SAFE_WEIGHTS_NAME = "model.safetensors"
+    if not hasattr(tu, "SAFE_WEIGHTS_INDEX_NAME"):
+        tu.SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 
     import diffusers.utils as du
     for name, fn in [
@@ -298,7 +307,7 @@ def _patch_diffusers_utils():
             setattr(du, name, fn)
 
 def load_ltx_pipe():
-    _patch_diffusers_utils()
+    _patch_imports()
 
     from diffusers import LTXImageToVideoPipeline
     from diffusers.utils import logging
