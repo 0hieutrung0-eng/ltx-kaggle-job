@@ -1,4 +1,5 @@
-# ========== FULL PIPELINE 1 GPU (T4 tối ưu): Agnes → LTX → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4 – LÁCH 5 GIÂY ==========
+# Render nhẹ 512x320 @12fps (5s) → Upscale + Interpolate → 768x512 24fps
 import os
 import sys
 import json
@@ -11,7 +12,7 @@ import pandas as pd
 # ==========================================
 # CẤU HÌNH
 # ==========================================
-TOTAL_SCENES = 100                  # Đổi số cảnh muốn chạy
+TOTAL_SCENES = 100
 OUTPUT_DIR = "./output_scenes"
 VIDEO_DIR = "./output_videos"
 FINAL_VIDEO = "final_full_movie.mp4"
@@ -27,13 +28,17 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- LTX tối ưu cho T4 (15GB) ---
+# --- LTX SIÊU NHẸ (T4 an toàn) ---
 LTX_MODEL = "Lightricks/LTX-Video"
-LTX_WIDTH = 768
-LTX_HEIGHT = 512
-LTX_NUM_FRAMES = 97           # ~4 giây (nhẹ, an toàn T4)
-LTX_STEPS = 15
-LTX_FPS = 24
+LTX_WIDTH = 512
+LTX_HEIGHT = 320
+LTX_NUM_FRAMES = 61            # 61 frames @ 12fps = đúng ~5.08 giây
+LTX_STEPS = 12
+LTX_FPS = 12                   # render thấp fps → nhẹ VRAM
+FINAL_FPS = 24
+FINAL_WIDTH = 768
+FINAL_HEIGHT = 512
+
 LTX_NEG = (
     "worst quality, inconsistent motion, blurry, jittery, distorted, "
     "morphing, text, watermark, still image, frozen, slideshow"
@@ -44,7 +49,6 @@ AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_MODEL = "agnes-image-2.0-flash"
 AGNES_SIZE = "1024x768"
 
-# Giảm fragmentation VRAM
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ==========================================
@@ -218,7 +222,6 @@ def step_1_ensure_images():
         name = f"scene_{scene_num:03d}.png"
         local = f"{OUTPUT_DIR}/{name}"
 
-        # 1. Đã có trên Drive
         if name in drive_map:
             if not (os.path.exists(local) and os.path.getsize(local) > 2000):
                 download_from_drive(drive_map[name], local)
@@ -227,14 +230,12 @@ def step_1_ensure_images():
                 print(f"✅ [{scene_num}] Drive OK")
                 continue
 
-        # 2. Đã có local
         if os.path.exists(local) and os.path.getsize(local) > 2000:
             upload_file_to_drive(local)
             ok += 1
             print(f"✅ [{scene_num}] Local OK")
             continue
 
-        # 3. Tạo mới bằng Agnes
         prompt = safe_get(row, "image_prompt", "scene_description") or f"Cinematic scene {scene_num}"
         print(f"🎨 [{scene_num}] Đang tạo ảnh bằng Agnes...")
         url = call_agnes(prompt)
@@ -267,7 +268,6 @@ def install_deps():
             "safetensors", "huggingface_hub", "protobuf<6"
         ], check=False)
 
-    # ffmpeg
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     except Exception:
@@ -317,24 +317,64 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
         return video_out
     return video_in
 
+def post_process_video(raw_path: str, out_path: str) -> str:
+    """
+    Lách: Upscale + Nội suy frame 12fps → 24fps + làm nét
+    """
+    if not os.path.exists(raw_path):
+        return raw_path
+
+    # minterpolate khá chậm nhưng không cần model thêm
+    # Có thể bỏ mi_mode nếu muốn nhanh hơn nữa
+    cmd = (
+        f'ffmpeg -y -hide_banner -loglevel error -i "{raw_path}" '
+        f'-vf "scale={FINAL_WIDTH}:{FINAL_HEIGHT}:flags=lanczos,'
+        f'unsharp=5:5:0.8:5:5:0.4,'
+        f'minterpolate=fps={FINAL_FPS}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1" '
+        f'-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -movflags +faststart "{out_path}"'
+    )
+    try:
+        subprocess.run(cmd, shell=True, timeout=180)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
+            return out_path
+    except Exception as e:
+        print(f"⚠️ Post-process lỗi: {e}")
+
+    # Fallback nhanh hơn (không nội suy motion phức tạp)
+    cmd2 = (
+        f'ffmpeg -y -hide_banner -loglevel error -i "{raw_path}" '
+        f'-vf "scale={FINAL_WIDTH}:{FINAL_HEIGHT}:flags=lanczos,unsharp=5:5:0.7:5:5:0.3,fps={FINAL_FPS}" '
+        f'-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -movflags +faststart "{out_path}"'
+    )
+    subprocess.run(cmd2, shell=True)
+    return out_path if os.path.exists(out_path) else raw_path
+
 def load_ltx_pipe():
     import torch
     from diffusers import LTXImageToVideoPipeline
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load LTX-Video (tối ưu T4)...")
+    print("🧠 Đang load LTX-Video (siêu nhẹ T4)...")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    pipe = LTXImageToVideoPipeline.from_pretrained(LTX_MODEL, torch_dtype=dtype)
+
+    pipe = LTXImageToVideoPipeline.from_pretrained(
+        LTX_MODEL,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+    )
 
     if torch.cuda.is_available():
-        # Ưu tiên CPU offload (tiết kiệm VRAM nhất)
         try:
-            pipe.enable_model_cpu_offload()
-            print("✅ enable_model_cpu_offload")
+            pipe.enable_sequential_cpu_offload()
+            print("✅ sequential_cpu_offload")
         except Exception:
-            pipe = pipe.to("cuda")
-            print("⚠️ Fallback to .to('cuda')")
+            try:
+                pipe.enable_model_cpu_offload()
+                print("✅ model_cpu_offload")
+            except Exception:
+                pipe = pipe.to("cuda")
+                print("⚠️ Fallback .to('cuda')")
 
         try:
             pipe.vae.enable_tiling()
@@ -343,10 +383,15 @@ def load_ltx_pipe():
             pass
 
         try:
-            pipe.enable_attention_slicing()
-            print("✅ Attention slicing")
+            pipe.enable_attention_slicing("max")
+            print("✅ Attention slicing max")
         except Exception:
             pass
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     print("✅ LTX ready")
     return pipe
@@ -359,7 +404,7 @@ def step_2_ltx_render():
     from diffusers.utils import export_to_video, load_image
 
     print("\n" + "=" * 55)
-    print(f"🎬 GIAI ĐOẠN 2: LTX Render (1 GPU) | {LTX_WIDTH}x{LTX_HEIGHT} | frames={LTX_NUM_FRAMES} | steps={LTX_STEPS}")
+    print(f"🎬 GIAI ĐOẠN 2: LTX LÁCH 5s | {LTX_WIDTH}x{LTX_HEIGHT} @ {LTX_FPS}fps → {FINAL_WIDTH}x{FINAL_HEIGHT} @{FINAL_FPS}fps")
     print("=" * 55)
 
     install_deps()
@@ -368,7 +413,7 @@ def step_2_ltx_render():
     df = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
 
-    # Tải ảnh thiếu về local
+    # Tải ảnh thiếu
     for i in range(1, TOTAL_SCENES + 1):
         local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
         name = f"scene_{i:03d}.png"
@@ -385,20 +430,21 @@ def step_2_ltx_render():
             break
 
         img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
-        raw_video = f"{VIDEO_DIR}/ltx_{scene_num:03d}.mp4"
+        raw_video = f"{VIDEO_DIR}/ltx_raw_{scene_num:03d}.mp4"
+        upscaled = f"{VIDEO_DIR}/ltx_up_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
         scene_name = f"scene_{scene_num:03d}.mp4"
 
         # Skip nếu đã có video tốt
-        if os.path.exists(final_scene) and os.path.getsize(final_scene) > 500_000:
+        if os.path.exists(final_scene) and os.path.getsize(final_scene) > 400_000:
             print(f"⏩ [{scene_num}] Đã có local")
             rendered.append(final_scene)
             continue
 
         if scene_name in drive_map:
             if download_from_drive(drive_map[scene_name], final_scene):
-                if os.path.getsize(final_scene) > 500_000:
+                if os.path.getsize(final_scene) > 400_000:
                     print(f"⏩ [{scene_num}] Tải từ Drive")
                     rendered.append(final_scene)
                     continue
@@ -413,6 +459,13 @@ def step_2_ltx_render():
 
         try:
             t1 = time.time()
+
+            # Dọn VRAM trước mỗi cảnh
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
             image = load_image(img_path)
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
@@ -428,15 +481,26 @@ def step_2_ltx_render():
             )
             export_to_video(res.frames[0], raw_video, fps=LTX_FPS)
 
+            # Lách: upscale + nội suy 24fps
+            post_process_video(raw_video, upscaled)
+
             make_tts(dialogue, voice_mp3)
-            out_file = mix_video_audio(raw_video, voice_mp3, final_scene)
+            out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
 
             sz = os.path.getsize(out_file) if os.path.exists(out_file) else 0
             print(f"✅ [{scene_num}] {time.time()-t1:.0f}s | {sz/1024:.0f} KB")
 
-            if sz > 300_000:
+            if sz > 200_000:
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
+
+            # Xóa file tạm để tiết kiệm ổ
+            for tmp in [raw_video, upscaled]:
+                if os.path.exists(tmp) and tmp != out_file:
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
 
             del res
             gc.collect()
@@ -452,7 +516,7 @@ def step_2_ltx_render():
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
 
     # Ghép phim
-    valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 300_000]
+    valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 200_000]
     if not valid:
         print("❌ Không đủ video để ghép")
         return False
