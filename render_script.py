@@ -8,7 +8,7 @@ import subprocess
 import pandas as pd
 
 # ==========================================
-# CẤU HÌNH
+# CẤU HÌNH CƠ BẢN
 # ==========================================
 TOTAL_SCENES = 100
 OUTPUT_DIR = "./output_scenes"
@@ -27,11 +27,14 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
+# ==========================================
+# CẤU HÌNH LTX-VIDEO (TỐI ƯU 720P - TỐC ĐỘ 20S/SCENE)
+# ==========================================
 LTX_MODEL = "Lightricks/LTX-Video"
-LTX_WIDTH = 704
-LTX_HEIGHT = 480
-LTX_NUM_FRAMES = 49
-LTX_STEPS = 25
+LTX_WIDTH = 1216       # Chuẩn 720p (16:9) chia hết cho 32
+LTX_HEIGHT = 704
+LTX_NUM_FRAMES = 121    # 121 frames / 24fps = đúng 5 giây video
+LTX_STEPS = 18          # Tối ưu 18 steps cho T4 render trong ~20s
 LTX_FPS = 24
 LTX_NEG = "worst quality, inconsistent motion, blurry, jittery, distorted, morphing, text, watermark"
 
@@ -90,7 +93,7 @@ def upload_file_to_drive(file_path: str):
     file_name = os.path.basename(file_path)
     metadata = {"name": file_name, "parents": [DRIVE_FOLDER_ID]}
     headers = {"Authorization": f"Bearer {token}"}
-    print(f"🚀 Upload {file_name}...")
+    print(f"🚀 Upload {file_name} lên Drive...")
     try:
         with open(file_path, "rb") as f:
             files = {
@@ -104,11 +107,11 @@ def upload_file_to_drive(file_path: str):
                 timeout=600,
             )
         if res.status_code in (200, 201):
-            print(f"✅ Uploaded: {file_name}")
+            print(f"✅ Uploaded thành công: {file_name}")
             return res.json()
-        print(f"❌ Upload {res.status_code}: {res.text[:250]}")
+        print(f"❌ Upload lỗi {res.status_code}: {res.text[:250]}")
     except Exception as e:
-        print(f"❌ Upload: {e}")
+        print(f"❌ Upload lỗi: {e}")
     return None
 
 def download_from_drive(file_id: str, save_path: str) -> bool:
@@ -230,18 +233,16 @@ def step_1_ensure_images():
     return ok >= max(1, int(len(df_scenes) * 0.8))
 
 # ==========================================
-# GIAI ĐOẠN 2: LTX (fix torchao)
+# GIAI ĐOẠN 2: LTX ENGINE
 # ==========================================
 def install_ltx_deps():
-    print("📦 Fix môi trường LTX (gỡ torchao lỗi + cài diffusers ổn định)...")
+    print("📦 Fix môi trường LTX (gỡ torchao + cài diffusers ổn định)...")
 
-    # 1) Gỡ torchao bị lỗi ABI trên Python 3.13 Kaggle
     subprocess.run(
         [sys.executable, "-m", "pip", "uninstall", "-y", "torchao"],
         check=False,
     )
 
-    # 2) Cài bản diffusers ổn định (không phụ thuộc torchao quantizer mới)
     subprocess.run(
         [
             sys.executable, "-m", "pip", "install", "-q",
@@ -276,7 +277,6 @@ def install_ltx_deps():
 def load_ltx_pipe():
     import torch
 
-    # Chặn import torchao lỗi nếu còn sót
     try:
         import torchao  # noqa: F401
     except Exception:
@@ -284,7 +284,7 @@ def load_ltx_pipe():
 
     from diffusers import LTXImageToVideoPipeline
 
-    print(f"🧠 Load LTX: {LTX_MODEL}")
+    print(f"🧠 Load LTX Pipeline: {LTX_MODEL}")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     pipe = LTXImageToVideoPipeline.from_pretrained(LTX_MODEL, torch_dtype=dtype)
 
@@ -298,7 +298,7 @@ def load_ltx_pipe():
         except Exception:
             pass
 
-    print("✅ LTX pipeline ready")
+    print("✅ LTX pipeline sẵn sàng (Tối ưu 720p - ~20s/scene)")
     return pipe
 
 def get_video_prompt(row) -> str:
@@ -336,7 +336,7 @@ def ltx_image_to_video(pipe, image_path: str, prompt: str, out_mp4: str) -> bool
     from diffusers.utils import export_to_video, load_image
 
     if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 5000:
-        print(f"⏩ Skip: {out_mp4}")
+        print(f"⏩ Skip LTX: {out_mp4}")
         return True
 
     try:
@@ -344,6 +344,7 @@ def ltx_image_to_video(pipe, image_path: str, prompt: str, out_mp4: str) -> bool
         device = "cuda" if torch.cuda.is_available() else "cpu"
         generator = torch.Generator(device=device).manual_seed(42)
 
+        start_time = time.time()
         result = pipe(
             image=image,
             prompt=prompt,
@@ -356,6 +357,9 @@ def ltx_image_to_video(pipe, image_path: str, prompt: str, out_mp4: str) -> bool
         )
         frames = result.frames[0]
         export_to_video(frames, out_mp4, fps=LTX_FPS)
+
+        elapsed = time.time() - start_time
+        print(f"⏱️ Render time: {elapsed:.1f}s")
 
         del result, frames
         gc.collect()
@@ -388,7 +392,7 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
 
 def step_2_ltx_render_merge():
     print("\n" + "=" * 50)
-    print("🎬 GIAI ĐOẠN 2: LTX Image-to-Video + TTS + ghép phim")
+    print("🎬 GIAI ĐOẠN 2: LTX Image-to-Video 720p + TTS + Upload Drive từng cảnh")
     print("=" * 50)
 
     install_ltx_deps()
@@ -397,6 +401,7 @@ def step_2_ltx_render_merge():
     df_scenes = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
 
+    # Kiểm tra & Tải ảnh về nếu thiếu
     for i in range(1, TOTAL_SCENES + 1):
         local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
         name = f"scene_{i:03d}.png"
@@ -409,24 +414,28 @@ def step_2_ltx_render_merge():
 
     for idx, row in df_scenes.iterrows():
         scene_num = int(row.get("scene_index")) if pd.notna(row.get("scene_index")) else idx + 1
+        scene_name = f"scene_{scene_num:03d}.mp4"
         img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
         raw_video = f"{VIDEO_DIR}/ltx_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
-        final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
+        final_scene = f"{VIDEO_DIR}/{scene_name}"
 
-        if not (os.path.exists(img_path) and os.path.getsize(img_path) > 2000):
-            print(f"⚠️ [{scene_num}] thiếu ảnh")
+        # 1. Kiểm tra trên Drive xem cảnh video này đã upload chưa
+        if scene_name in drive_map:
+            if not (os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000):
+                download_from_drive(drive_map[scene_name], final_scene)
+            rendered.append(final_scene)
+            print(f"⏩ [{scene_num}] Đã có trên Drive, bỏ qua.")
             continue
 
-        if os.path.exists(final_scene) and os.path.getsize(final_scene) > 5000:
-            print(f"⏩ [{scene_num}] đã có video")
-            rendered.append(final_scene)
+        if not (os.path.exists(img_path) and os.path.getsize(img_path) > 2000):
+            print(f"⚠️ [{scene_num}] thiếu ảnh gốc")
             continue
 
         prompt = get_video_prompt(row)
         dialogue = get_dialogue(row)
 
-        print(f"\n🎥 [{scene_num}/{TOTAL_SCENES}] LTX I2V...")
+        print(f"\n🎥 [{scene_num}/{TOTAL_SCENES}] LTX I2V 720p...")
         print(f"   prompt: {prompt[:90]}...")
         ok = ltx_image_to_video(pipe, img_path, prompt, raw_video)
         if not ok:
@@ -436,20 +445,24 @@ def step_2_ltx_render_merge():
         make_tts(dialogue, voice_mp3)
         out = mix_video_audio(raw_video, voice_mp3, final_scene)
         rendered.append(out)
-        print(f"✅ [{scene_num}] {os.path.basename(out)}")
+        print(f"✅ [{scene_num}] Xuất xong local: {os.path.basename(out)}")
 
-    print(f"\n✅ LTX xong {len(rendered)}/{TOTAL_SCENES} trong {(time.time()-t0)/60:.1f} phút")
+        # 2. TỰ ĐỘNG UPLOAD CẢNH VỪA XONG LÊN DRIVE NGAY LẬP TỨC
+        upload_file_to_drive(out)
+
+    print(f"\n✅ LTX hoàn tất {len(rendered)}/{TOTAL_SCENES} cảnh trong {(time.time()-t0)/60:.1f} phút")
 
     if not rendered:
         print("❌ Không có video để ghép")
         return False
 
+    # 3. Ghép toàn bộ phim
     concat_file = "concat_list.txt"
     with open(concat_file, "w", encoding="utf-8") as f:
         for v in sorted(rendered):
             f.write(f"file '{os.path.abspath(v)}'\n")
 
-    print("🎞️ Ghép final_full_movie.mp4...")
+    print("🎞️ Đang ghép toàn bộ phim final_full_movie.mp4...")
     subprocess.run(
         f'ffmpeg -y -hide_banner -loglevel error '
         f'-f concat -safe 0 -i "{concat_file}" -c copy -movflags +faststart "{FINAL_VIDEO}"',
@@ -467,7 +480,7 @@ def step_2_ltx_render_merge():
 
     if os.path.exists(FINAL_VIDEO):
         mb = os.path.getsize(FINAL_VIDEO) / 1024 / 1024
-        print(f"✅ Phim: {FINAL_VIDEO} ({mb:.1f} MB)")
+        print(f"🎉 Phim hoàn chỉnh: {FINAL_VIDEO} ({mb:.1f} MB)")
         upload_file_to_drive(FINAL_VIDEO)
         return True
 
@@ -475,19 +488,19 @@ def step_2_ltx_render_merge():
     return False
 
 # ==========================================
-# MAIN
+# MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
     print("DRIVE_FOLDER_ID =", DRIVE_FOLDER_ID or "(EMPTY)")
     try:
         import torch
-        print("CUDA:", torch.cuda.is_available(),
-              torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
+        print("CUDA Available:", torch.cuda.is_available(),
+              "Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
     except Exception as e:
         print("Torch:", e)
 
     if step_1_ensure_images():
         step_2_ltx_render_merge()
-        print("\n🎉 HOÀN TẤT LTX IMAGE-TO-VIDEO")
+        print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
     else:
-        print("\n❌ Dừng: chưa đủ ảnh")
+        print("\n❌ Dừng: chưa đủ ảnh ở Giai đoạn 1")
