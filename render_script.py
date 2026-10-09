@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU: Agnes → LTX → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU (T4 tối ưu): Agnes → LTX → TTS → Merge ==========
 import os
 import sys
 import json
@@ -27,12 +27,12 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- LTX (720p) ---
+# --- LTX tối ưu cho T4 (15GB) ---
 LTX_MODEL = "Lightricks/LTX-Video"
-LTX_WIDTH = 1216
-LTX_HEIGHT = 704
-LTX_NUM_FRAMES = 121          # ~5s @ 24fps
-LTX_STEPS = 18
+LTX_WIDTH = 768
+LTX_HEIGHT = 512
+LTX_NUM_FRAMES = 97           # ~4 giây (nhẹ, an toàn T4)
+LTX_STEPS = 15
 LTX_FPS = 24
 LTX_NEG = (
     "worst quality, inconsistent motion, blurry, jittery, distorted, "
@@ -43,6 +43,9 @@ LTX_NEG = (
 AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_MODEL = "agnes-image-2.0-flash"
 AGNES_SIZE = "1024x768"
+
+# Giảm fragmentation VRAM
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ==========================================
 # GOOGLE OAUTH + DRIVE
@@ -320,21 +323,32 @@ def load_ltx_pipe():
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load LTX-Video...")
+    print("🧠 Đang load LTX-Video (tối ưu T4)...")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     pipe = LTXImageToVideoPipeline.from_pretrained(LTX_MODEL, torch_dtype=dtype)
 
     if torch.cuda.is_available():
+        # Ưu tiên CPU offload (tiết kiệm VRAM nhất)
         try:
             pipe.enable_model_cpu_offload()
+            print("✅ enable_model_cpu_offload")
         except Exception:
             pipe = pipe.to("cuda")
+            print("⚠️ Fallback to .to('cuda')")
+
         try:
             pipe.vae.enable_tiling()
+            print("✅ VAE tiling")
         except Exception:
             pass
 
-    print("✅ LTX sẵn sàng")
+        try:
+            pipe.enable_attention_slicing()
+            print("✅ Attention slicing")
+        except Exception:
+            pass
+
+    print("✅ LTX ready")
     return pipe
 
 # ==========================================
@@ -345,7 +359,7 @@ def step_2_ltx_render():
     from diffusers.utils import export_to_video, load_image
 
     print("\n" + "=" * 55)
-    print("🎬 GIAI ĐOẠN 2: LTX Render (1 GPU)")
+    print(f"🎬 GIAI ĐOẠN 2: LTX Render (1 GPU) | {LTX_WIDTH}x{LTX_HEIGHT} | frames={LTX_NUM_FRAMES} | steps={LTX_STEPS}")
     print("=" * 55)
 
     install_deps()
