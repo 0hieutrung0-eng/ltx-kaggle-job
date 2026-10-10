@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → CogVideoX-2B (fixed) → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Agnes → CogVideoX-5B-I2V (fixed) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -27,11 +27,11 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- CogVideoX-2B (cấu hình an toàn nhất cho T4 16GB) ---
-COG_MODEL = "THUDM/CogVideoX-2b"
+# --- CogVideoX-5B-I2V (chính thức hỗ trợ Image-to-Video) ---
+COG_MODEL = "THUDM/CogVideoX-5b-I2V"   # ← ĐÃ ĐỔI TỪ 2b sang 5b-I2V
 COG_WIDTH = 720
 COG_HEIGHT = 480
-COG_NUM_FRAMES = 49          # 8*6 + 1 → tránh lỗi latent 16 vs 8
+COG_NUM_FRAMES = 49
 COG_STEPS = 30
 COG_FPS = 8
 FINAL_FPS = 24
@@ -284,10 +284,8 @@ def make_tts(text: str, out_mp3: str) -> bool:
                 f'edge-tts --text "{safe}" --voice {voice} '
                 f'--rate=+5% --write-media "{out_mp3}"'
             )
-            subprocess.run(
-                cmd, shell=True, timeout=90,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            subprocess.run(cmd, shell=True, timeout=90,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400:
                 return True
         except Exception:
@@ -333,8 +331,8 @@ def load_cog_pipe():
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load CogVideoX-2B (T4-safe float16)...")
-    # T4 (Turing) → bắt buộc dùng float16
+    print("🧠 Đang load CogVideoX-5B-I2V (official I2V)...")
+    # 5B-I2V khuyến nghị bfloat16, nhưng trên T4 dùng float16 vẫn ổn hơn
     dtype = torch.float16
 
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(
@@ -343,6 +341,7 @@ def load_cog_pipe():
     )
 
     if torch.cuda.is_available():
+        # Tối ưu mạnh cho T4 16GB
         pipe.enable_model_cpu_offload()
         print("✅ model_cpu_offload")
 
@@ -357,12 +356,15 @@ def load_cog_pipe():
         except Exception:
             pass
 
+        # Thêm sequential offload nếu vẫn OOM
+        # pipe.enable_sequential_cpu_offload()
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print("✅ CogVideoX ready")
+    print("✅ CogVideoX-5B-I2V ready")
     return pipe
 
 # ==========================================
@@ -374,7 +376,7 @@ def step_2_cog_render():
     from PIL import Image
 
     print("\n" + "=" * 55)
-    print(f"🎬 GIAI ĐOẠN 2: CogVideoX-2B | {COG_WIDTH}x{COG_HEIGHT} | frames={COG_NUM_FRAMES} | steps={COG_STEPS}")
+    print(f"🎬 GIAI ĐOẠN 2: CogVideoX-5B-I2V | {COG_WIDTH}x{COG_HEIGHT} | frames={COG_NUM_FRAMES} | steps={COG_STEPS}")
     print("=" * 55)
 
     install_deps()
@@ -406,7 +408,6 @@ def step_2_cog_render():
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
         scene_name = f"scene_{scene_num:03d}.mp4"
 
-        # Đã có sẵn thì bỏ qua
         if os.path.exists(final_scene) and os.path.getsize(final_scene) > 400_000:
             print(f"⏩ [{scene_num}] Đã có local")
             rendered.append(final_scene)
@@ -434,7 +435,6 @@ def step_2_cog_render():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
 
-            # Resize chính xác
             image = load_image(img_path).convert("RGB")
             image = image.resize((COG_WIDTH, COG_HEIGHT), Image.Resampling.LANCZOS)
 
@@ -464,7 +464,6 @@ def step_2_cog_render():
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
-            # Xóa file tạm
             for tmp in [raw_video, upscaled]:
                 if os.path.exists(tmp) and tmp != out_file:
                     try:
@@ -490,7 +489,6 @@ def step_2_cog_render():
         print("❌ Không đủ video để ghép")
         return False
 
-    # Tạo concat list an toàn
     concat_file = "concat_list.txt"
     with open(concat_file, "w", encoding="utf-8") as f:
         for v in valid:
