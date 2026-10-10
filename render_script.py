@@ -27,11 +27,11 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- CogVideoX-2B (cấu hình an toàn T4) ---
+# --- CogVideoX-2B (cấu hình chuẩn an toàn cho T4 & VAE tensor) ---
 COG_MODEL = "THUDM/CogVideoX-2b"
 COG_WIDTH = 720
 COG_HEIGHT = 480
-COG_NUM_FRAMES = 45          # bắt buộc 45 (tránh lỗi size tensor)
+COG_NUM_FRAMES = 33          # Chuẩn công thức 8k + 1 (khớp tuyệt đối VAE latent size)
 COG_STEPS = 30
 COG_FPS = 8
 FINAL_FPS = 24
@@ -268,7 +268,6 @@ def install_deps():
         subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg", shell=True, check=False)
 
 def get_video_prompt(row) -> str:
-    """Prompt ngắn, 1 động tác chính, tránh 'then...then...'"""
     vp = safe_get(row, "video_prompt")
     if vp:
         return vp[:220]
@@ -312,7 +311,6 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
     return video_in
 
 def post_process_video(raw_path: str, out_path: str) -> str:
-    """Upscale + đẩy 24fps + làm nét"""
     if not os.path.exists(raw_path):
         return raw_path
 
@@ -408,7 +406,6 @@ def step_2_cog_render():
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
         scene_name = f"scene_{scene_num:03d}.mp4"
 
-        # Skip nếu đã có
         if os.path.exists(final_scene) and os.path.getsize(final_scene) > 400_000:
             print(f"⏩ [{scene_num}] Đã có local")
             rendered.append(final_scene)
@@ -432,23 +429,21 @@ def step_2_cog_render():
         try:
             t1 = time.time()
 
-            # Dọn VRAM trước mỗi cảnh
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
 
-            # Ảnh phải RGB + đúng size
             image = load_image(img_path).convert("RGB").resize(
                 (COG_WIDTH, COG_HEIGHT), Image.LANCZOS
             )
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
-            # === ĐÃ SỬA: bỏ negative_prompt, cố định frames=49, thêm use_dynamic_cfg ===
+            # ĐÃ ĐỒNG BỘ: Sử dụng COG_NUM_FRAMES (33) để khớp tuyệt đối với VAE
             res = pipe(
                 image=image,
                 prompt=prompt,
-                num_frames=49,
+                num_frames=COG_NUM_FRAMES,
                 num_inference_steps=COG_STEPS,
                 guidance_scale=6.0,
                 use_dynamic_cfg=True,
@@ -456,7 +451,6 @@ def step_2_cog_render():
             )
             export_to_video(res.frames[0], raw_video, fps=COG_FPS)
 
-            # Upscale + 24fps
             post_process_video(raw_video, upscaled)
 
             make_tts(dialogue, voice_mp3)
@@ -469,7 +463,6 @@ def step_2_cog_render():
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
-            # Xóa file tạm
             for tmp in [raw_video, upscaled]:
                 if os.path.exists(tmp) and tmp != out_file:
                     try:
@@ -490,7 +483,6 @@ def step_2_cog_render():
 
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
 
-    # Ghép phim
     valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 200_000]
     if not valid:
         print("❌ Không đủ video để ghép")
@@ -522,7 +514,7 @@ def step_2_cog_render():
 # ==========================================
 if __name__ == "__main__":
     print("DRIVE_FOLDER_ID =", DRIVE_FOLDER_ID or "(EMPTY)")
-    print("AGNES_API_KEY   =", "có" if AGNES_API_KEY else "(EMPTY)")
+    print("AGNES_API_KEY    =", "có" if AGNES_API_KEY else "(EMPTY)")
 
     try:
         import torch
