@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → CogVideoX-5B-I2V (Speed Optimized) → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.1 I2V 14B-480P → TTS → Merge ==========
 import os
 import sys
 import json
@@ -27,13 +27,13 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- CogVideoX-5B-I2V (tối ưu tốc độ, giữ chất lượng + thời lượng) ---
-COG_MODEL = "THUDM/CogVideoX-5b-I2V"
-COG_WIDTH = 720
-COG_HEIGHT = 480
-COG_NUM_FRAMES = 49              # Giữ nguyên thời lượng ~6 giây
-COG_STEPS = 22                   # Giảm từ 30 → 22 (tăng tốc rõ rệt)
-COG_FPS = 8
+# --- Wan 2.1 I2V 14B-480P ---
+WAN_MODEL = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+WAN_WIDTH = 832
+WAN_HEIGHT = 480
+WAN_NUM_FRAMES = 81              # ≈ 5 giây ở 16fps
+WAN_STEPS = 30
+WAN_FPS = 16
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
@@ -237,21 +237,21 @@ def step_1_ensure_images():
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÀI ĐẶT + CogVideoX
+# CÀI ĐẶT + Wan 2.1
 # ==========================================
 def install_deps():
     print("📦 Kiểm tra / cài dependency...")
     try:
-        from diffusers import CogVideoXImageToVideoPipeline
-        print("✅ diffusers + CogVideoX đã có")
+        from diffusers import WanImageToVideoPipeline
+        print("✅ diffusers + Wan đã có")
     except Exception:
-        print("📦 Đang cài diffusers + transformers...")
+        print("📦 Đang cài diffusers mới nhất...")
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
-            "diffusers==0.32.2", "transformers==4.46.3", "accelerate==1.1.1",
+            "diffusers>=0.33.0", "transformers>=4.46.0", "accelerate>=1.1.0",
             "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
-            "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless"
+            "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
         ], check=False)
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -284,10 +284,8 @@ def make_tts(text: str, out_mp3: str) -> bool:
                 f'edge-tts --text "{safe}" --voice {voice} '
                 f'--rate=+5% --write-media "{out_mp3}"'
             )
-            subprocess.run(
-                cmd, shell=True, timeout=90,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            subprocess.run(cmd, shell=True, timeout=90,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400:
                 return True
         except Exception:
@@ -327,17 +325,26 @@ def post_process_video(raw_path: str, out_path: str) -> str:
         print(f"⚠️ Post-process: {e}")
     return raw_path
 
-def load_cog_pipe():
+def load_wan_pipe():
     import torch
-    from diffusers import CogVideoXImageToVideoPipeline
+    from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
+    from transformers import CLIPVisionModel
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load CogVideoX-5B-I2V (Speed Optimized)...")
+    print("🧠 Đang load Wan 2.1 I2V 14B-480P...")
     dtype = torch.float16
 
-    pipe = CogVideoXImageToVideoPipeline.from_pretrained(
-        COG_MODEL,
+    image_encoder = CLIPVisionModel.from_pretrained(
+        WAN_MODEL, subfolder="image_encoder", torch_dtype=torch.float32
+    )
+    vae = AutoencoderKLWan.from_pretrained(
+        WAN_MODEL, subfolder="vae", torch_dtype=torch.float32
+    )
+    pipe = WanImageToVideoPipeline.from_pretrained(
+        WAN_MODEL,
+        vae=vae,
+        image_encoder=image_encoder,
         torch_dtype=dtype,
     )
 
@@ -346,49 +353,33 @@ def load_cog_pipe():
         print("✅ model_cpu_offload")
 
         try:
-            pipe.vae.enable_tiling()
-            print("✅ VAE tiling")
-        except Exception:
-            pass
-        try:
             pipe.vae.enable_slicing()
             print("✅ VAE slicing")
         except Exception:
             pass
-
-        # === TỐI ƯU TỐC ĐỘ: torch.compile ===
-        try:
-            pipe.transformer = torch.compile(
-                pipe.transformer,
-                mode="reduce-overhead",
-                fullgraph=False
-            )
-            print("✅ torch.compile transformer (speed boost)")
-        except Exception as e:
-            print(f"⚠️ torch.compile bỏ qua: {e}")
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print("✅ CogVideoX-5B-I2V ready (Speed Mode)")
+    print("✅ Wan 2.1 I2V 14B-480P ready")
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: RENDER CogVideoX
+# GIAI ĐOẠN 2: RENDER Wan 2.1
 # ==========================================
-def step_2_cog_render():
+def step_2_wan_render():
     import torch
     from diffusers.utils import export_to_video, load_image
     from PIL import Image
 
     print("\n" + "=" * 55)
-    print(f"🎬 GIAI ĐOẠN 2: CogVideoX-5B-I2V | {COG_WIDTH}x{COG_HEIGHT} | frames={COG_NUM_FRAMES} | steps={COG_STEPS}")
+    print(f"🎬 GIAI ĐOẠN 2: Wan 2.1 I2V 14B-480P | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES} | steps={WAN_STEPS}")
     print("=" * 55)
 
     install_deps()
-    pipe = load_cog_pipe()
+    pipe = load_wan_pipe()
 
     df = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
@@ -410,13 +401,12 @@ def step_2_cog_render():
             break
 
         img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
-        raw_video = f"{VIDEO_DIR}/cog_raw_{scene_num:03d}.mp4"
-        upscaled = f"{VIDEO_DIR}/cog_up_{scene_num:03d}.mp4"
+        raw_video = f"{VIDEO_DIR}/wan_raw_{scene_num:03d}.mp4"
+        upscaled = f"{VIDEO_DIR}/wan_up_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
         scene_name = f"scene_{scene_num:03d}.mp4"
 
-        # Đã có sẵn thì bỏ qua
         if os.path.exists(final_scene) and os.path.getsize(final_scene) > 400_000:
             print(f"⏩ [{scene_num}] Đã có local")
             rendered.append(final_scene)
@@ -445,23 +435,23 @@ def step_2_cog_render():
                 torch.cuda.ipc_collect()
 
             image = load_image(img_path).convert("RGB")
-            image = image.resize((COG_WIDTH, COG_HEIGHT), Image.Resampling.LANCZOS)
+            image = image.resize((WAN_WIDTH, WAN_HEIGHT), Image.Resampling.LANCZOS)
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
             res = pipe(
                 image=image,
                 prompt=prompt,
-                num_frames=COG_NUM_FRAMES,
-                num_inference_steps=COG_STEPS,
-                guidance_scale=5.5,              # hơi giảm để nhanh hơn
-                use_dynamic_cfg=True,
-                height=COG_HEIGHT,
-                width=COG_WIDTH,
+                negative_prompt="blurry, low quality, distorted, deformed, ugly, bad anatomy",
+                height=WAN_HEIGHT,
+                width=WAN_WIDTH,
+                num_frames=WAN_NUM_FRAMES,
+                num_inference_steps=WAN_STEPS,
+                guidance_scale=5.0,
                 generator=generator,
             )
 
-            export_to_video(res.frames[0], raw_video, fps=COG_FPS)
+            export_to_video(res.frames[0], raw_video, fps=WAN_FPS)
             post_process_video(raw_video, upscaled)
             make_tts(dialogue, voice_mp3)
             out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
@@ -473,7 +463,6 @@ def step_2_cog_render():
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
-            # Xóa file tạm
             for tmp in [raw_video, upscaled]:
                 if os.path.exists(tmp) and tmp != out_file:
                     try:
@@ -499,7 +488,6 @@ def step_2_cog_render():
         print("❌ Không đủ video để ghép")
         return False
 
-    # Tạo concat list an toàn
     concat_file = "concat_list.txt"
     with open(concat_file, "w", encoding="utf-8") as f:
         for v in valid:
@@ -536,7 +524,7 @@ if __name__ == "__main__":
         print("Torch:", e)
 
     if step_1_ensure_images():
-        step_2_cog_render()
+        step_2_wan_render()
         print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
     else:
         print("\n❌ Dừng: chưa đủ ảnh ở Giai đoạn 1")
