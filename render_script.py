@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.1 I2V 14B-480P → TTS → Merge ==========
+# ========== FULL PIPELINE: Agnes Image → Agnes Video 2.5 → TTS → Merge ==========
 import os
 import sys
 import json
@@ -27,23 +27,18 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- Wan 2.1 I2V 14B-480P ---
-WAN_MODEL = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
-WAN_WIDTH = 832
-WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 81              # ≈ 5 giây ở 16fps
-WAN_STEPS = 30
-WAN_FPS = 16
-FINAL_FPS = 24
-FINAL_WIDTH = 768
-FINAL_HEIGHT = 512
-
 # --- Agnes ---
-AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
-AGNES_MODEL = "agnes-image-2.0-flash"
+AGNES_BASE = "https://apihub.agnes-ai.com"
+AGNES_IMAGE_URL = f"{AGNES_BASE}/v1/images/generations"
+AGNES_VIDEO_URL = f"{AGNES_BASE}/v1/videos"
+AGNES_IMAGE_MODEL = "agnes-image-2.1-flash"
+AGNES_VIDEO_MODEL = "agnes-video-2.5"
 AGNES_SIZE = "1024x768"
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Video settings
+VIDEO_SECONDS = "5"          # 4 ~ 12
+VIDEO_SIZE = "720P"
+VIDEO_ASPECT = "16:9"
 
 # ==========================================
 # GOOGLE OAUTH + DRIVE
@@ -135,8 +130,27 @@ def download_from_drive(file_id: str, save_path: str) -> bool:
         print(f"❌ DL Drive: {e}")
     return False
 
+def get_public_drive_url(file_id: str) -> str | None:
+    """Tạo link công khai tạm thời để Agnes lấy được ảnh"""
+    token = get_google_access_token()
+    if not token:
+        return None
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        # Bật quyền anyone with link
+        requests.post(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+            headers=headers,
+            json={"role": "reader", "type": "anyone"},
+            timeout=15,
+        )
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+    except Exception as e:
+        print(f"⚠️ Public link: {e}")
+        return None
+
 # ==========================================
-# SHEET & AGNES
+# SHEET & AGNES IMAGE
 # ==========================================
 def safe_get(row, *keys, default=""):
     for key in keys:
@@ -155,31 +169,31 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
         print(f"❌ Sheet gid={gid}: {e}")
         return pd.DataFrame()
 
-def call_agnes(prompt: str, retries: int = 2):
+def call_agnes_image(prompt: str, retries: int = 3):
     if not AGNES_API_KEY:
         print("❌ Thiếu AGNES_API_KEY")
         return None
-    body = {
-        "model": AGNES_MODEL,
-        "prompt": prompt,
-        "size": AGNES_SIZE,
-        "extra_body": {"response_format": "url"},
-    }
     headers = {
         "Authorization": f"Bearer {AGNES_API_KEY}",
         "Content-Type": "application/json",
     }
+    body = {
+        "model": AGNES_IMAGE_MODEL,
+        "prompt": prompt,
+        "size": AGNES_SIZE,
+        "extra_body": {"response_format": "url"},
+    }
     for attempt in range(retries + 1):
         try:
-            r = requests.post(AGNES_URL, headers=headers, json=body, timeout=120)
+            r = requests.post(AGNES_IMAGE_URL, headers=headers, json=body, timeout=120)
             if r.status_code == 200:
-                data = r.json().get("data", [{}])
-                if data:
-                    return data[0].get("url")
-            print(f"⚠️ Agnes {r.status_code}: {r.text[:150]}")
+                data = r.json().get("data", [])
+                if data and data[0].get("url"):
+                    return data[0]["url"]
+            print(f"⚠️ Agnes Image {r.status_code}: {r.text[:200]}")
         except Exception as e:
-            print(f"❌ Agnes attempt {attempt+1}: {e}")
-        time.sleep(2)
+            print(f"❌ Agnes Image attempt {attempt+1}: {e}")
+        time.sleep(2 + attempt)
     return None
 
 def download_url(url: str, path: str) -> bool:
@@ -194,6 +208,67 @@ def download_url(url: str, path: str) -> bool:
     return False
 
 # ==========================================
+# AGNES VIDEO 2.5
+# ==========================================
+def create_agnes_video(prompt: str, image_url: str = None):
+    """Tạo task video bằng Agnes Video 2.5"""
+    headers = {
+        "Authorization": f"Bearer {AGNES_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "model": AGNES_VIDEO_MODEL,
+        "prompt": prompt,
+        "seconds": VIDEO_SECONDS,
+        "size": VIDEO_SIZE,
+        "aspect_ratio": VIDEO_ASPECT,
+        "mode": "keyframe" if image_url else "text",
+    }
+
+    if image_url:
+        body["first_frame"] = image_url
+
+    try:
+        r = requests.post(AGNES_VIDEO_URL, headers=headers, json=body, timeout=60)
+        if r.status_code in (200, 201):
+            data = r.json()
+            video_id = data.get("video_id") or data.get("id")
+            return video_id
+        print(f"❌ Tạo video task lỗi {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        print(f"❌ Create video: {e}")
+    return None
+
+def poll_agnes_video(video_id: str, max_wait: int = 600):
+    """Poll kết quả video"""
+    headers = {"Authorization": f"Bearer {AGNES_API_KEY}"}
+    url = f"{AGNES_BASE}/agnesapi"
+    params = {"video_id": video_id, "model_name": AGNES_VIDEO_MODEL}
+
+    start = time.time()
+    while time.time() - start < max_wait:
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                status = str(data.get("status", "")).lower()
+                progress = data.get("progress", 0)
+                print(f"   ⏳ status={status} | progress={progress}%")
+
+                if status in ("completed", "succeeded", "success", "done"):
+                    return data.get("url") or data.get("video_url")
+                if status in ("failed", "error", "cancelled"):
+                    print(f"❌ Video failed: {data}")
+                    return None
+            time.sleep(5)
+        except Exception as e:
+            print(f"⚠️ Poll: {e}")
+            time.sleep(5)
+    print("❌ Timeout chờ video")
+    return None
+
+# ==========================================
 # GIAI ĐOẠN 1: ĐẢM BẢO ĐỦ ẢNH
 # ==========================================
 def step_1_ensure_images():
@@ -205,13 +280,16 @@ def step_1_ensure_images():
     if df.empty:
         print("❌ Sheet rỗng")
         return False
+
     ok = 0
     for idx, row in df.iterrows():
         scene_num = int(row["scene_index"]) if pd.notna(row.get("scene_index")) else idx + 1
         if scene_num > TOTAL_SCENES:
             break
+
         name = f"scene_{scene_num:03d}.png"
         local = f"{OUTPUT_DIR}/{name}"
+
         if name in drive_map:
             if not (os.path.exists(local) and os.path.getsize(local) > 2000):
                 download_from_drive(drive_map[name], local)
@@ -219,54 +297,37 @@ def step_1_ensure_images():
                 ok += 1
                 print(f"✅ [{scene_num}] Drive OK")
                 continue
+
         if os.path.exists(local) and os.path.getsize(local) > 2000:
             upload_file_to_drive(local)
             ok += 1
             print(f"✅ [{scene_num}] Local OK")
             continue
+
         prompt = safe_get(row, "image_prompt", "scene_description") or f"Cinematic scene {scene_num}"
         print(f"🎨 [{scene_num}] Đang tạo ảnh bằng Agnes...")
-        url = call_agnes(prompt)
+        url = call_agnes_image(prompt)
         if url and download_url(url, local):
             upload_file_to_drive(local)
             ok += 1
-            print(f"✅ [{scene_num}] Agnes OK")
+            print(f"✅ [{scene_num}] Agnes Image OK")
         else:
             print(f"❌ [{scene_num}] Không tạo được ảnh")
+
     print(f"\n✅ Giai đoạn 1 xong: {ok} ảnh")
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÀI ĐẶT + Wan 2.1
+# TTS + POST PROCESS
 # ==========================================
-def install_deps():
-    print("📦 Kiểm tra / cài dependency...")
-    try:
-        from diffusers import WanImageToVideoPipeline
-        print("✅ diffusers + Wan đã có")
-    except Exception:
-        print("📦 Đang cài diffusers mới nhất...")
-        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
-        subprocess.run([
-            sys.executable, "-m", "pip", "install", "-q",
-            "diffusers>=0.33.0", "transformers>=4.46.0", "accelerate>=1.1.0",
-            "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
-            "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
-        ], check=False)
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except Exception:
-        print("📦 Cài ffmpeg...")
-        subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg", shell=True, check=False)
-
 def get_video_prompt(row) -> str:
     vp = safe_get(row, "video_prompt")
     if vp:
-        return vp[:220]
+        return vp[:300]
     ip = safe_get(row, "image_prompt", "scene_description")
     if ip:
-        return f"Slow cinematic camera move, subtle natural motion, consistent characters. {ip[:160]}"
-    return "Slow cinematic camera push-in, subtle character movement, natural atmosphere, consistent faces"
+        return f"Slow cinematic camera move, subtle natural motion, consistent characters. {ip[:200]}"
+    return "Slow cinematic camera push-in, subtle character movement, natural atmosphere"
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
@@ -277,13 +338,9 @@ def make_tts(text: str, out_mp3: str) -> bool:
     if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400:
         return True
     safe = text.replace('"', "'").replace("\n", " ").replace("`", "'")
-    voices = ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]
-    for voice in voices:
+    for voice in ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]:
         try:
-            cmd = (
-                f'edge-tts --text "{safe}" --voice {voice} '
-                f'--rate=+5% --write-media "{out_mp3}"'
-            )
+            cmd = f'edge-tts --text "{safe}" --voice {voice} --rate=+5% --write-media "{out_mp3}"'
             subprocess.run(cmd, shell=True, timeout=90,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400:
@@ -307,79 +364,13 @@ def mix_video_audio(video_in: str, audio_mp3: str, video_out: str) -> str:
         return video_out
     return video_in
 
-def post_process_video(raw_path: str, out_path: str) -> str:
-    if not os.path.exists(raw_path):
-        return raw_path
-    cmd = (
-        f'ffmpeg -y -hide_banner -loglevel error -i "{raw_path}" '
-        f'-vf "scale={FINAL_WIDTH}:{FINAL_HEIGHT}:flags=lanczos,'
-        f'unsharp=5:5:0.7:5:5:0.3,fps={FINAL_FPS}" '
-        f'-c:v libx264 -preset fast -crf 17 -pix_fmt yuv420p '
-        f'-movflags +faststart "{out_path}"'
-    )
-    try:
-        subprocess.run(cmd, shell=True, timeout=120)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
-            return out_path
-    except Exception as e:
-        print(f"⚠️ Post-process: {e}")
-    return raw_path
-
-def load_wan_pipe():
-    import torch
-    from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
-    from transformers import CLIPVisionModel
-    from diffusers.utils import logging
-    logging.set_verbosity_error()
-
-    print("🧠 Đang load Wan 2.1 I2V 14B-480P...")
-    dtype = torch.float16
-
-    image_encoder = CLIPVisionModel.from_pretrained(
-        WAN_MODEL, subfolder="image_encoder", torch_dtype=torch.float32
-    )
-    vae = AutoencoderKLWan.from_pretrained(
-        WAN_MODEL, subfolder="vae", torch_dtype=torch.float32
-    )
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        WAN_MODEL,
-        vae=vae,
-        image_encoder=image_encoder,
-        torch_dtype=dtype,
-    )
-
-    if torch.cuda.is_available():
-        pipe.enable_model_cpu_offload()
-        print("✅ model_cpu_offload")
-
-        try:
-            pipe.vae.enable_slicing()
-            print("✅ VAE slicing")
-        except Exception:
-            pass
-
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-    print("✅ Wan 2.1 I2V 14B-480P ready")
-    return pipe
-
 # ==========================================
-# GIAI ĐOẠN 2: RENDER Wan 2.1
+# GIAI ĐOẠN 2: RENDER BẰNG AGNES VIDEO 2.5
 # ==========================================
-def step_2_wan_render():
-    import torch
-    from diffusers.utils import export_to_video, load_image
-    from PIL import Image
-
+def step_2_agnes_video_render():
     print("\n" + "=" * 55)
-    print(f"🎬 GIAI ĐOẠN 2: Wan 2.1 I2V 14B-480P | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES} | steps={WAN_STEPS}")
+    print(f"🎬 GIAI ĐOẠN 2: Agnes Video 2.5 | {VIDEO_SECONDS}s | {VIDEO_SIZE}")
     print("=" * 55)
-
-    install_deps()
-    pipe = load_wan_pipe()
 
     df = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
@@ -401,8 +392,7 @@ def step_2_wan_render():
             break
 
         img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
-        raw_video = f"{VIDEO_DIR}/wan_raw_{scene_num:03d}.mp4"
-        upscaled = f"{VIDEO_DIR}/wan_up_{scene_num:03d}.mp4"
+        raw_video = f"{VIDEO_DIR}/agnes_raw_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
         scene_name = f"scene_{scene_num:03d}.mp4"
@@ -425,65 +415,58 @@ def step_2_wan_render():
 
         prompt = get_video_prompt(row)
         dialogue = get_dialogue(row)
-        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] {prompt[:75]}...")
+        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] {prompt[:70]}...")
+
+        # Lấy public URL của ảnh
+        img_name = f"scene_{scene_num:03d}.png"
+        image_url = None
+        if img_name in drive_map:
+            image_url = get_public_drive_url(drive_map[img_name])
+
+        # Nếu không có public link thì dùng tạm URL từ Agnes Image (nếu còn)
+        if not image_url:
+            print(f"⚠️ [{scene_num}] Không có public image URL, thử text mode")
 
         try:
             t1 = time.time()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+            video_id = create_agnes_video(prompt, image_url)
+            if not video_id:
+                print(f"❌ [{scene_num}] Không tạo được task")
+                continue
 
-            image = load_image(img_path).convert("RGB")
-            image = image.resize((WAN_WIDTH, WAN_HEIGHT), Image.Resampling.LANCZOS)
+            print(f"   📡 video_id = {video_id}")
+            video_url = poll_agnes_video(video_id)
 
-            generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
+            if not video_url:
+                print(f"❌ [{scene_num}] Không lấy được video")
+                continue
 
-            res = pipe(
-                image=image,
-                prompt=prompt,
-                negative_prompt="blurry, low quality, distorted, deformed, ugly, bad anatomy",
-                height=WAN_HEIGHT,
-                width=WAN_WIDTH,
-                num_frames=WAN_NUM_FRAMES,
-                num_inference_steps=WAN_STEPS,
-                guidance_scale=5.0,
-                generator=generator,
-            )
+            if not download_url(video_url, raw_video):
+                print(f"❌ [{scene_num}] Tải video thất bại")
+                continue
 
-            export_to_video(res.frames[0], raw_video, fps=WAN_FPS)
-            post_process_video(raw_video, upscaled)
             make_tts(dialogue, voice_mp3)
-            out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
+            out_file = mix_video_audio(raw_video, voice_mp3, final_scene)
 
             sz = os.path.getsize(out_file) if os.path.exists(out_file) else 0
             print(f"✅ [{scene_num}] {time.time()-t1:.0f}s | {sz/1024:.0f} KB")
 
-            if sz > 200_000:
+            if sz > 100_000:
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
-            for tmp in [raw_video, upscaled]:
-                if os.path.exists(tmp) and tmp != out_file:
-                    try:
-                        os.remove(tmp)
-                    except Exception:
-                        pass
-
-            del res
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if os.path.exists(raw_video) and raw_video != out_file:
+                try:
+                    os.remove(raw_video)
+                except Exception:
+                    pass
 
         except Exception as e:
             print(f"❌ [{scene_num}] Lỗi: {e}")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
 
-    valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 200_000]
+    valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 100_000]
     if not valid:
         print("❌ Không đủ video để ghép")
         return False
@@ -516,15 +499,9 @@ def step_2_wan_render():
 if __name__ == "__main__":
     print("DRIVE_FOLDER_ID =", DRIVE_FOLDER_ID or "(EMPTY)")
     print("AGNES_API_KEY    =", "có" if AGNES_API_KEY else "(EMPTY)")
-    try:
-        import torch
-        print("CUDA:", torch.cuda.is_available(),
-              torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
-    except Exception as e:
-        print("Torch:", e)
 
     if step_1_ensure_images():
-        step_2_wan_render()
+        step_2_agnes_video_render()
         print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
     else:
         print("\n❌ Dừng: chưa đủ ảnh ở Giai đoạn 1")
