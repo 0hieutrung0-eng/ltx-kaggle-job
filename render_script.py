@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.1 I2V 14B-480P (Speed Optimized) → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B → TTS → Merge ==========
 import os
 import sys
 import json
@@ -27,12 +27,12 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- Wan 2.1 I2V 14B-480P (Speed Optimized) ---
-WAN_MODEL = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+# --- Wan 2.2 TI2V-5B ---
+WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 WAN_WIDTH = 832
 WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 81              # Giữ nguyên ≈ 5 giây @ 16fps
-WAN_STEPS = 22                   # Giảm từ 30 → 22 (tăng tốc rõ)
+WAN_NUM_FRAMES = 81              # ≈ 5 giây @ 16fps (hoặc 121 @ 24fps)
+WAN_STEPS = 22
 WAN_FPS = 16
 FINAL_FPS = 24
 FINAL_WIDTH = 768
@@ -243,12 +243,12 @@ def step_1_ensure_images():
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÀI ĐẶT + Wan 2.1
+# CÀI ĐẶT + Wan 2.2
 # ==========================================
 def install_deps():
     print("📦 Kiểm tra / cài dependency...")
     try:
-        from diffusers import WanImageToVideoPipeline
+        from diffusers import WanPipeline
         print("✅ diffusers + Wan đã có")
     except Exception:
         print("📦 Đang cài diffusers mới nhất...")
@@ -333,24 +333,19 @@ def post_process_video(raw_path: str, out_path: str) -> str:
 
 def load_wan_pipe():
     import torch
-    from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
-    from transformers import CLIPVisionModel
+    from diffusers import WanPipeline, AutoencoderKLWan
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load Wan 2.1 I2V 14B-480P (Speed Mode)...")
+    print("🧠 Đang load Wan 2.2 TI2V-5B...")
     dtype = torch.float16
 
-    image_encoder = CLIPVisionModel.from_pretrained(
-        WAN_MODEL, subfolder="image_encoder", torch_dtype=torch.float32
-    )
     vae = AutoencoderKLWan.from_pretrained(
         WAN_MODEL, subfolder="vae", torch_dtype=torch.float32
     )
-    pipe = WanImageToVideoPipeline.from_pretrained(
+    pipe = WanPipeline.from_pretrained(
         WAN_MODEL,
         vae=vae,
-        image_encoder=image_encoder,
         torch_dtype=dtype,
     )
 
@@ -364,14 +359,14 @@ def load_wan_pipe():
         except Exception:
             pass
 
-        # === SPEED BOOST: torch.compile ===
+        # Speed boost
         try:
             pipe.transformer = torch.compile(
                 pipe.transformer,
                 mode="reduce-overhead",
                 fullgraph=False
             )
-            print("✅ torch.compile transformer (speed boost)")
+            print("✅ torch.compile transformer")
         except Exception as e:
             print(f"⚠️ torch.compile bỏ qua: {e}")
 
@@ -380,11 +375,11 @@ def load_wan_pipe():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print("✅ Wan 2.1 I2V 14B-480P ready (Speed Mode)")
+    print("✅ Wan 2.2 TI2V-5B ready")
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: RENDER Wan 2.1
+# GIAI ĐOẠN 2: RENDER Wan 2.2
 # ==========================================
 def step_2_wan_render():
     import torch
@@ -392,7 +387,7 @@ def step_2_wan_render():
     from PIL import Image
 
     print("\n" + "=" * 55)
-    print(f"🎬 GIAI ĐOẠN 2: Wan 2.1 I2V 14B-480P | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES} | steps={WAN_STEPS}")
+    print(f"🎬 GIAI ĐOẠN 2: Wan 2.2 TI2V-5B | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES} | steps={WAN_STEPS}")
     print("=" * 55)
 
     install_deps()
@@ -456,6 +451,7 @@ def step_2_wan_render():
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
+            # Wan 2.2 TI2V hỗ trợ truyền image
             res = pipe(
                 image=image,
                 prompt=prompt,
