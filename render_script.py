@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.1 I2V 14B-480P → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.1 I2V 14B-480P (Speed Optimized) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -27,12 +27,12 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- Wan 2.1 I2V 14B-480P ---
+# --- Wan 2.1 I2V 14B-480P (Speed Optimized) ---
 WAN_MODEL = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 WAN_WIDTH = 832
 WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 81              # ≈ 5 giây ở 16fps
-WAN_STEPS = 30
+WAN_NUM_FRAMES = 81              # Giữ nguyên ≈ 5 giây @ 16fps
+WAN_STEPS = 22                   # Giảm từ 30 → 22 (tăng tốc rõ)
 WAN_FPS = 16
 FINAL_FPS = 24
 FINAL_WIDTH = 768
@@ -40,7 +40,7 @@ FINAL_HEIGHT = 512
 
 # --- Agnes ---
 AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
-AGNES_MODEL = "agnes-image-2.0-flash"
+AGNES_MODEL = "agnes-image-2.1-flash"
 AGNES_SIZE = "1024x768"
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -155,7 +155,7 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
         print(f"❌ Sheet gid={gid}: {e}")
         return pd.DataFrame()
 
-def call_agnes(prompt: str, retries: int = 2):
+def call_agnes(prompt: str, retries: int = 3):
     if not AGNES_API_KEY:
         print("❌ Thiếu AGNES_API_KEY")
         return None
@@ -173,13 +173,13 @@ def call_agnes(prompt: str, retries: int = 2):
         try:
             r = requests.post(AGNES_URL, headers=headers, json=body, timeout=120)
             if r.status_code == 200:
-                data = r.json().get("data", [{}])
-                if data:
-                    return data[0].get("url")
+                data = r.json().get("data", [])
+                if data and data[0].get("url"):
+                    return data[0]["url"]
             print(f"⚠️ Agnes {r.status_code}: {r.text[:150]}")
         except Exception as e:
             print(f"❌ Agnes attempt {attempt+1}: {e}")
-        time.sleep(2)
+        time.sleep(2 + attempt)
     return None
 
 def download_url(url: str, path: str) -> bool:
@@ -205,13 +205,16 @@ def step_1_ensure_images():
     if df.empty:
         print("❌ Sheet rỗng")
         return False
+
     ok = 0
     for idx, row in df.iterrows():
         scene_num = int(row["scene_index"]) if pd.notna(row.get("scene_index")) else idx + 1
         if scene_num > TOTAL_SCENES:
             break
+
         name = f"scene_{scene_num:03d}.png"
         local = f"{OUTPUT_DIR}/{name}"
+
         if name in drive_map:
             if not (os.path.exists(local) and os.path.getsize(local) > 2000):
                 download_from_drive(drive_map[name], local)
@@ -219,11 +222,13 @@ def step_1_ensure_images():
                 ok += 1
                 print(f"✅ [{scene_num}] Drive OK")
                 continue
+
         if os.path.exists(local) and os.path.getsize(local) > 2000:
             upload_file_to_drive(local)
             ok += 1
             print(f"✅ [{scene_num}] Local OK")
             continue
+
         prompt = safe_get(row, "image_prompt", "scene_description") or f"Cinematic scene {scene_num}"
         print(f"🎨 [{scene_num}] Đang tạo ảnh bằng Agnes...")
         url = call_agnes(prompt)
@@ -233,6 +238,7 @@ def step_1_ensure_images():
             print(f"✅ [{scene_num}] Agnes OK")
         else:
             print(f"❌ [{scene_num}] Không tạo được ảnh")
+
     print(f"\n✅ Giai đoạn 1 xong: {ok} ảnh")
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
@@ -332,7 +338,7 @@ def load_wan_pipe():
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load Wan 2.1 I2V 14B-480P...")
+    print("🧠 Đang load Wan 2.1 I2V 14B-480P (Speed Mode)...")
     dtype = torch.float16
 
     image_encoder = CLIPVisionModel.from_pretrained(
@@ -358,12 +364,23 @@ def load_wan_pipe():
         except Exception:
             pass
 
+        # === SPEED BOOST: torch.compile ===
+        try:
+            pipe.transformer = torch.compile(
+                pipe.transformer,
+                mode="reduce-overhead",
+                fullgraph=False
+            )
+            print("✅ torch.compile transformer (speed boost)")
+        except Exception as e:
+            print(f"⚠️ torch.compile bỏ qua: {e}")
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print("✅ Wan 2.1 I2V 14B-480P ready")
+    print("✅ Wan 2.1 I2V 14B-480P ready (Speed Mode)")
     return pipe
 
 # ==========================================
