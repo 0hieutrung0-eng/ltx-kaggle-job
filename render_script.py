@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B (I2V) → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B (Low VRAM) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -14,7 +14,6 @@ import pandas as pd
 def install_all_deps():
     print("📦 Đang kiểm tra và cài đặt dependency...")
 
-    # 1. Cài ftfy bắt buộc trước
     try:
         import ftfy
         print("✅ ftfy đã có")
@@ -24,30 +23,19 @@ def install_all_deps():
         import ftfy
         print("✅ ftfy đã cài xong")
 
-    # 2. Cài các thư viện còn lại
     try:
         from diffusers import WanImageToVideoPipeline
         print("✅ diffusers + Wan đã có")
     except Exception:
-        print("📦 Đang cài diffusers và các thư viện liên quan...")
+        print("📦 Đang cài diffusers...")
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
-            "diffusers>=0.33.0",
-            "transformers>=4.46.0",
-            "accelerate>=1.1.0",
-            "sentencepiece",
-            "imageio",
-            "imageio-ffmpeg",
-            "edge-tts",
-            "safetensors",
-            "huggingface_hub",
-            "protobuf<6",
-            "opencv-python-headless",
-            "ftfy"
+            "diffusers>=0.33.0", "transformers>=4.46.0", "accelerate>=1.1.0",
+            "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
+            "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
         ], check=False)
 
-    # 3. Cài ffmpeg
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         print("✅ ffmpeg đã có")
@@ -57,14 +45,13 @@ def install_all_deps():
 
     print("✅ Tất cả dependency đã sẵn sàng\n")
 
-# Chạy cài đặt ngay khi bắt đầu
 install_all_deps()
 
 import torch
-import ftfy  # import lại sau khi chắc chắn đã cài
+import ftfy
 
 # ==========================================
-# CẤU HÌNH
+# CẤU HÌNH (Đã giảm VRAM)
 # ==========================================
 TOTAL_SCENES = 100
 OUTPUT_DIR = "./output_scenes"
@@ -82,12 +69,12 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- Wan 2.2 TI2V-5B ---
+# --- Wan 2.2 TI2V-5B (Low VRAM cho T4) ---
 WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-WAN_WIDTH = 832
-WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 81
-WAN_STEPS = 22
+WAN_WIDTH = 640          # Giảm từ 832 → 640
+WAN_HEIGHT = 360         # Giảm từ 480 → 360
+WAN_NUM_FRAMES = 81      # Vẫn ≈ 5 giây
+WAN_STEPS = 20           # Giảm nhẹ để tiết kiệm thêm
 WAN_FPS = 16
 FINAL_FPS = 24
 FINAL_WIDTH = 768
@@ -366,7 +353,7 @@ def load_wan_pipe():
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load Wan 2.2 TI2V-5B (Image-to-Video)...")
+    print("🧠 Đang load Wan 2.2 TI2V-5B (Low VRAM mode)...")
     dtype = torch.float16
 
     vae = AutoencoderKLWan.from_pretrained(
@@ -380,8 +367,9 @@ def load_wan_pipe():
     )
 
     if torch.cuda.is_available():
-        pipe.enable_model_cpu_offload()
-        print("✅ model_cpu_offload")
+        # Sequential offload tiết kiệm VRAM hơn model_cpu_offload
+        pipe.enable_sequential_cpu_offload()
+        print("✅ sequential_cpu_offload (tiết kiệm VRAM)")
 
         try:
             pipe.vae.enable_slicing()
@@ -389,22 +377,14 @@ def load_wan_pipe():
         except Exception:
             pass
 
-        try:
-            pipe.transformer = torch.compile(
-                pipe.transformer,
-                mode="reduce-overhead",
-                fullgraph=False
-            )
-            print("✅ torch.compile transformer")
-        except Exception as e:
-            print(f"⚠️ torch.compile bỏ qua: {e}")
+        # Không dùng torch.compile để tránh tăng VRAM
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print("✅ Wan 2.2 TI2V-5B ready")
+    print("✅ Wan 2.2 TI2V-5B ready (Low VRAM)")
     return pipe
 
 # ==========================================
@@ -423,7 +403,6 @@ def step_2_wan_render():
     df = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
 
-    # Tải ảnh thiếu
     for i in range(1, TOTAL_SCENES + 1):
         local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
         name = f"scene_{i:03d}.png"
