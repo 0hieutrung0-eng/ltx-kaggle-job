@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE: Quantum-State Streaming Architecture ==========
+# ========== FULL PIPELINE: Quantum-State Streaming Architecture (Fixed) ==========
 import os
 import sys
 import json
@@ -8,6 +8,7 @@ import requests
 import subprocess
 import pandas as pd
 import torch
+import ftfy  # <--- Đã vá lỗi thiếu ftfy tại đây
 
 # ==========================================
 # CẤU HÌNH & KHỞI TẠO KHÔNG GIAN ẢO HÓA
@@ -44,11 +45,10 @@ AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_MODEL = "agnes-image-2.1-flash"
 AGNES_SIZE = "1024x768"
 
-# Kích hoạt cơ chế phân mảnh phân khúc bộ nhớ tối đa để chống tràn RAM/VRAM
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
 
 # ==========================================
-# GOOGLE OAUTH + DRIVE (Băng chuyền đồng bộ)
+# GOOGLE OAUTH + DRIVE
 # ==========================================
 def get_google_access_token():
     if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
@@ -245,7 +245,7 @@ def step_1_ensure_images():
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÀI ĐẶT + KỸ THUẬT LƯỢNG TỬ HÓA PIPELINE
+# CÀI ĐẶT + PIPELINE
 # ==========================================
 def install_deps():
     print("📦 Kiểm tra / cài dependency...")
@@ -353,7 +353,6 @@ def load_wan_pipe():
     )
 
     if torch.cuda.is_available():
-        # Cấu hình "Bẫy từ trường dữ liệu": Tách rời lớp, chỉ nạp vào phần cứng khi tính toán xong lập tức thu hồi
         pipe.enable_model_cpu_offload()
         print("✅ Kích hoạt phân mảnh động (Dynamic CPU Offload)")
 
@@ -372,7 +371,7 @@ def load_wan_pipe():
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: RENDER VỚI CƠ CHẾ "TRẠNG THÁI SỤP ĐỔ" (IN-PLACE FLUSH)
+# GIAI ĐOẠN 2: RENDER
 # ==========================================
 def step_2_wan_render():
     from diffusers.utils import export_to_video, load_image
@@ -433,7 +432,6 @@ def step_2_wan_render():
         try:
             t1 = time.time()
             
-            # Quét sạch bộ nhớ đệm trước khi phóng tia chiếu khung hình mới
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -444,7 +442,6 @@ def step_2_wan_render():
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
-            # Thực thi sinh frame qua băng chuyền phân mảnh động
             with torch.inference_mode():
                 res = pipe(
                     image=image,
@@ -477,7 +474,6 @@ def step_2_wan_render():
                     except Exception:
                         pass
 
-            # SỤP ĐỔ HÀM SÓNG: Ép xóa toàn bộ kết quả tensor ngay lập tức sau khi hoàn tất cảnh
             del res
             del image
             gc.collect()
