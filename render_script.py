@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B (I2V) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -31,7 +31,7 @@ GID_SCENES = os.environ.get("GID_SCENES", "0")
 WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 WAN_WIDTH = 832
 WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 81              # ≈ 5 giây @ 16fps (hoặc 121 @ 24fps)
+WAN_NUM_FRAMES = 81              # ≈ 5 giây @ 16fps
 WAN_STEPS = 22
 WAN_FPS = 16
 FINAL_FPS = 24
@@ -248,7 +248,7 @@ def step_1_ensure_images():
 def install_deps():
     print("📦 Kiểm tra / cài dependency...")
     try:
-        from diffusers import WanPipeline
+        from diffusers import WanImageToVideoPipeline
         print("✅ diffusers + Wan đã có")
     except Exception:
         print("📦 Đang cài diffusers mới nhất...")
@@ -333,17 +333,18 @@ def post_process_video(raw_path: str, out_path: str) -> str:
 
 def load_wan_pipe():
     import torch
-    from diffusers import WanPipeline, AutoencoderKLWan
+    from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load Wan 2.2 TI2V-5B...")
+    print("🧠 Đang load Wan 2.2 TI2V-5B (Image-to-Video)...")
     dtype = torch.float16
 
     vae = AutoencoderKLWan.from_pretrained(
         WAN_MODEL, subfolder="vae", torch_dtype=torch.float32
     )
-    pipe = WanPipeline.from_pretrained(
+    
+    pipe = WanImageToVideoPipeline.from_pretrained(
         WAN_MODEL,
         vae=vae,
         torch_dtype=dtype,
@@ -359,7 +360,6 @@ def load_wan_pipe():
         except Exception:
             pass
 
-        # Speed boost
         try:
             pipe.transformer = torch.compile(
                 pipe.transformer,
@@ -375,7 +375,7 @@ def load_wan_pipe():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print("✅ Wan 2.2 TI2V-5B ready")
+    print("✅ Wan 2.2 TI2V-5B ready (I2V mode)")
     return pipe
 
 # ==========================================
@@ -451,7 +451,6 @@ def step_2_wan_render():
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
-            # Wan 2.2 TI2V hỗ trợ truyền image
             res = pipe(
                 image=image,
                 prompt=prompt,
