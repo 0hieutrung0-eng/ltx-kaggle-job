@@ -72,7 +72,7 @@ GID_SCENES = os.environ.get("GID_SCENES", "0")
 # --- Wan 2.2 TI2V-5B (Low VRAM cho T4) ---
 WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 WAN_WIDTH = 640          # Giảm từ 832 → 640
-WAN_HEIGHT = 360         # Giảm từ 480 → 360
+WAN_HEIGHT = 368         # Giảm từ 480 → 368
 WAN_NUM_FRAMES = 81      # Vẫn ≈ 5 giây
 WAN_STEPS = 20           # Giảm nhẹ để tiết kiệm thêm
 WAN_FPS = 16
