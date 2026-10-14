@@ -7,7 +7,61 @@ import gc
 import requests
 import subprocess
 import pandas as pd
+
+# ==========================================
+# CÀI ĐẶT DEPENDENCY NGAY TỪ ĐẦU
+# ==========================================
+def install_all_deps():
+    print("📦 Đang kiểm tra và cài đặt dependency...")
+
+    # 1. Cài ftfy bắt buộc trước
+    try:
+        import ftfy
+        print("✅ ftfy đã có")
+    except ImportError:
+        print("📦 Đang cài ftfy...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "ftfy"], check=False)
+        import ftfy
+        print("✅ ftfy đã cài xong")
+
+    # 2. Cài các thư viện còn lại
+    try:
+        from diffusers import WanImageToVideoPipeline
+        print("✅ diffusers + Wan đã có")
+    except Exception:
+        print("📦 Đang cài diffusers và các thư viện liên quan...")
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
+        subprocess.run([
+            sys.executable, "-m", "pip", "install", "-q",
+            "diffusers>=0.33.0",
+            "transformers>=4.46.0",
+            "accelerate>=1.1.0",
+            "sentencepiece",
+            "imageio",
+            "imageio-ffmpeg",
+            "edge-tts",
+            "safetensors",
+            "huggingface_hub",
+            "protobuf<6",
+            "opencv-python-headless",
+            "ftfy"
+        ], check=False)
+
+    # 3. Cài ffmpeg
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        print("✅ ffmpeg đã có")
+    except Exception:
+        print("📦 Đang cài ffmpeg...")
+        subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg", shell=True, check=False)
+
+    print("✅ Tất cả dependency đã sẵn sàng\n")
+
+# Chạy cài đặt ngay khi bắt đầu
+install_all_deps()
+
 import torch
+import ftfy  # import lại sau khi chắc chắn đã cài
 
 # ==========================================
 # CẤU HÌNH
@@ -244,38 +298,8 @@ def step_1_ensure_images():
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÀI ĐẶT + PIPELINE
+# CÁC HÀM HỖ TRỢ
 # ==========================================
-def install_deps():
-    print("📦 Kiểm tra / cài dependency...")
-
-    # Bắt buộc cài ftfy trước
-    try:
-        import ftfy
-        print("✅ ftfy đã có")
-    except ImportError:
-        print("📦 Đang cài ftfy...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ftfy"], check=False)
-
-    try:
-        from diffusers import WanImageToVideoPipeline
-        print("✅ diffusers + Wan đã có")
-    except Exception:
-        print("📦 Đang cài diffusers...")
-        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
-        subprocess.run([
-            sys.executable, "-m", "pip", "install", "-q",
-            "diffusers>=0.33.0", "transformers>=4.46.0", "accelerate>=1.1.0",
-            "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
-            "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
-        ], check=False)
-
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except Exception:
-        print("📦 Cài ffmpeg...")
-        subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg", shell=True, check=False)
-
 def get_video_prompt(row) -> str:
     vp = safe_get(row, "video_prompt")
     if vp:
@@ -394,7 +418,6 @@ def step_2_wan_render():
     print(f"🎬 GIAI ĐOẠN 2: Wan 2.2 TI2V-5B | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES} | steps={WAN_STEPS}")
     print("=" * 55)
 
-    install_deps()
     pipe = load_wan_pipe()
 
     df = get_sheet_csv(GID_SCENES)
