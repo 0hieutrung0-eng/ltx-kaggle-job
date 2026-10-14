@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B (I2V) → TTS → Merge ==========
+# ========== FULL PIPELINE: Quantum-State Streaming Architecture ==========
 import os
 import sys
 import json
@@ -7,9 +7,10 @@ import gc
 import requests
 import subprocess
 import pandas as pd
+import torch
 
 # ==========================================
-# CẤU HÌNH
+# CẤU HÌNH & KHỞI TẠO KHÔNG GIAN ẢO HÓA
 # ==========================================
 TOTAL_SCENES = 100
 OUTPUT_DIR = "./output_scenes"
@@ -27,11 +28,11 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- Wan 2.2 TI2V-5B ---
+# --- Wan 2.2 TI2V-5B (Tối ưu hóa không gian động) ---
 WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 WAN_WIDTH = 832
 WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 81              # ≈ 5 giây @ 16fps
+WAN_NUM_FRAMES = 81          # ≈ 5 giây @ 16fps
 WAN_STEPS = 22
 WAN_FPS = 16
 FINAL_FPS = 24
@@ -43,10 +44,11 @@ AGNES_URL = "https://apihub.agnes-ai.com/v1/images/generations"
 AGNES_MODEL = "agnes-image-2.1-flash"
 AGNES_SIZE = "1024x768"
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Kích hoạt cơ chế phân mảnh phân khúc bộ nhớ tối đa để chống tràn RAM/VRAM
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
 
 # ==========================================
-# GOOGLE OAUTH + DRIVE
+# GOOGLE OAUTH + DRIVE (Băng chuyền đồng bộ)
 # ==========================================
 def get_google_access_token():
     if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
@@ -243,15 +245,20 @@ def step_1_ensure_images():
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÀI ĐẶT + Wan 2.2
+# CÀI ĐẶT + KỸ THUẬT LƯỢNG TỬ HÓA PIPELINE
 # ==========================================
 def install_deps():
     print("📦 Kiểm tra / cài dependency...")
     try:
+        import ftfy
+        print("✅ ftfy đã có")
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ftfy"], check=False)
+
+    try:
         from diffusers import WanImageToVideoPipeline
         print("✅ diffusers + Wan đã có")
     except Exception:
-        print("📦 Đang cài diffusers mới nhất...")
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
@@ -259,10 +266,10 @@ def install_deps():
             "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
             "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
         ], check=False)
+
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     except Exception:
-        print("📦 Cài ffmpeg...")
         subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg", shell=True, check=False)
 
 def get_video_prompt(row) -> str:
@@ -286,12 +293,8 @@ def make_tts(text: str, out_mp3: str) -> bool:
     voices = ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]
     for voice in voices:
         try:
-            cmd = (
-                f'edge-tts --text "{safe}" --voice {voice} '
-                f'--rate=+5% --write-media "{out_mp3}"'
-            )
-            subprocess.run(cmd, shell=True, timeout=90,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cmd = f'edge-tts --text "{safe}" --voice {voice} --rate=+5% --write-media "{out_mp3}"'
+            subprocess.run(cmd, shell=True, timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400:
                 return True
         except Exception:
@@ -332,12 +335,11 @@ def post_process_video(raw_path: str, out_path: str) -> str:
     return raw_path
 
 def load_wan_pipe():
-    import torch
     from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load Wan 2.2 TI2V-5B (Image-to-Video)...")
+    print("🧠 [Hệ thống lượng tử] Thiết lập pipeline nạp phân mảnh động cho Wan 2.2...")
     dtype = torch.float16
 
     vae = AutoencoderKLWan.from_pretrained(
@@ -351,43 +353,33 @@ def load_wan_pipe():
     )
 
     if torch.cuda.is_available():
+        # Cấu hình "Bẫy từ trường dữ liệu": Tách rời lớp, chỉ nạp vào phần cứng khi tính toán xong lập tức thu hồi
         pipe.enable_model_cpu_offload()
-        print("✅ model_cpu_offload")
+        print("✅ Kích hoạt phân mảnh động (Dynamic CPU Offload)")
 
         try:
             pipe.vae.enable_slicing()
-            print("✅ VAE slicing")
+            print("✅ Kích hoạt cắt lát VAE không gian")
         except Exception:
             pass
-
-        try:
-            pipe.transformer = torch.compile(
-                pipe.transformer,
-                mode="reduce-overhead",
-                fullgraph=False
-            )
-            print("✅ torch.compile transformer")
-        except Exception as e:
-            print(f"⚠️ torch.compile bỏ qua: {e}")
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print("✅ Wan 2.2 TI2V-5B ready (I2V mode)")
+    print("✅ Wan 2.2 TI2V-5B ready (Quantum Mode)")
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: RENDER Wan 2.2
+# GIAI ĐOẠN 2: RENDER VỚI CƠ CHẾ "TRẠNG THÁI SỤP ĐỔ" (IN-PLACE FLUSH)
 # ==========================================
 def step_2_wan_render():
-    import torch
     from diffusers.utils import export_to_video, load_image
     from PIL import Image
 
     print("\n" + "=" * 55)
-    print(f"🎬 GIAI ĐOẠN 2: Wan 2.2 TI2V-5B | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES} | steps={WAN_STEPS}")
+    print(f"🎬 GIAI ĐOẠN 2: Băng chuyền lượng tử | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES}")
     print("=" * 55)
 
     install_deps()
@@ -396,7 +388,6 @@ def step_2_wan_render():
     df = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
 
-    # Tải ảnh thiếu
     for i in range(1, TOTAL_SCENES + 1):
         local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
         name = f"scene_{i:03d}.png"
@@ -441,6 +432,8 @@ def step_2_wan_render():
 
         try:
             t1 = time.time()
+            
+            # Quét sạch bộ nhớ đệm trước khi phóng tia chiếu khung hình mới
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -451,17 +444,19 @@ def step_2_wan_render():
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
-            res = pipe(
-                image=image,
-                prompt=prompt,
-                negative_prompt="blurry, low quality, distorted, deformed, ugly, bad anatomy",
-                height=WAN_HEIGHT,
-                width=WAN_WIDTH,
-                num_frames=WAN_NUM_FRAMES,
-                num_inference_steps=WAN_STEPS,
-                guidance_scale=5.0,
-                generator=generator,
-            )
+            # Thực thi sinh frame qua băng chuyền phân mảnh động
+            with torch.inference_mode():
+                res = pipe(
+                    image=image,
+                    prompt=prompt,
+                    negative_prompt="blurry, low quality, distorted, deformed, ugly, bad anatomy",
+                    height=WAN_HEIGHT,
+                    width=WAN_WIDTH,
+                    num_frames=WAN_NUM_FRAMES,
+                    num_inference_steps=WAN_STEPS,
+                    guidance_scale=5.0,
+                    generator=generator,
+                )
 
             export_to_video(res.frames[0], raw_video, fps=WAN_FPS)
             post_process_video(raw_video, upscaled)
@@ -482,16 +477,20 @@ def step_2_wan_render():
                     except Exception:
                         pass
 
+            # SỤP ĐỔ HÀM SÓNG: Ép xóa toàn bộ kết quả tensor ngay lập tức sau khi hoàn tất cảnh
             del res
+            del image
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
         except Exception as e:
             print(f"❌ [{scene_num}] Lỗi: {e}")
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
 
@@ -529,7 +528,6 @@ if __name__ == "__main__":
     print("DRIVE_FOLDER_ID =", DRIVE_FOLDER_ID or "(EMPTY)")
     print("AGNES_API_KEY    =", "có" if AGNES_API_KEY else "(EMPTY)")
     try:
-        import torch
         print("CUDA:", torch.cuda.is_available(),
               torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
     except Exception as e:
@@ -537,6 +535,6 @@ if __name__ == "__main__":
 
     if step_1_ensure_images():
         step_2_wan_render()
-        print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
+        print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH QUANTUM PIPELINE!")
     else:
         print("\n❌ Dừng: chưa đủ ảnh ở Giai đoạn 1")
