@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE: Quantum-State Streaming Architecture (Fixed) ==========
+# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B (I2V) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -8,10 +8,9 @@ import requests
 import subprocess
 import pandas as pd
 import torch
-import ftfy  # <--- Đã vá lỗi thiếu ftfy tại đây
 
 # ==========================================
-# CẤU HÌNH & KHỞI TẠO KHÔNG GIAN ẢO HÓA
+# CẤU HÌNH
 # ==========================================
 TOTAL_SCENES = 100
 OUTPUT_DIR = "./output_scenes"
@@ -29,11 +28,11 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- Wan 2.2 TI2V-5B (Tối ưu hóa không gian động) ---
+# --- Wan 2.2 TI2V-5B ---
 WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 WAN_WIDTH = 832
 WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 81          # ≈ 5 giây @ 16fps
+WAN_NUM_FRAMES = 81
 WAN_STEPS = 22
 WAN_FPS = 16
 FINAL_FPS = 24
@@ -249,16 +248,20 @@ def step_1_ensure_images():
 # ==========================================
 def install_deps():
     print("📦 Kiểm tra / cài dependency...")
+
+    # Bắt buộc cài ftfy trước
     try:
         import ftfy
         print("✅ ftfy đã có")
     except ImportError:
+        print("📦 Đang cài ftfy...")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ftfy"], check=False)
 
     try:
         from diffusers import WanImageToVideoPipeline
         print("✅ diffusers + Wan đã có")
     except Exception:
+        print("📦 Đang cài diffusers...")
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
@@ -270,6 +273,7 @@ def install_deps():
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     except Exception:
+        print("📦 Cài ffmpeg...")
         subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg", shell=True, check=False)
 
 def get_video_prompt(row) -> str:
@@ -290,8 +294,7 @@ def make_tts(text: str, out_mp3: str) -> bool:
     if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400:
         return True
     safe = text.replace('"', "'").replace("\n", " ").replace("`", "'")
-    voices = ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]
-    for voice in voices:
+    for voice in ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]:
         try:
             cmd = f'edge-tts --text "{safe}" --voice {voice} --rate=+5% --write-media "{out_mp3}"'
             subprocess.run(cmd, shell=True, timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -339,13 +342,13 @@ def load_wan_pipe():
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 [Hệ thống lượng tử] Thiết lập pipeline nạp phân mảnh động cho Wan 2.2...")
+    print("🧠 Đang load Wan 2.2 TI2V-5B (Image-to-Video)...")
     dtype = torch.float16
 
     vae = AutoencoderKLWan.from_pretrained(
         WAN_MODEL, subfolder="vae", torch_dtype=torch.float32
     )
-    
+
     pipe = WanImageToVideoPipeline.from_pretrained(
         WAN_MODEL,
         vae=vae,
@@ -354,20 +357,30 @@ def load_wan_pipe():
 
     if torch.cuda.is_available():
         pipe.enable_model_cpu_offload()
-        print("✅ Kích hoạt phân mảnh động (Dynamic CPU Offload)")
+        print("✅ model_cpu_offload")
 
         try:
             pipe.vae.enable_slicing()
-            print("✅ Kích hoạt cắt lát VAE không gian")
+            print("✅ VAE slicing")
         except Exception:
             pass
+
+        try:
+            pipe.transformer = torch.compile(
+                pipe.transformer,
+                mode="reduce-overhead",
+                fullgraph=False
+            )
+            print("✅ torch.compile transformer")
+        except Exception as e:
+            print(f"⚠️ torch.compile bỏ qua: {e}")
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print("✅ Wan 2.2 TI2V-5B ready (Quantum Mode)")
+    print("✅ Wan 2.2 TI2V-5B ready")
     return pipe
 
 # ==========================================
@@ -378,7 +391,7 @@ def step_2_wan_render():
     from PIL import Image
 
     print("\n" + "=" * 55)
-    print(f"🎬 GIAI ĐOẠN 2: Băng chuyền lượng tử | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES}")
+    print(f"🎬 GIAI ĐOẠN 2: Wan 2.2 TI2V-5B | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES} | steps={WAN_STEPS}")
     print("=" * 55)
 
     install_deps()
@@ -387,6 +400,7 @@ def step_2_wan_render():
     df = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
 
+    # Tải ảnh thiếu
     for i in range(1, TOTAL_SCENES + 1):
         local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
         name = f"scene_{i:03d}.png"
@@ -431,7 +445,7 @@ def step_2_wan_render():
 
         try:
             t1 = time.time()
-            
+
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -531,6 +545,6 @@ if __name__ == "__main__":
 
     if step_1_ensure_images():
         step_2_wan_render()
-        print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH QUANTUM PIPELINE!")
+        print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
     else:
         print("\n❌ Dừng: chưa đủ ảnh ở Giai đoạn 1")
