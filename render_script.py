@@ -1,4 +1,3 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B (Low VRAM) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -9,19 +8,20 @@ import subprocess
 import pandas as pd
 
 # ==========================================
-# CÀI ĐẶT DEPENDENCY NGAY TỪ ĐẦU
+# CÀI ĐẶT DEPENDENCY (Bổ sung Petals)
 # ==========================================
 def install_all_deps():
-    print("📦 Đang kiểm tra và cài đặt dependency...")
+    print("📦 Đang kiểm tra và cài đặt dependency (bao gồm Petals)...")
 
     try:
-        import ftfy
-        print("✅ ftfy đã có")
+        from petals import AutoDistributedModelForCausalLM
+        print("✅ Petals đã có")
     except ImportError:
-        print("📦 Đang cài ftfy...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "ftfy"], check=False)
-        import ftfy
-        print("✅ ftfy đã cài xong")
+        print("📦 Đang cài đặt Petals và Hugging Face transformers...")
+        subprocess.run([
+            sys.executable, "-m", "pip", "install", "-q",
+            "petals", "transformers>=4.46.0", "accelerate>=1.1.0", "torch"
+        ], check=False)
 
     try:
         from diffusers import WanImageToVideoPipeline
@@ -31,8 +31,7 @@ def install_all_deps():
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
-            "diffusers>=0.33.0", "transformers>=4.46.0", "accelerate>=1.1.0",
-            "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
+            "diffusers>=0.33.0", "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
             "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
         ], check=False)
 
@@ -49,9 +48,11 @@ install_all_deps()
 
 import torch
 import ftfy
+from transformers import AutoTokenizer
+from petals import AutoDistributedModelForCausalLM
 
 # ==========================================
-# CẤU HÌNH (Đã giảm VRAM)
+# CẤU HÌNH HỆ THỐNG
 # ==========================================
 TOTAL_SCENES = 100
 OUTPUT_DIR = "./output_scenes"
@@ -69,12 +70,15 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
+# --- Petals LLM Model (Chạy phân tán P2P) ---
+PETALS_MODEL_NAME = "meta-llama/Meta-Llama-3-70B-Instruct" # Hoặc model nhẹ hơn: "meta-llama/Meta-Llama-3-8B-Instruct"
+
 # --- Wan 2.2 TI2V-5B (Low VRAM cho T4) ---
 WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-WAN_WIDTH = 640          # Giảm từ 832 → 640
-WAN_HEIGHT = 368         # Giảm từ 480 → 368
-WAN_NUM_FRAMES = 81      # Vẫn ≈ 5 giây
-WAN_STEPS = 20           # Giảm nhẹ để tiết kiệm thêm
+WAN_WIDTH = 640
+WAN_HEIGHT = 368
+WAN_NUM_FRAMES = 81
+WAN_STEPS = 20
 WAN_FPS = 16
 FINAL_FPS = 24
 FINAL_WIDTH = 768
@@ -88,7 +92,53 @@ AGNES_SIZE = "1024x768"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
 
 # ==========================================
-# GOOGLE OAUTH + DRIVE
+# KHỞI TẠO KẾT NỐI PETALS (P2P DISTRIBUTED LLM)
+# ==========================================
+_petals_model = None
+_petals_tokenizer = None
+
+def get_petals_pipeline():
+    global _petals_model, _petals_tokenizer
+    if _petals_model is not None and _petals_tokenizer is not None:
+        return _petals_model, _petals_tokenizer
+
+    print(f"🌐 Đang kết nối tới mạng lưới P2P Petals cho mô hình {PETALS_MODEL_NAME}...")
+    try:
+        _petals_tokenizer = AutoTokenizer.from_pretrained(PETALS_MODEL_NAME)
+        _petals_model = AutoDistributedModelForCausalLM.from_pretrained(
+            PETALS_MODEL_NAME,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
+        )
+        print("✅ Kết nối mạng lưới P2P Petals thành công!")
+    except Exception as e:
+        print(f"❌ Lỗi kết nối Petals P2P: {e}")
+        _petals_model = None
+        _petals_tokenizer = None
+
+    return _petals_model, _petals_tokenizer
+
+def generate_prompt_via_petals(base_text: str) -> str:
+    """Dùng mạng P2P Petals để làm giàu / tối ưu prompt kịch bản phim"""
+    model, tokenizer = get_petals_pipeline()
+    if not model or not tokenizer:
+        return base_text # Fallback nếu mạng P2P bận
+
+    prompt = f"Human: Tối ưu hóa đoạn mô tả cảnh quay sau thành một prompt điện ảnh chi tiết bằng tiếng Anh, tối đa 30 từ: '{base_text}'\nAssistant:"
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt")
+        outputs = model.generate(inputs['input_ids'], max_new_tokens=60, temperature=0.7)
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Tách phần trả lời của Assistant
+        if "Assistant:" in response:
+            res_text = response.split("Assistant:")[-1].strip()
+            return res_text if len(res_text) > 5 else base_text
+    except Exception as e:
+        print(f"⚠️ Lỗi suy luận qua Petals: {e}")
+    return base_text
+
+# ==========================================
+# GOOGLE OAUTH + DRIVE (Giữ nguyên)
 # ==========================================
 def get_google_access_token():
     if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
@@ -271,8 +321,13 @@ def step_1_ensure_images():
             print(f"✅ [{scene_num}] Local OK")
             continue
 
-        prompt = safe_get(row, "image_prompt", "scene_description") or f"Cinematic scene {scene_num}"
-        print(f"🎨 [{scene_num}] Đang tạo ảnh bằng Agnes...")
+        raw_prompt = safe_get(row, "image_prompt", "scene_description") or f"Cinematic scene {scene_num}"
+        
+        # 🌐 Tối ưu hóa prompt thông qua mạng P2P Petals trước khi gọi Agnes
+        print(f"🌐 [{scene_num}] Tối ưu hóa prompt qua mạng P2P Petals...")
+        prompt = generate_prompt_via_petals(raw_prompt)
+
+        print(f"🎨 [{scene_num}] Đang tạo ảnh bằng Agnes với prompt tối ưu...")
         url = call_agnes(prompt)
         if url and download_url(url, local):
             upload_file_to_drive(local)
@@ -285,7 +340,7 @@ def step_1_ensure_images():
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÁC HÀM HỖ TRỢ
+# CÁC HÀM HỖ TRỢ AUDIO & VIDEO
 # ==========================================
 def get_video_prompt(row) -> str:
     vp = safe_get(row, "video_prompt")
@@ -367,17 +422,13 @@ def load_wan_pipe():
     )
 
     if torch.cuda.is_available():
-        # Sequential offload tiết kiệm VRAM hơn model_cpu_offload
         pipe.enable_sequential_cpu_offload()
         print("✅ sequential_cpu_offload (tiết kiệm VRAM)")
-
         try:
             pipe.vae.enable_slicing()
             print("✅ VAE slicing")
         except Exception:
             pass
-
-        # Không dùng torch.compile để tránh tăng VRAM
 
     gc.collect()
     if torch.cuda.is_available():
@@ -388,7 +439,7 @@ def load_wan_pipe():
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: RENDER
+# GIAI ĐOẠN 2: RENDER VIDEO
 # ==========================================
 def step_2_wan_render():
     from diffusers.utils import export_to_video, load_image
