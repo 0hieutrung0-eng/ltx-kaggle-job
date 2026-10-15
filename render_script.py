@@ -1,3 +1,4 @@
+# ========== FULL PIPELINE 1 GPU T4: Agnes → LTX-Video (Image-to-Video) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -24,10 +25,10 @@ def install_all_deps():
         print("✅ ftfy đã cài xong")
 
     try:
-        from diffusers import LTXPipeline
-        print("✅ diffusers + LTXPipeline đã có")
+        from diffusers import LTXImageToVideoPipeline
+        print("✅ diffusers + LTXImageToVideoPipeline đã có")
     except Exception:
-        print("📦 Đang cài diffusers và các gói hỗ trợ LTX...")
+        print("📦 Đang cài diffusers mới nhất...")
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
@@ -51,7 +52,7 @@ import torch
 import ftfy
 
 # ==========================================
-# CẤU HÌNH LTX-VIDEO TỐI ƯU
+# CẤU HÌNH LTX-VIDEO
 # ==========================================
 TOTAL_SCENES = 100
 OUTPUT_DIR = "./output_scenes"
@@ -73,7 +74,7 @@ GID_SCENES = os.environ.get("GID_SCENES", "0")
 DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
 LTX_WIDTH = 512
 LTX_HEIGHT = 512
-LTX_NUM_FRAMES = 49
+LTX_NUM_FRAMES = 49          # ≈ 2 giây @ 24fps (an toàn VRAM)
 LTX_STEPS = 25
 LTX_FPS = 24
 FINAL_FPS = 24
@@ -91,31 +92,35 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size
 # HÀM TỰ ĐỘNG TÌM DATASET CỤC BỘ TRÊN KAGGLE
 # ==========================================
 def find_local_model_path():
-    print("🔍 Đang quét các dataset có sẵn trong hệ thống (/kaggle/input/)...")
-    
-    # Tìm kiếm tất cả các thư mục con trong kaggle input có chứa file trọng số hoặc cấu hình model
-    search_patterns = [
-        "/kaggle/input/**/ltx-video*",
-        "/kaggle/input/**/Lightricks*",
-        "/kaggle/input/**/*.safetensors"
-    ]
-    
-    matched_dirs = set()
-    for pattern in search_patterns:
-        for path in glob.glob(pattern, recursive=True):
-            if os.path.isfile(path):
-                matched_dirs.add(os.path.dirname(path))
-            elif os.path.isdir(path):
-                matched_dirs.add(path)
-                
-    if matched_dirs:
-        # Lấy thư mục hợp lệ đầu tiên tìm thấy
-        local_path = list(matched_dirs)[0]
-        # Nếu path trỏ tới thư mục như 'model' hoặc 'weights', kiểm tra sâu hơn chút nếu cần
-        print(f"✅ Đã tìm thấy dataset cục bộ tại: {local_path}")
-        return local_path
-    
-    print("⚠️ Không tìm thấy dataset cục bộ, sẽ sử dụng nguồn online từ Hugging Face.")
+    print("🔍 Đang quét dataset trong /kaggle/input/...")
+
+    if not os.path.exists("/kaggle/input"):
+        print("⚠️ Không tìm thấy /kaggle/input/, dùng Hugging Face online.")
+        return DEFAULT_MODEL_ID
+
+    all_files = glob.glob("/kaggle/input/**/*", recursive=True)
+
+    matched_path = None
+    for path in all_files:
+        if "ltx" in path.lower() and os.path.isdir(path):
+            sub_files = os.listdir(path)
+            if any(f.endswith(('.safetensors', '.json', '.bin')) for f in sub_files) or len(sub_files) > 2:
+                matched_path = path
+                break
+        elif path.endswith('.safetensors') and "ltx" in path.lower():
+            matched_path = os.path.dirname(path)
+            break
+
+    if matched_path:
+        print(f"✅ Tìm thấy LTX local: {matched_path}")
+        return matched_path
+
+    dataset_dirs = [os.path.join("/kaggle/input", d) for d in os.listdir("/kaggle/input") if os.path.isdir(os.path.join("/kaggle/input", d))]
+    if dataset_dirs:
+        print(f"⚠️ Thử dùng dataset: {dataset_dirs[0]}")
+        return dataset_dirs[0]
+
+    print("⚠️ Không tìm thấy local, dùng Hugging Face online.")
     return DEFAULT_MODEL_ID
 
 # ==========================================
@@ -314,7 +319,7 @@ def step_1_ensure_images():
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÁC HÀM HỖ TRỢ AUDIO & VIDEO
+# CÁC HÀM HỖ TRỢ
 # ==========================================
 def get_video_prompt(row) -> str:
     vp = safe_get(row, "video_prompt")
@@ -322,8 +327,8 @@ def get_video_prompt(row) -> str:
         return vp[:220]
     ip = safe_get(row, "image_prompt", "scene_description")
     if ip:
-        return f"Cinematic motion, high quality. {ip[:160]}"
-    return "Cinematic motion, high quality"
+        return f"Smooth cinematic motion, consistent character, high quality. {ip[:150]}"
+    return "Smooth cinematic motion, consistent character, high quality"
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
@@ -364,8 +369,7 @@ def post_process_video(raw_path: str, out_path: str) -> str:
         return raw_path
     cmd = (
         f'ffmpeg -y -hide_banner -loglevel error -i "{raw_path}" '
-        f'-vf "scale={FINAL_WIDTH}:{FINAL_HEIGHT}:flags=lanczos,'
-        f'fps={FINAL_FPS}" '
+        f'-vf "scale={FINAL_WIDTH}:{FINAL_HEIGHT}:flags=lanczos,fps={FINAL_FPS}" '
         f'-c:v libx264 -preset fast -crf 17 -pix_fmt yuv420p '
         f'-movflags +faststart "{out_path}"'
     )
@@ -378,40 +382,43 @@ def post_process_video(raw_path: str, out_path: str) -> str:
     return raw_path
 
 def load_ltx_pipe():
-    from diffusers import LTXPipeline
+    from diffusers import LTXImageToVideoPipeline
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    # Tự động tìm nguồn model cục bộ hoặc online
     model_source = find_local_model_path()
-    print(f"🧠 Đang load LTX-Video từ: {model_source}...")
+    print(f"🧠 Đang load LTXImageToVideoPipeline từ: {model_source}...")
+
     dtype = torch.float16
 
-    pipe = LTXPipeline.from_pretrained(
+    pipe = LTXImageToVideoPipeline.from_pretrained(
         model_source,
         torch_dtype=dtype,
     )
 
     if torch.cuda.is_available():
         pipe.enable_sequential_cpu_offload()
-        print("✅ LTX sequential_cpu_offload đã bật (Tiết kiệm VRAM)")
+        print("✅ sequential_cpu_offload")
 
-        if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
-            pipe.vae.enable_slicing()
-            print("✅ VAE slicing đã bật")
+        try:
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+                pipe.vae.enable_slicing()
+                print("✅ VAE slicing")
+        except Exception:
+            pass
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print("✅ LTX-Video ready")
+    print("✅ LTX-Video (Image-to-Video) ready")
     return pipe
 
 # ==========================================
 # GIAI ĐOẠN 2: RENDER VỚI LTX
 # ==========================================
 def step_2_ltx_render():
-    from diffusers.utils import export_to_video
+    from diffusers.utils import export_to_video, load_image
     from PIL import Image
 
     print("\n" + "=" * 55)
@@ -422,6 +429,13 @@ def step_2_ltx_render():
 
     df = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
+
+    for i in range(1, TOTAL_SCENES + 1):
+        local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
+        name = f"scene_{i:03d}.png"
+        if not (os.path.exists(local) and os.path.getsize(local) > 2000):
+            if name in drive_map:
+                download_from_drive(drive_map[name], local)
 
     rendered = []
     t0 = time.time()
@@ -443,6 +457,13 @@ def step_2_ltx_render():
             rendered.append(final_scene)
             continue
 
+        if scene_name in drive_map:
+            if download_from_drive(drive_map[scene_name], final_scene):
+                if os.path.getsize(final_scene) > 200_000:
+                    print(f"⏩ [{scene_num}] Tải từ Drive")
+                    rendered.append(final_scene)
+                    continue
+
         if not (os.path.exists(img_path) and os.path.getsize(img_path) > 2000):
             print(f"⚠️ [{scene_num}] Thiếu ảnh → bỏ qua")
             continue
@@ -454,7 +475,11 @@ def step_2_ltx_render():
         try:
             t1 = time.time()
 
-            image = Image.open(img_path).convert("RGB")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            image = load_image(img_path).convert("RGB")
             image = image.resize((LTX_WIDTH, LTX_HEIGHT), Image.Resampling.LANCZOS)
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
@@ -463,7 +488,7 @@ def step_2_ltx_render():
                 res = pipe(
                     image=image,
                     prompt=prompt,
-                    negative_prompt="worst quality, inconsistent motion, blurry, jittery",
+                    negative_prompt="worst quality, inconsistent motion, blurry, jittery, distorted, deformed",
                     height=LTX_HEIGHT,
                     width=LTX_WIDTH,
                     num_frames=LTX_NUM_FRAMES,
@@ -483,6 +508,13 @@ def step_2_ltx_render():
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
+            for tmp in [raw_video, upscaled]:
+                if os.path.exists(tmp) and tmp != out_file:
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+
             del res
             del image
             gc.collect()
@@ -492,6 +524,8 @@ def step_2_ltx_render():
         except Exception as e:
             print(f"❌ [{scene_num}] Lỗi: {e}")
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
 
