@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: LTX Image-to-Video (Bản tốt nhất có thể chạy T4) ==========
+# ========== FULL PIPELINE 1 GPU T4: Wan 2.2 TI2V-5B (Image-to-Video) → TTS → Drive → Merge ==========
 # Dùng ảnh nhân vật khóa mặt + Text điều khiển cảnh
 import os
 import sys
@@ -16,12 +16,12 @@ def install_all_deps():
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "ftfy"], check=False)
     try:
-        from diffusers import LTXImageToVideoPipeline
+        from diffusers import WanImageToVideoPipeline
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
-            "diffusers>=0.32.0", "transformers>=4.46.0", "accelerate>=1.1.0",
+            "diffusers>=0.33.0", "transformers>=4.46.0", "accelerate>=1.1.0",
             "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
             "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
         ], check=False)
@@ -38,7 +38,7 @@ from diffusers.utils import export_to_video, load_image
 from PIL import Image
 
 # ==========================================
-# CẤU HÌNH TỐI ƯU CHO T4 - LTX BẢN TỐT
+# CẤU HÌNH - WAN 2.2 TI2V-5B TỐI ƯU T4
 # ==========================================
 TOTAL_SCENES = 100
 CHAR_DIR = "./character_images"
@@ -56,23 +56,21 @@ SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af35
 GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# Model LTX tốt nhất vẫn chạy được trên T4
-LTX_MODEL = "Lightricks/LTX-Video"          # Bản ổn định nhất hiện tại
-
-# Cấu hình tối ưu T4 + cố gắng ra ~4-5 giây
-LTX_WIDTH = 512
-LTX_HEIGHT = 512
-LTX_NUM_FRAMES = 73                         # ~4.5s @ 16fps
-LTX_FPS = 16
-LTX_STEPS = 25
+# --- Wan 2.2 TI2V-5B ---
+WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+WAN_WIDTH = 832
+WAN_HEIGHT = 480
+WAN_NUM_FRAMES = 81              # ≈ 5 giây @ 16fps
+WAN_STEPS = 25
+WAN_FPS = 16
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
-NEGATIVE_PROMPT_LOCK = (
+NEGATIVE_PROMPT = (
     "worst quality, low quality, blurry, jittery, distorted face, deformed eyes, "
     "morphed limbs, extra limbs, bad anatomy, warped features, changing face shape, "
-    "duplicate heads, unstable character design, black screen, blank video"
+    "duplicate heads, unstable character, black screen, static image"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -155,7 +153,7 @@ def download_url(url: str, path: str) -> bool:
     return False
 
 # ==========================================
-# TẢI ẢNH NHÂN VẬT TỪ TAB CHARACTERS
+# TẢI ẢNH NHÂN VẬT
 # ==========================================
 def load_character_images_map():
     print("\n🔍 Đang tải ảnh nhân vật từ Tab Characters...")
@@ -195,12 +193,13 @@ def load_character_images_map():
 def get_video_prompt(row) -> str:
     base = safe_get(row, "video_prompt", "scene_description", "action", "image_prompt")
     lock = (
-        "Keep the exact same face, identity, hairstyle and appearance from the reference image. "
-        "No face morphing, no identity change. Natural smooth cinematic motion. "
+        "Keep the exact same face, identity, hairstyle and clothing from the reference image. "
+        "No face morphing, no identity change, no deformation. "
+        "Natural smooth cinematic motion, high quality. "
     )
     if base:
-        return (lock + base)[:320]
-    return lock + "Cinematic scene, high quality, smooth movement"
+        return (lock + base)[:350]
+    return lock + "Cinematic scene, detailed, smooth movement"
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
@@ -246,19 +245,20 @@ def post_process_video(raw_path, out_path):
         pass
     return raw_path
 
-def load_ltx_pipe():
-    from diffusers import LTXImageToVideoPipeline
+def load_wan_pipe():
+    from diffusers import WanImageToVideoPipeline
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print(f"🧠 Load LTX Image-to-Video (tối ưu T4): {LTX_MODEL}")
-    pipe = LTXImageToVideoPipeline.from_pretrained(
-        LTX_MODEL,
+    print(f"🧠 Load Wan 2.2 TI2V-5B: {WAN_MODEL}")
+    pipe = WanImageToVideoPipeline.from_pretrained(
+        WAN_MODEL,
         torch_dtype=torch.float16,
     )
 
     if torch.cuda.is_available():
-        pipe.enable_sequential_cpu_offload()   # Quan trọng nhất để chạy T4
+        # sequential_cpu_offload tiết kiệm VRAM nhất trên T4
+        pipe.enable_sequential_cpu_offload()
         print("✅ sequential_cpu_offload")
         try:
             pipe.vae.enable_slicing()
@@ -269,7 +269,7 @@ def load_ltx_pipe():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("✅ LTX ready")
+    print("✅ Wan 2.2 TI2V-5B ready (T4 optimized)")
     return pipe
 
 # ==========================================
@@ -286,7 +286,7 @@ def run_pipeline():
         print("❌ Sheet Scenes rỗng")
         return False
 
-    pipe = load_ltx_pipe()
+    pipe = load_wan_pipe()
     rendered = []
     t0 = time.time()
     default_img = list(char_map.values())[0]
@@ -296,12 +296,12 @@ def run_pipeline():
         if scene_num > TOTAL_SCENES:
             break
 
-        raw_video = f"{VIDEO_DIR}/ltx_raw_{scene_num:03d}.mp4"
-        upscaled = f"{VIDEO_DIR}/ltx_up_{scene_num:03d}.mp4"
+        raw_video = f"{VIDEO_DIR}/wan_raw_{scene_num:03d}.mp4"
+        upscaled = f"{VIDEO_DIR}/wan_up_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
 
-        if os.path.exists(final_scene) and os.path.getsize(final_scene) > 50000:
+        if os.path.exists(final_scene) and os.path.getsize(final_scene) > 80000:
             print(f"⏩ [{scene_num}] Đã có")
             rendered.append(final_scene)
             continue
@@ -313,7 +313,7 @@ def run_pipeline():
         dialogue = get_dialogue(row)
 
         print(f"🎥 [{scene_num}/{TOTAL_SCENES}] Nhân vật: {char_key or 'default'}")
-        print(f"   Prompt: {prompt[:65]}...")
+        print(f"   Prompt: {prompt[:70]}...")
 
         try:
             t1 = time.time()
@@ -321,24 +321,25 @@ def run_pipeline():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            # Load ảnh nhân vật làm điều kiện identity
             image = load_image(img_path).convert("RGB")
-            image = image.resize((LTX_WIDTH, LTX_HEIGHT), Image.Resampling.LANCZOS)
+            image = image.resize((WAN_WIDTH, WAN_HEIGHT), Image.Resampling.LANCZOS)
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
             with torch.inference_mode():
                 res = pipe(
-                    image=image,                    # Ảnh nhân vật khóa mặt
-                    prompt=prompt,                  # Text điều khiển cảnh
-                    negative_prompt=NEGATIVE_PROMPT_LOCK,
-                    height=LTX_HEIGHT,
-                    width=LTX_WIDTH,
-                    num_frames=LTX_NUM_FRAMES,
-                    num_inference_steps=LTX_STEPS,
+                    image=image,
+                    prompt=prompt,
+                    negative_prompt=NEGATIVE_PROMPT,
+                    height=WAN_HEIGHT,
+                    width=WAN_WIDTH,
+                    num_frames=WAN_NUM_FRAMES,
+                    num_inference_steps=WAN_STEPS,
                     generator=generator,
                 )
 
-            export_to_video(res.frames[0], raw_video, fps=LTX_FPS)
+            export_to_video(res.frames[0], raw_video, fps=WAN_FPS)
             post_process_video(raw_video, upscaled)
             make_tts(dialogue, voice_mp3)
             out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
@@ -346,7 +347,7 @@ def run_pipeline():
             sz = os.path.getsize(out_file) if os.path.exists(out_file) else 0
             print(f"✅ [{scene_num}] {time.time()-t1:.0f}s | {sz/1024:.0f} KB")
 
-            if sz > 50000:
+            if sz > 80000:
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
@@ -370,7 +371,7 @@ def run_pipeline():
 
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
 
-    valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 50000]
+    valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 80000]
     if not valid:
         print("❌ Không đủ video")
         return False
