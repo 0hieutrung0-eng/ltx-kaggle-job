@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Optimized Text-to-Video AI → TTS → Drive Backup → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Text-to-Video ~5s (LTX) → TTS → Drive → Merge ==========
 import os
 import sys
 import json
@@ -7,16 +7,13 @@ import gc
 import requests
 import subprocess
 import pandas as pd
-import glob
-import shutil
 
 def install_all_deps():
-    print("📦 Đang kiểm tra và cài đặt dependency...")
+    print("📦 Đang kiểm tra dependency...")
     try:
         import ftfy
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "ftfy"], check=False)
-
     try:
         from diffusers import LTXPipeline
     except Exception:
@@ -25,9 +22,8 @@ def install_all_deps():
             sys.executable, "-m", "pip", "install", "-q",
             "diffusers>=0.32.0", "transformers>=4.46.0", "accelerate>=1.1.0",
             "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
-            "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy", "kaggle"
+            "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
         ], check=False)
-
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     except Exception:
@@ -39,13 +35,13 @@ import torch
 import ftfy
 from diffusers.utils import export_to_video
 
+# ==========================================
+# CẤU HÌNH TỐI ƯU CHO T4 + VIDEO ~5 GIÂY
+# ==========================================
 TOTAL_SCENES = 100
 VIDEO_DIR = "./output_videos"
 FINAL_VIDEO = "final_full_movie.mp4"
-LOCAL_LTX_DIR = "/kaggle/working/ltx-video-model"
-
 os.makedirs(VIDEO_DIR, exist_ok=True)
-os.makedirs(LOCAL_LTX_DIR, exist_ok=True)
 
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
@@ -56,22 +52,28 @@ GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
 DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
+
+# --- Cấu hình để ra ~5 giây trên T4 ---
 LTX_WIDTH = 512
 LTX_HEIGHT = 512
-LTX_NUM_FRAMES = 81  # Giảm số frame xuống 33 để tiết kiệm VRAM T4, tránh lỗi tràn bộ nhớ sinh video trắng
-LTX_STEPS = 25
-LTX_FPS = 24
+LTX_NUM_FRAMES = 81          # 81 frames
+LTX_FPS = 16                 # 81 / 16 ≈ 5.0 giây
+LTX_STEPS = 20               # Giảm steps để đỡ nặng VRAM
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
 NEGATIVE_PROMPT_LOCK = (
-    "black screen, blank video, static image, no motion, worst quality, low quality, blurry, "
-    "distorted face, deformed eyes, morphed limbs, extra limbs, bad anatomy, 2d, chibi"
+    "black screen, blank video, static image, no motion, worst quality, low quality, "
+    "blurry, distorted face, deformed eyes, morphed limbs, extra limbs, bad anatomy, "
+    "2d, chibi, ugly, deformed"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
 
+# ==========================================
+# GOOGLE DRIVE
+# ==========================================
 def get_google_access_token():
     if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
         return None
@@ -94,8 +96,7 @@ def upload_file_to_drive(file_path: str):
     token = get_google_access_token()
     if not token or not DRIVE_FOLDER_ID:
         return None
-    if not os.path.exists(file_path) or os.path.getsize(file_path) < 50000: # Chặn không upload file dưới 50KB (file lỗi)
-        print(f"⚠️ Bỏ qua upload vì file quá nhỏ hoặc lỗi: {file_path}")
+    if not os.path.exists(file_path) or os.path.getsize(file_path) < 50000:
         return None
     file_name = os.path.basename(file_path)
     metadata = {"name": file_name, "parents": [DRIVE_FOLDER_ID]}
@@ -111,20 +112,15 @@ def upload_file_to_drive(file_path: str):
                 headers=headers, files=files, timeout=600,
             )
         if res.status_code in (200, 201):
-            print(f"✅ Đã backup thành công lên Drive: {file_name}")
+            print(f"✅ Backup Drive: {file_name}")
             return res.json()
     except Exception as e:
-        print(f"❌ Lỗi backup Drive: {e}")
+        print(f"❌ Drive: {e}")
     return None
 
-def download_ltx_dataset():
-    if os.path.exists(LOCAL_LTX_DIR) and len(os.listdir(LOCAL_LTX_DIR)) > 3:
-        return LOCAL_LTX_DIR
-    return DEFAULT_MODEL_ID
-
-def find_local_model_path():
-    return download_ltx_dataset()
-
+# ==========================================
+# SHEET
+# ==========================================
 def safe_get(row, *keys, default=""):
     for key in keys:
         val = row.get(key)
@@ -150,28 +146,33 @@ def load_character_profiles():
         char_id = safe_get(row, "character_id").lower()
         char_name = safe_get(row, "character_name")
         appearance = safe_get(row, "appearance", "design_detail", "costume")
-        if char_id: char_prompts[char_id] = appearance
-        if char_name: char_prompts[char_name.lower()] = appearance
+        if char_id:
+            char_prompts[char_id] = appearance
+        if char_name:
+            char_prompts[char_name.lower()] = appearance
     return char_prompts
 
 def build_pure_text_prompt(row, char_prompts) -> str:
     scene_desc = safe_get(row, "video_prompt", "scene_description", "action")
     char_key = safe_get(row, "character_id", "character", "nhan_vat").lower()
-    char_details = char_prompts.get(char_key, "3d chinese donghua style character")
-    
+    char_details = char_prompts.get(char_key, "handsome young chinese man, sharp face, detailed eyes, donghua style")
+
     full_prompt = (
-        f"Masterpiece, 3d chinese donghua style, unreal engine 5, cinematic neon noir lighting, highly detailed. "
-        f"Character features: {char_details[:200]}. "
-        f"Action sequence: {scene_desc[:250]}, smooth motion, dynamic camera angles."
+        f"Masterpiece, best quality, highly detailed, 3d chinese donghua style, unreal engine 5, "
+        f"cinematic lighting, bright neon lights, volumetric light, sharp focus. "
+        f"Character: {char_details[:180]}. "
+        f"Scene: {scene_desc[:220]}, smooth natural motion, clear face, consistent character"
     )
-    return full_prompt
+    return full_prompt[:400]
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
 
 def make_tts(text: str, out_mp3: str) -> bool:
-    if not text or len(text.strip()) < 2: return False
-    if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400: return True
+    if not text or len(text.strip()) < 2:
+        text = "Cảnh tiếp theo."
+    if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400:
+        return True
     safe = text.replace('"', "'").replace("\n", " ")
     for voice in ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]:
         try:
@@ -179,7 +180,8 @@ def make_tts(text: str, out_mp3: str) -> bool:
             subprocess.run(cmd, shell=True, timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 400:
                 return True
-        except: continue
+        except:
+            continue
     return False
 
 def mix_video_audio(video_in, audio_mp3, video_out):
@@ -192,13 +194,19 @@ def mix_video_audio(video_in, audio_mp3, video_out):
     return video_out if os.path.exists(video_out) and os.path.getsize(video_out) > 5000 else video_in
 
 def post_process_video(raw_path, out_path):
-    if not os.path.exists(raw_path): return raw_path
-    cmd = f'ffmpeg -y -hide_banner -loglevel error -i "{raw_path}" -vf "scale={FINAL_WIDTH}:{FINAL_HEIGHT}:flags=lanczos,fps={FINAL_FPS}" -c:v libx264 -preset fast -crf 17 -pix_fmt yuv420p -movflags +faststart "{out_path}"'
+    if not os.path.exists(raw_path):
+        return raw_path
+    cmd = (
+        f'ffmpeg -y -hide_banner -loglevel error -i "{raw_path}" '
+        f'-vf "scale={FINAL_WIDTH}:{FINAL_HEIGHT}:flags=lanczos,fps={FINAL_FPS}" '
+        f'-c:v libx264 -preset fast -crf 17 -pix_fmt yuv420p -movflags +faststart "{out_path}"'
+    )
     try:
         subprocess.run(cmd, shell=True, timeout=120)
         if os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
             return out_path
-    except: pass
+    except:
+        pass
     return raw_path
 
 def load_ltx_text_pipe():
@@ -206,24 +214,32 @@ def load_ltx_text_pipe():
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    model_source = find_local_model_path()
-    pipe = LTXPipeline.from_pretrained(model_source, torch_dtype=torch.float16)
+    print(f"🧠 Load LTX Text-to-Video: {DEFAULT_MODEL_ID}")
+    pipe = LTXPipeline.from_pretrained(DEFAULT_MODEL_ID, torch_dtype=torch.float16)
 
     if torch.cuda.is_available():
         pipe.enable_sequential_cpu_offload()
+        print("✅ sequential_cpu_offload")
         try:
             pipe.vae.enable_slicing()
-        except: pass
+            print("✅ VAE slicing")
+        except:
+            pass
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    print("✅ LTX ready (tối ưu T4 - ~5s)")
     return pipe
 
+# ==========================================
+# MAIN RENDER
+# ==========================================
 def run_pipeline():
     char_prompts = load_character_profiles()
     df_scenes = get_sheet_csv(GID_SCENES)
     if df_scenes.empty:
+        print("❌ Sheet rỗng")
         return False
 
     pipe = load_ltx_text_pipe()
@@ -232,7 +248,8 @@ def run_pipeline():
 
     for idx, row in df_scenes.iterrows():
         scene_num = int(row["scene_index"]) if pd.notna(row.get("scene_index")) else idx + 1
-        if scene_num > TOTAL_SCENES: break
+        if scene_num > TOTAL_SCENES:
+            break
 
         raw_video = f"{VIDEO_DIR}/ltx_raw_{scene_num:03d}.mp4"
         upscaled = f"{VIDEO_DIR}/ltx_up_{scene_num:03d}.mp4"
@@ -240,18 +257,21 @@ def run_pipeline():
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
 
         if os.path.exists(final_scene) and os.path.getsize(final_scene) > 50000:
+            print(f"⏩ [{scene_num}] Đã có")
             rendered.append(final_scene)
             continue
 
         text_prompt = build_pure_text_prompt(row, char_prompts)
         dialogue = get_dialogue(row)
-        
-        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] Render Text-to-Video...")
+
+        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] ~5s Text-to-Video...")
+        print(f"   Prompt: {text_prompt[:70]}...")
 
         try:
             t1 = time.time()
             gc.collect()
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
@@ -259,7 +279,8 @@ def run_pipeline():
                 res = pipe(
                     prompt=text_prompt,
                     negative_prompt=NEGATIVE_PROMPT_LOCK,
-                    height=LTX_HEIGHT, width=LTX_WIDTH,
+                    height=LTX_HEIGHT,
+                    width=LTX_WIDTH,
                     num_frames=LTX_NUM_FRAMES,
                     num_inference_steps=LTX_STEPS,
                     generator=generator,
@@ -271,7 +292,7 @@ def run_pipeline():
             out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
 
             sz = os.path.getsize(out_file) if os.path.exists(out_file) else 0
-            print(f"✅ [{scene_num}] Hoàn tất | Kích thước: {sz/1024:.0f}KB")
+            print(f"✅ [{scene_num}] {time.time()-t1:.0f}s | {sz/1024:.0f} KB")
 
             if sz > 50000:
                 upload_file_to_drive(out_file)
@@ -279,32 +300,48 @@ def run_pipeline():
 
             for tmp in [raw_video, upscaled]:
                 if os.path.exists(tmp) and tmp != out_file:
-                    try: os.remove(tmp)
-                    except: pass
+                    try:
+                        os.remove(tmp)
+                    except:
+                        pass
 
             del res
             gc.collect()
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"❌ Lỗi cảnh [{scene_num}]: {e}")
+            print(f"❌ [{scene_num}] {e}")
             gc.collect()
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
 
     valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 50000]
     if not valid:
+        print("❌ Không đủ video")
         return False
 
     with open("concat_list.txt", "w") as f:
         for v in valid:
             f.write(f"file '{os.path.abspath(v)}'\n")
 
-    subprocess.run(f'ffmpeg -y -hide_banner -loglevel error -f concat -safe 0 -i concat_list.txt -c copy -movflags +faststart "{FINAL_VIDEO}"', shell=True)
+    subprocess.run(
+        f'ffmpeg -y -hide_banner -loglevel error -f concat -safe 0 -i concat_list.txt '
+        f'-c copy -movflags +faststart "{FINAL_VIDEO}"',
+        shell=True,
+    )
 
     if os.path.exists(FINAL_VIDEO):
+        print(f"🎉 Phim hoàn chỉnh: {FINAL_VIDEO} ({os.path.getsize(FINAL_VIDEO)/1024/1024:.1f} MB)")
         upload_file_to_drive(FINAL_VIDEO)
         return True
     return False
 
 if __name__ == "__main__":
+    try:
+        print("CUDA:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
+    except:
+        pass
     run_pipeline()
