@@ -1,4 +1,3 @@
-# ========== FULL PIPELINE 1 GPU T4: Agnes → Wan 2.2 TI2V-5B (Speed + Quality) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -7,12 +6,13 @@ import gc
 import requests
 import subprocess
 import pandas as pd
+import glob
 
 # ==========================================
 # CÀI ĐẶT DEPENDENCY NGAY TỪ ĐẦU
 # ==========================================
 def install_all_deps():
-    print("📦 Đang kiểm tra và cài đặt dependency...")
+    print("📦 Đang kiểm tra và cài đặt dependency cho LTX-Video...")
 
     try:
         import ftfy
@@ -24,14 +24,14 @@ def install_all_deps():
         print("✅ ftfy đã cài xong")
 
     try:
-        from diffusers import WanImageToVideoPipeline
-        print("✅ diffusers + Wan đã có")
+        from diffusers import LTXPipeline
+        print("✅ diffusers + LTXPipeline đã có")
     except Exception:
-        print("📦 Đang cài diffusers...")
+        print("📦 Đang cài diffusers và các gói hỗ trợ LTX...")
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
-            "diffusers>=0.33.0", "transformers>=4.46.0", "accelerate>=1.1.0",
+            "diffusers>=0.32.0", "transformers>=4.46.0", "accelerate>=1.1.0",
             "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
             "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
         ], check=False)
@@ -51,7 +51,7 @@ import torch
 import ftfy
 
 # ==========================================
-# CẤU HÌNH TỐI ƯU TỐC ĐỘ + CHẤT LƯỢNG
+# CẤU HÌNH LTX-VIDEO TỐI ƯU
 # ==========================================
 TOTAL_SCENES = 100
 OUTPUT_DIR = "./output_scenes"
@@ -69,13 +69,13 @@ AGNES_API_KEY = os.environ.get("AGNES_API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- Wan 2.2 TI2V-5B (Cân bằng tốc độ + chất lượng) ---
-WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-WAN_WIDTH = 640
-WAN_HEIGHT = 368
-WAN_NUM_FRAMES = 65              # ≈ 5 giây
-WAN_STEPS = 22                   # Cân bằng tốt
-WAN_FPS = 16
+# --- LTX-Video Configuration ---
+DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
+LTX_WIDTH = 512
+LTX_HEIGHT = 512
+LTX_NUM_FRAMES = 49
+LTX_STEPS = 25
+LTX_FPS = 24
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
@@ -86,6 +86,37 @@ AGNES_MODEL = "agnes-image-2.1-flash"
 AGNES_SIZE = "1024x768"
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
+
+# ==========================================
+# HÀM TỰ ĐỘNG TÌM DATASET CỤC BỘ TRÊN KAGGLE
+# ==========================================
+def find_local_model_path():
+    print("🔍 Đang quét các dataset có sẵn trong hệ thống (/kaggle/input/)...")
+    
+    # Tìm kiếm tất cả các thư mục con trong kaggle input có chứa file trọng số hoặc cấu hình model
+    search_patterns = [
+        "/kaggle/input/**/ltx-video*",
+        "/kaggle/input/**/Lightricks*",
+        "/kaggle/input/**/*.safetensors"
+    ]
+    
+    matched_dirs = set()
+    for pattern in search_patterns:
+        for path in glob.glob(pattern, recursive=True):
+            if os.path.isfile(path):
+                matched_dirs.add(os.path.dirname(path))
+            elif os.path.isdir(path):
+                matched_dirs.add(path)
+                
+    if matched_dirs:
+        # Lấy thư mục hợp lệ đầu tiên tìm thấy
+        local_path = list(matched_dirs)[0]
+        # Nếu path trỏ tới thư mục như 'model' hoặc 'weights', kiểm tra sâu hơn chút nếu cần
+        print(f"✅ Đã tìm thấy dataset cục bộ tại: {local_path}")
+        return local_path
+    
+    print("⚠️ Không tìm thấy dataset cục bộ, sẽ sử dụng nguồn online từ Hugging Face.")
+    return DEFAULT_MODEL_ID
 
 # ==========================================
 # GOOGLE OAUTH + DRIVE
@@ -153,7 +184,6 @@ def upload_file_to_drive(file_path: str):
         if res.status_code in (200, 201):
             print(f"✅ Uploaded: {file_name}")
             return res.json()
-        print(f"❌ Upload lỗi {res.status_code}: {res.text[:200]}")
     except Exception as e:
         print(f"❌ Upload: {e}")
     return None
@@ -218,7 +248,6 @@ def call_agnes(prompt: str, retries: int = 3):
                 data = r.json().get("data", [])
                 if data and data[0].get("url"):
                     return data[0]["url"]
-            print(f"⚠️ Agnes {r.status_code}: {r.text[:150]}")
         except Exception as e:
             print(f"❌ Agnes attempt {attempt+1}: {e}")
         time.sleep(2 + attempt)
@@ -285,7 +314,7 @@ def step_1_ensure_images():
     return ok >= max(1, int(min(TOTAL_SCENES, len(df)) * 0.7))
 
 # ==========================================
-# CÁC HÀM HỖ TRỢ
+# CÁC HÀM HỖ TRỢ AUDIO & VIDEO
 # ==========================================
 def get_video_prompt(row) -> str:
     vp = safe_get(row, "video_prompt")
@@ -293,14 +322,8 @@ def get_video_prompt(row) -> str:
         return vp[:220]
     ip = safe_get(row, "image_prompt", "scene_description")
     if ip:
-        return (
-            f"Smooth natural cinematic motion, consistent character face and body proportions, "
-            f"no distortion, no deformation, fluid movement. {ip[:140]}"
-        )
-    return (
-        "Smooth natural cinematic camera movement, consistent character appearance, "
-        "natural body motion, no face distortion, high quality"
-    )
+        return f"Cinematic motion, high quality. {ip[:160]}"
+    return "Cinematic motion, high quality"
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
@@ -342,7 +365,7 @@ def post_process_video(raw_path: str, out_path: str) -> str:
     cmd = (
         f'ffmpeg -y -hide_banner -loglevel error -i "{raw_path}" '
         f'-vf "scale={FINAL_WIDTH}:{FINAL_HEIGHT}:flags=lanczos,'
-        f'unsharp=5:5:0.7:5:5:0.3,fps={FINAL_FPS}" '
+        f'fps={FINAL_FPS}" '
         f'-c:v libx264 -preset fast -crf 17 -pix_fmt yuv420p '
         f'-movflags +faststart "{out_path}"'
     )
@@ -354,64 +377,51 @@ def post_process_video(raw_path: str, out_path: str) -> str:
         print(f"⚠️ Post-process: {e}")
     return raw_path
 
-def load_wan_pipe():
-    from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
+def load_ltx_pipe():
+    from diffusers import LTXPipeline
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
-    print("🧠 Đang load Wan 2.2 TI2V-5B (Speed + Quality mode)...")
+    # Tự động tìm nguồn model cục bộ hoặc online
+    model_source = find_local_model_path()
+    print(f"🧠 Đang load LTX-Video từ: {model_source}...")
     dtype = torch.float16
 
-    vae = AutoencoderKLWan.from_pretrained(
-        WAN_MODEL, subfolder="vae", torch_dtype=torch.float32
-    )
-
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        WAN_MODEL,
-        vae=vae,
+    pipe = LTXPipeline.from_pretrained(
+        model_source,
         torch_dtype=dtype,
     )
 
     if torch.cuda.is_available():
-        pipe.enable_model_cpu_offload()   # Nhanh hơn sequential
-        print("✅ model_cpu_offload")
+        pipe.enable_sequential_cpu_offload()
+        print("✅ LTX sequential_cpu_offload đã bật (Tiết kiệm VRAM)")
 
-        try:
+        if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
             pipe.vae.enable_slicing()
-            print("✅ VAE slicing")
-        except Exception:
-            pass
+            print("✅ VAE slicing đã bật")
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
 
-    print("✅ Wan 2.2 TI2V-5B ready")
+    print("✅ LTX-Video ready")
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: RENDER
+# GIAI ĐOẠN 2: RENDER VỚI LTX
 # ==========================================
-def step_2_wan_render():
-    from diffusers.utils import export_to_video, load_image
+def step_2_ltx_render():
+    from diffusers.utils import export_to_video
     from PIL import Image
 
     print("\n" + "=" * 55)
-    print(f"🎬 GIAI ĐOẠN 2: Wan 2.2 TI2V-5B | {WAN_WIDTH}x{WAN_HEIGHT} | frames={WAN_NUM_FRAMES} | steps={WAN_STEPS}")
+    print(f"🎬 GIAI ĐOẠN 2: LTX-Video | {LTX_WIDTH}x{LTX_HEIGHT} | frames={LTX_NUM_FRAMES} | steps={LTX_STEPS}")
     print("=" * 55)
 
-    pipe = load_wan_pipe()
+    pipe = load_ltx_pipe()
 
     df = get_sheet_csv(GID_SCENES)
     drive_map = get_drive_files_map()
-
-    for i in range(1, TOTAL_SCENES + 1):
-        local = f"{OUTPUT_DIR}/scene_{i:03d}.png"
-        name = f"scene_{i:03d}.png"
-        if not (os.path.exists(local) and os.path.getsize(local) > 2000):
-            if name in drive_map:
-                download_from_drive(drive_map[name], local)
 
     rendered = []
     t0 = time.time()
@@ -422,23 +432,16 @@ def step_2_wan_render():
             break
 
         img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
-        raw_video = f"{VIDEO_DIR}/wan_raw_{scene_num:03d}.mp4"
-        upscaled = f"{VIDEO_DIR}/wan_up_{scene_num:03d}.mp4"
+        raw_video = f"{VIDEO_DIR}/ltx_raw_{scene_num:03d}.mp4"
+        upscaled = f"{VIDEO_DIR}/ltx_up_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
         scene_name = f"scene_{scene_num:03d}.mp4"
 
-        if os.path.exists(final_scene) and os.path.getsize(final_scene) > 400_000:
+        if os.path.exists(final_scene) and os.path.getsize(final_scene) > 200_000:
             print(f"⏩ [{scene_num}] Đã có local")
             rendered.append(final_scene)
             continue
-
-        if scene_name in drive_map:
-            if download_from_drive(drive_map[scene_name], final_scene):
-                if os.path.getsize(final_scene) > 400_000:
-                    print(f"⏩ [{scene_num}] Tải từ Drive")
-                    rendered.append(final_scene)
-                    continue
 
         if not (os.path.exists(img_path) and os.path.getsize(img_path) > 2000):
             print(f"⚠️ [{scene_num}] Thiếu ảnh → bỏ qua")
@@ -451,13 +454,8 @@ def step_2_wan_render():
         try:
             t1 = time.time()
 
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-
-            image = load_image(img_path).convert("RGB")
-            image = image.resize((WAN_WIDTH, WAN_HEIGHT), Image.Resampling.LANCZOS)
+            image = Image.open(img_path).convert("RGB")
+            image = image.resize((LTX_WIDTH, LTX_HEIGHT), Image.Resampling.LANCZOS)
 
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
@@ -465,20 +463,15 @@ def step_2_wan_render():
                 res = pipe(
                     image=image,
                     prompt=prompt,
-                    negative_prompt=(
-                        "blurry, low quality, distorted face, deformed body, ugly, bad anatomy, "
-                        "mutated hands, extra limbs, frozen motion, stiff movement, jitter, "
-                        "morphing, face changing, identity loss, warping"
-                    ),
-                    height=WAN_HEIGHT,
-                    width=WAN_WIDTH,
-                    num_frames=WAN_NUM_FRAMES,
-                    num_inference_steps=WAN_STEPS,
-                    guidance_scale=5.0,
+                    negative_prompt="worst quality, inconsistent motion, blurry, jittery",
+                    height=LTX_HEIGHT,
+                    width=LTX_WIDTH,
+                    num_frames=LTX_NUM_FRAMES,
+                    num_inference_steps=LTX_STEPS,
                     generator=generator,
                 )
 
-            export_to_video(res.frames[0], raw_video, fps=WAN_FPS)
+            export_to_video(res.frames[0], raw_video, fps=LTX_FPS)
             post_process_video(raw_video, upscaled)
             make_tts(dialogue, voice_mp3)
             out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
@@ -486,34 +479,23 @@ def step_2_wan_render():
             sz = os.path.getsize(out_file) if os.path.exists(out_file) else 0
             print(f"✅ [{scene_num}] {time.time()-t1:.0f}s | {sz/1024:.0f} KB")
 
-            if sz > 200_000:
+            if sz > 100_000:
                 upload_file_to_drive(out_file)
                 rendered.append(out_file)
-
-            for tmp in [raw_video, upscaled]:
-                if os.path.exists(tmp) and tmp != out_file:
-                    try:
-                        os.remove(tmp)
-                    except Exception:
-                        pass
 
             del res
             del image
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
 
         except Exception as e:
             print(f"❌ [{scene_num}] Lỗi: {e}")
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
 
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
 
-    valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 200_000]
+    valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 100_000]
     if not valid:
         print("❌ Không đủ video để ghép")
         return False
@@ -553,7 +535,7 @@ if __name__ == "__main__":
         print("Torch:", e)
 
     if step_1_ensure_images():
-        step_2_wan_render()
+        step_2_ltx_render()
         print("\n🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
     else:
         print("\n❌ Dừng: chưa đủ ảnh ở Giai đoạn 1")
