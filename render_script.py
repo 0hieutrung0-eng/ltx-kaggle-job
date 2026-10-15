@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Character Reference + Text-to-Video AI (LTX) → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Pure Text-to-Video AI (LTXPipeline) → TTS → Drive Backup → Merge ==========
 import os
 import sys
 import json
@@ -24,8 +24,8 @@ def install_all_deps():
         import ftfy
 
     try:
-        from diffusers import LTXImageToVideoPipeline
-        print("✅ diffusers + LTXImageToVideoPipeline đã có")
+        from diffusers import LTXPipeline
+        print("✅ diffusers + LTXPipeline đã có")
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
@@ -46,19 +46,16 @@ install_all_deps()
 
 import torch
 import ftfy
-from diffusers.utils import export_to_video, load_image
-from PIL import Image
+from diffusers.utils import export_to_video
 
 # ==========================================
 # CẤU HÌNH PIPELINE
 # ==========================================
 TOTAL_SCENES = 100
-CHAR_DIR = "./character_images"
 VIDEO_DIR = "./output_videos"
 FINAL_VIDEO = "final_full_movie.mp4"
 LOCAL_LTX_DIR = "/kaggle/working/ltx-video-model"
 
-os.makedirs(CHAR_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(LOCAL_LTX_DIR, exist_ok=True)
 
@@ -80,11 +77,11 @@ FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
-# Bộ Negative Prompt chống biến dạng mặt, sai lệch nhân vật
+# Bộ Negative Prompt chuẩn chống méo mó, bảo toàn tỷ lệ và không gian
 NEGATIVE_PROMPT_LOCK = (
-    "worst quality, low quality, static image, no motion, blurry, jittery, distorted face, "
+    "worst quality, low quality, blurry, jittery, distorted face, "
     "deformed eyes, morphed limbs, extra limbs, bad anatomy, warped features, "
-    "changing face shape, duplicate heads, unstable character design, inconsistent clothing"
+    "changing face shape, duplicate heads, unstable character design, 2d, flat color, chibi"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -207,39 +204,23 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
         print(f"❌ Sheet (GID {gid}): {e}")
         return pd.DataFrame()
 
-def download_url(url: str, path: str) -> bool:
-    try:
-        r = requests.get(url, timeout=90)
-        if r.status_code == 200 and len(r.content) > 2000:
-            with open(path, "wb") as f:
-                f.write(r.content)
-            return True
-    except Exception as e:
-        print(f"❌ Tải ảnh từ URL thất bại: {e}")
-    return False
-
 # ==========================================
-# GIAI ĐOẠN 1: TẢI BẢNG MÀU / ẢNH NHÂN VẬT THAM CHIẾU
+# ĐỌC THÔNG TIN NHÂN VẬT TỪ TAB CHARACTERS
 # ==========================================
 def load_character_profiles():
     print("\n" + "="*55)
-    print("🔍 GIAI ĐOẠN 1: Tải thông tin chi tiết và ảnh tham chiếu nhân vật")
+    print("🔍 Đọc thông tin mô tả nhân vật từ Tab Characters")
     print("="*55)
     
     df_char = get_sheet_csv(GID_CHARACTERS)
     if df_char.empty:
         print("❌ Không đọc được bảng Characters từ Google Sheet!")
-        return {}, {}
+        return {}
 
-    char_images = {}
     char_prompts = {}
-    
     for idx, row in df_char.iterrows():
         char_id = safe_get(row, "character_id").lower()
         char_name = safe_get(row, "character_name")
-        img_url = safe_get(row, "image_url", "url", "link_anh")
-        
-        # Lấy mô tả ngoại hình nhân vật (appearance / design_detail) để bổ sung vào prompt động
         appearance = safe_get(row, "appearance", "design_detail", "costume")
 
         if char_id:
@@ -247,44 +228,26 @@ def load_character_profiles():
         if char_name:
             char_prompts[char_name.lower()] = appearance
 
-        if not img_url or not img_url.startswith("http"):
-            continue
-
-        filename = f"{char_id}_{char_name}.png".replace(" ", "_").lower() if char_id else f"char_{idx}.png"
-        local_path = os.path.join(CHAR_DIR, filename)
-
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 2000:
-            print(f"✅ Đã có sẵn: {filename}")
-        else:
-            print(f"📥 Đang tải ảnh định danh nhân vật [{char_id} - {char_name}]...")
-            if download_url(img_url, local_path):
-                print(f"✅ Tải thành công: {filename}")
-
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 2000:
-            if char_id: char_images[char_id] = local_path
-            if char_name: char_images[char_name.lower()] = local_path
-
-    print(f"🎯 Đã thiết lập thông tin cho {len(char_images)} nhân vật.")
-    return char_images, char_prompts
+    print(f"🎯 Đã nạp đặc điểm ngoại hình cho {len(char_prompts)} thực thể/nhân vật.")
+    return char_prompts
 
 # ==========================================
-# XỬ LÝ PROMPT & TTS
+# XỬ LÝ PROMPT TỪNG CẢNH VÀ TTS
 # ==========================================
-def build_dynamic_scene_prompt(row, char_prompts) -> str:
-    # Lấy mô tả hành động cảnh từ kịch bản scenes
+def build_pure_text_prompt(row, char_prompts) -> str:
     scene_desc = safe_get(row, "video_prompt", "scene_description", "action")
     char_key = safe_get(row, "character_id", "character", "nhan_vat").lower()
     
-    # Lấy thêm chi tiết ngoại hình nhân vật từ kho profile nếu có để gộp vào prompt
-    char_details = char_prompts.get(char_key, "3d chinese donghua style, highly detailed character")
+    # Lấy mô tả ngoại hình nhân vật từ Sheet để gộp vào prompt giữ nguyên nhận diện
+    char_details = char_prompts.get(char_key, "3d chinese donghua style character")
     
-    # Kết hợp tạo ra prompt động cho Text-to-Video AI thay vì chỉ dùng ảnh đứng yên
-    combined_prompt = (
-        f"3d chinese donghua style, unreal engine 5, cinematic dynamic action lighting. "
-        f"Character details: {char_details[:250]}. "
-        f"Scene action & motion: {scene_desc[:250]}, smooth fluent cinematic camera movement."
+    # Prompt hoàn toàn bằng văn bản (Text-to-Video)
+    full_prompt = (
+        f"3d chinese donghua style, unreal engine 5, cinematic neon noir lighting, highly detailed. "
+        f"Character: {char_details[:200]}. "
+        f"Action & Movement: {scene_desc[:250]}, smooth motion, dynamic camera angles."
     )
-    return combined_prompt
+    return full_prompt
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
@@ -321,15 +284,15 @@ def post_process_video(raw_path, out_path):
     except: pass
     return raw_path
 
-def load_ltx_pipe():
-    from diffusers import LTXImageToVideoPipeline
+def load_ltx_text_pipe():
+    from diffusers import LTXPipeline
     from diffusers.utils import logging
     logging.set_verbosity_error()
 
     model_source = find_local_model_path()
-    print(f"🧠 Load LTX Model từ: {model_source}")
+    print(f"🧠 Load LTX Text-to-Video Pipeline từ: {model_source}")
 
-    pipe = LTXImageToVideoPipeline.from_pretrained(model_source, torch_dtype=torch.float16)
+    pipe = LTXPipeline.from_pretrained(model_source, torch_dtype=torch.float16)
 
     if torch.cuda.is_available():
         pipe.enable_sequential_cpu_offload()
@@ -342,20 +305,17 @@ def load_ltx_pipe():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("✅ LTX Pipeline ready")
+    print("✅ LTX Text-to-Video Pipeline ready")
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: RENDER TỪNG CẢNH (TEXT-TO-VIDEO + ẢNH ĐỊNH DANH MỎ NEO)
+# GIAI ĐOẠN 2: RENDER TEXT-TO-VIDEO THUẦN TÚY
 # ==========================================
 def run_pipeline():
-    char_images, char_prompts = load_character_profiles()
-    if not char_images:
-        print("❌ Không tìm thấy ảnh tham chiếu nhân vật nào!")
-        return False
+    char_prompts = load_character_profiles()
 
     print("\n" + "="*55)
-    print(f"🎬 GIAI ĐOẠN 2: Render động Text-to-Video theo kịch bản | {LTX_WIDTH}x{LTX_HEIGHT}")
+    print(f"🎬 GIAI ĐOẠN 2: Chạy Text-to-Video AI theo kịch bản Scenes | {LTX_WIDTH}x{LTX_HEIGHT}")
     print("="*55)
 
     df_scenes = get_sheet_csv(GID_SCENES)
@@ -363,11 +323,9 @@ def run_pipeline():
         print("❌ Không đọc được bảng kịch bản Scenes!")
         return False
 
-    pipe = load_ltx_pipe()
+    pipe = load_ltx_text_pipe()
     rendered = []
     t0 = time.time()
-
-    default_char_img = list(char_images.values())[0]
 
     for idx, row in df_scenes.iterrows():
         scene_num = int(row["scene_index"]) if pd.notna(row.get("scene_index")) else idx + 1
@@ -383,31 +341,22 @@ def run_pipeline():
             rendered.append(final_scene)
             continue
 
-        # Lấy ảnh mỏ neo của đúng nhân vật đó để giữ cố định khuôn mặt, tóc, trang phục
-        char_key = safe_get(row, "character_id", "character", "nhan_vat").lower()
-        img_path = char_images.get(char_key, default_char_img)
-
-        # Xây dựng Prompt động tạo cảnh phim (Text-to-Video AI)
-        dynamic_prompt = build_dynamic_scene_prompt(row, char_prompts)
+        text_prompt = build_pure_text_prompt(row, char_prompts)
         dialogue = get_dialogue(row)
         
-        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] Nhân vật: {char_key or 'Default'} | Tạo cảnh hành động: {dynamic_prompt[:80]}...")
+        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] Text-to-Video Prompt: {text_prompt[:80]}...")
 
         try:
             t1 = time.time()
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-            # Đọc ảnh định danh nhân vật làm mỏ neo
-            image = load_image(img_path).convert("RGB").resize((LTX_WIDTH, LTX_HEIGHT), Image.Resampling.LANCZOS)
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
             with torch.inference_mode():
-                # Pipeline kết hợp: Sử dụng ảnh mỏ neo của nhân vật để khóa ngoại hình, 
-                # kết hợp với prompt động chi tiết để AI vẽ ra hoạt cảnh động hành động theo kịch bản
+                # Pipeline thuần túy Text-to-Video: Tạo chuyển động và cảnh phim hoàn toàn bằng văn bản
                 res = pipe(
-                    image=image,
-                    prompt=dynamic_prompt,
+                    prompt=text_prompt,
                     negative_prompt=NEGATIVE_PROMPT_LOCK,
                     height=LTX_HEIGHT, width=LTX_WIDTH,
                     num_frames=LTX_NUM_FRAMES,
@@ -432,7 +381,7 @@ def run_pipeline():
                     try: os.remove(tmp)
                     except: pass
 
-            del res, image
+            del res
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
@@ -470,6 +419,6 @@ if __name__ == "__main__":
 
     success = run_pipeline()
     if success:
-        print("\n🎉 HOÀN TẤT PIPELINE THÀNH CÔNG!")
+        print("\n🎉 HOÀN TẤT PIPELINE TEXT-TO-VIDEO THÀNH CÔNG!")
     else:
         print("\n❌ PIPELINE DỪNG DO LỖI.")
