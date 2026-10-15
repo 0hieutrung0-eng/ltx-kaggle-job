@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Sheet Image URLs → LTX Image-To-Video → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Sheet Image URLs → LTX Image-To-Video (No Drive) → TTS → Merge ==========
 import os
 import sys
 import json
@@ -60,10 +60,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(LOCAL_LTX_DIR, exist_ok=True)
 
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
-CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
-REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
@@ -136,86 +132,6 @@ def find_local_model_path():
     return download_ltx_dataset()
 
 # ==========================================
-# GOOGLE OAUTH + DRIVE
-# ==========================================
-def get_google_access_token():
-    if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
-        return None
-    try:
-        res = requests.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "refresh_token": REFRESH_TOKEN,
-                "grant_type": "refresh_token",
-            },
-            timeout=20,
-        ).json()
-        return res.get("access_token")
-    except Exception as e:
-        print(f"❌ OAuth: {e}")
-        return None
-
-def get_drive_files_map():
-    token = get_google_access_token()
-    if not token or not DRIVE_FOLDER_ID:
-        return {}
-    headers = {"Authorization": f"Bearer {token}"}
-    query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
-    url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(query)}&fields=files(id,name)&pageSize=1000"
-    try:
-        res = requests.get(url, headers=headers, timeout=30).json()
-        files = res.get("files", [])
-        print(f"📁 Drive: {len(files)} file")
-        return {f["name"]: f["id"] for f in files}
-    except Exception as e:
-        print(f"❌ Quét Drive: {e}")
-        return {}
-
-def upload_file_to_drive(file_path: str):
-    token = get_google_access_token()
-    if not token or not DRIVE_FOLDER_ID:
-        return None
-    if not os.path.exists(file_path) or os.path.getsize(file_path) < 1000:
-        return None
-    file_name = os.path.basename(file_path)
-    metadata = {"name": file_name, "parents": [DRIVE_FOLDER_ID]}
-    headers = {"Authorization": f"Bearer {token}"}
-    print(f"🚀 Upload {file_name}...")
-    try:
-        with open(file_path, "rb") as f:
-            files = {
-                "data": ("metadata", json.dumps(metadata), "application/json; charset=UTF-8"),
-                "file": (file_name, f, "application/octet-stream"),
-            }
-            res = requests.post(
-                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
-                headers=headers, files=files, timeout=600,
-            )
-        if res.status_code in (200, 201):
-            print(f"✅ Uploaded: {file_name}")
-            return res.json()
-    except Exception as e:
-        print(f"❌ Upload: {e}")
-    return None
-
-def download_from_drive(file_id: str, save_path: str) -> bool:
-    token = get_google_access_token()
-    if not token:
-        return False
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        r = requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=180)
-        if r.status_code == 200 and len(r.content) > 1000:
-            with open(save_path, "wb") as f:
-                f.write(r.content)
-            return True
-    except Exception as e:
-        print(f"❌ DL Drive: {e}")
-    return False
-
-# ==========================================
 # GOOGLE SHEET UTILS & TẢI ẢNH TỪ LINK SHEET
 # ==========================================
 def safe_get(row, *keys, default=""):
@@ -247,15 +163,15 @@ def download_url(url: str, path: str) -> bool:
     return False
 
 # ==========================================
-# GIAI ĐOẠN 1: TẢI ẢNH CÓ SẴN TỪ GOOGLE SHEET
+# GIAI ĐOẠN 1: TẢI ẢNH CHỈ TỪ LINK SHEET
 # ==========================================
 def step_1_ensure_images():
     print("\n" + "="*55)
-    print("🔍 GIAI ĐOẠN 1: Tải ảnh nhân vật/cảnh từ link có sẵn trên Sheet")
+    print("🔍 GIAI ĐOẠN 1: Tải ảnh trực tiếp từ link trên Google Sheet (No Drive)")
     print("="*55)
-    drive_map = get_drive_files_map()
     df = get_sheet_csv(GID_SCENES)
     if df.empty:
+        print("❌ Không lấy được dữ liệu từ Google Sheet")
         return False
 
     ok = 0
@@ -266,30 +182,23 @@ def step_1_ensure_images():
         name = f"scene_{scene_num:03d}.png"
         local = f"{OUTPUT_DIR}/{name}"
 
-        # 1. Kiểm tra nếu đã có ở local
+        # 1. Nếu đã có file sẵn ở local thì giữ nguyên
         if os.path.exists(local) and os.path.getsize(local) > 2000:
             ok += 1
             continue
 
-        # 2. Kiểm tra trên Google Drive
-        if name in drive_map:
-            if download_from_drive(drive_map[name], local):
-                ok += 1
-                continue
-
-        # 3. Tải từ link image_url trên Google Sheet
+        # 2. Đọc trực tiếp link từ cột image_url trong Sheet
         img_url = safe_get(row, "image_url", "url", "link_anh")
         if img_url and img_url.startswith("http"):
-            print(f"📥 [{scene_num}] Tải ảnh từ Sheet URL: {img_url[:60]}...")
+            print(f"📥 [{scene_num}] Tải ảnh nhân vật từ Sheet: {img_url[:60]}...")
             if download_url(img_url, local):
-                upload_file_to_drive(local)
                 ok += 1
                 print(f"✅ [{scene_num}] Tải ảnh thành công")
                 continue
 
         print(f"⚠️ [{scene_num}] Không tìm thấy link ảnh hợp lệ trong Sheet!")
 
-    print(f"\n✅ Giai đoạn 1 hoàn tất: {ok} ảnh đã sẵn sàng")
+    print(f"\n✅ Giai đoạn 1 hoàn tất: {ok} ảnh đã tải về sẵn sàng")
     return ok > 0
 
 # ==========================================
@@ -374,7 +283,6 @@ def step_2_ltx_render():
 
     pipe = load_ltx_pipe()
     df = get_sheet_csv(GID_SCENES)
-    drive_map = get_drive_files_map()
 
     rendered = []
     t0 = time.time()
@@ -388,17 +296,12 @@ def step_2_ltx_render():
         upscaled = f"{VIDEO_DIR}/ltx_up_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
-        scene_name = f"scene_{scene_num:03d}.mp4"
 
         if os.path.exists(final_scene) and os.path.getsize(final_scene) > 200000:
             print(f"⏩ [{scene_num}] Đã có sẵn local")
             rendered.append(final_scene)
             continue
-        if scene_name in drive_map and download_from_drive(drive_map[scene_name], final_scene):
-            if os.path.getsize(final_scene) > 200000:
-                print(f"⏩ [{scene_num}] Đã có trên Google Drive")
-                rendered.append(final_scene)
-                continue
+
         if not (os.path.exists(img_path) and os.path.getsize(img_path) > 2000):
             print(f"⚠️ [{scene_num}] Thiếu ảnh nhân vật gốc -> Bỏ qua")
             continue
@@ -438,7 +341,6 @@ def step_2_ltx_render():
             print(f"✅ [{scene_num}] Render xong trong {time.time()-t1:.0f}s | {sz/1024:.0f}KB")
 
             if sz > 100000:
-                upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
             for tmp in [raw_video, upscaled]:
@@ -470,7 +372,6 @@ def step_2_ltx_render():
 
     if os.path.exists(FINAL_VIDEO):
         print(f"🎉 Phim hoàn chỉnh: {FINAL_VIDEO} ({os.path.getsize(FINAL_VIDEO)/1024/1024:.1f} MB)")
-        upload_file_to_drive(FINAL_VIDEO)
         return True
     return False
 
@@ -478,7 +379,6 @@ def step_2_ltx_render():
 # MAIN
 # ==========================================
 if __name__ == "__main__":
-    print("DRIVE_FOLDER_ID =", DRIVE_FOLDER_ID or "(EMPTY)")
     try:
         print("CUDA:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
     except: pass
@@ -487,4 +387,4 @@ if __name__ == "__main__":
         step_2_ltx_render()
         print("\n🎉 HOÀN TẤT PIPELINE!")
     else:
-        print("\n❌ Dừng pipeline: Không lấy được ảnh nhân vật từ Sheet hoặc Drive")
+        print("\n❌ Dừng pipeline: Không lấy được ảnh nhân vật từ Sheet")
