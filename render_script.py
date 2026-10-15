@@ -46,6 +46,8 @@ install_all_deps()
 
 import torch
 import ftfy
+from diffusers.utils import export_to_video, load_image
+from PIL import Image
 
 # ==========================================
 # CẤU HÌNH PIPELINE
@@ -61,8 +63,8 @@ os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(LOCAL_LTX_DIR, exist_ok=True)
 
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
-GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846") # GID của tab Characters
-GID_SCENES = os.environ.get("GID_SCENES", "0")                # GID của tab Scenes (Kịch bản)
+GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846")
+GID_SCENES = os.environ.get("GID_SCENES", "0")
 
 DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
 LTX_WIDTH = 512
@@ -74,7 +76,6 @@ FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
-# Bộ Negative Prompt khóa cố định nhân vật, chống méo mó hình thể
 NEGATIVE_PROMPT_LOCK = (
     "worst quality, low quality, inconsistent motion, blurry, jittery, distorted face, "
     "deformed eyes, morphed limbs, extra limbs, bad anatomy, warped features, "
@@ -185,12 +186,11 @@ def load_character_images_map():
         if not img_url or not img_url.startswith("http"):
             continue
 
-        # Đặt tên file lưu local theo character_id hoặc tên
         filename = f"{char_id}_{char_name}.png".replace(" ", "_").lower() if char_id else f"char_{idx}.png"
         local_path = os.path.join(CHAR_DIR, filename)
 
         if os.path.exists(local_path) and os.path.getsize(local_path) > 2000:
-            print(files_msg := f"✅ Đã có sẵn: {filename}")
+            print(f"✅ Đã có sẵn: {filename}")
         else:
             print(f"📥 Đang tải ảnh nhân vật [{char_id} - {char_name}]...")
             if download_url(img_url, local_path):
@@ -294,7 +294,7 @@ def run_pipeline():
     rendered = []
     t0 = time.time()
 
-    default_char_img = list(char_map.values())[0] # Lấy nhân vật mặc định đầu tiên nếu cảnh không chỉ định rõ
+    default_char_img = list(char_map.values())[0]
 
     for idx, row in df_scenes.iterrows():
         scene_num = int(row["scene_index"]) if pd.notna(row.get("scene_index")) else idx + 1
@@ -310,7 +310,6 @@ def run_pipeline():
             rendered.append(final_scene)
             continue
 
-        # Tìm ảnh nhân vật cho cảnh này (khớp tên nhân vật hoặc character_id trong kịch bản)
         char_key = safe_get(row, "character_id", "character", "nhan_vat").lower()
         img_path = char_map.get(char_key, default_char_img)
 
@@ -322,9 +321,6 @@ def run_pipeline():
             t1 = time.time()
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-            from diffusers.utils import load_image
-            from PIL import Image
 
             image = load_image(img_path).convert("RGB").resize((LTX_WIDTH, LTX_HEIGHT), Image.Resampling.LANCZOS)
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
