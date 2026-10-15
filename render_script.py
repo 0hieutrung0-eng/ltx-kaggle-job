@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Sheet Image URLs → LTX Image-To-Video (No Drive) → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Multi-Tab Google Sheets (Characters + Scenes) → LTX Image-to-Video → TTS → Merge ==========
 import os
 import sys
 import json
@@ -51,17 +51,18 @@ import ftfy
 # CẤU HÌNH PIPELINE
 # ==========================================
 TOTAL_SCENES = 100
-OUTPUT_DIR = "./output_scenes"
+CHAR_DIR = "./character_images"
 VIDEO_DIR = "./output_videos"
 FINAL_VIDEO = "final_full_movie.mp4"
 LOCAL_LTX_DIR = "/kaggle/working/ltx-video-model"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CHAR_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(LOCAL_LTX_DIR, exist_ok=True)
 
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
-GID_SCENES = os.environ.get("GID_SCENES", "0")
+GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846") # GID của tab Characters
+GID_SCENES = os.environ.get("GID_SCENES", "0")                # GID của tab Scenes (Kịch bản)
 
 DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
 LTX_WIDTH = 512
@@ -132,7 +133,7 @@ def find_local_model_path():
     return download_ltx_dataset()
 
 # ==========================================
-# GOOGLE SHEET UTILS & TẢI ẢNH TỪ LINK SHEET
+# GOOGLE SHEET UTILS
 # ==========================================
 def safe_get(row, *keys, default=""):
     for key in keys:
@@ -148,7 +149,7 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
         df.columns = df.columns.str.strip().str.lower()
         return df.dropna(how="all")
     except Exception as e:
-        print(f"❌ Sheet: {e}")
+        print(f"❌ Sheet (GID {gid}): {e}")
         return pd.DataFrame()
 
 def download_url(url: str, path: str) -> bool:
@@ -163,43 +164,44 @@ def download_url(url: str, path: str) -> bool:
     return False
 
 # ==========================================
-# GIAI ĐOẠN 1: TẢI ẢNH CHỈ TỪ LINK SHEET
+# GIAI ĐOẠN 1: TẢI ẢNH NHÂN VẬT TỪ TAB CHARACTERS
 # ==========================================
-def step_1_ensure_images():
+def load_character_images_map():
     print("\n" + "="*55)
-    print("🔍 GIAI ĐOẠN 1: Tải ảnh trực tiếp từ link trên Google Sheet (No Drive)")
+    print("🔍 GIAI ĐOẠN 1: Tải bộ sưu tập ảnh nhân vật từ Tab Characters")
     print("="*55)
-    df = get_sheet_csv(GID_SCENES)
-    if df.empty:
-        print("❌ Không lấy được dữ liệu từ Google Sheet")
-        return False
+    
+    df_char = get_sheet_csv(GID_CHARACTERS)
+    if df_char.empty:
+        print("❌ Không đọc được bảng Characters từ Google Sheet!")
+        return {}
 
-    ok = 0
-    for idx, row in df.iterrows():
-        scene_num = int(row["scene_index"]) if pd.notna(row.get("scene_index")) else idx + 1
-        if scene_num > TOTAL_SCENES:
-            break
-        name = f"scene_{scene_num:03d}.png"
-        local = f"{OUTPUT_DIR}/{name}"
-
-        # 1. Nếu đã có file sẵn ở local thì giữ nguyên
-        if os.path.exists(local) and os.path.getsize(local) > 2000:
-            ok += 1
+    char_map = {}
+    for idx, row in df_char.iterrows():
+        char_id = safe_get(row, "character_id")
+        char_name = safe_get(row, "character_name")
+        img_url = safe_get(row, "image_url", "url", "link_anh")
+        
+        if not img_url or not img_url.startswith("http"):
             continue
 
-        # 2. Đọc trực tiếp link từ cột image_url trong Sheet
-        img_url = safe_get(row, "image_url", "url", "link_anh")
-        if img_url and img_url.startswith("http"):
-            print(f"📥 [{scene_num}] Tải ảnh nhân vật từ Sheet: {img_url[:60]}...")
-            if download_url(img_url, local):
-                ok += 1
-                print(f"✅ [{scene_num}] Tải ảnh thành công")
-                continue
+        # Đặt tên file lưu local theo character_id hoặc tên
+        filename = f"{char_id}_{char_name}.png".replace(" ", "_").lower() if char_id else f"char_{idx}.png"
+        local_path = os.path.join(CHAR_DIR, filename)
 
-        print(f"⚠️ [{scene_num}] Không tìm thấy link ảnh hợp lệ trong Sheet!")
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 2000:
+            print(files_msg := f"✅ Đã có sẵn: {filename}")
+        else:
+            print(f"📥 Đang tải ảnh nhân vật [{char_id} - {char_name}]...")
+            if download_url(img_url, local_path):
+                print(f"✅ Tải thành công: {filename}")
 
-    print(f"\n✅ Giai đoạn 1 hoàn tất: {ok} ảnh đã tải về sẵn sàng")
-    return ok > 0
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 2000:
+            if char_id: char_map[char_id.lower()] = local_path
+            if char_name: char_map[char_name.lower()] = local_path
+
+    print(f"🎯 Đã thiết lập kho ảnh tham chiếu cho {len(char_map)} thực thể/nhân vật.")
+    return char_map
 
 # ==========================================
 # HÀM HỖ TRỢ KỸ THUẬT RENDER
@@ -271,27 +273,33 @@ def load_ltx_pipe():
     return pipe
 
 # ==========================================
-# GIAI ĐOẠN 2: LTX IMAGE-TO-VIDEO + TTS
+# GIAI ĐOẠN 2: RENDER TỪNG CẢNH (SCENES)
 # ==========================================
-def step_2_ltx_render():
-    from diffusers.utils import export_to_video, load_image
-    from PIL import Image
+def run_pipeline():
+    char_map = load_character_images_map()
+    if not char_map:
+        print("❌ Không tìm thấy ảnh nhân vật tham chiếu nào từ Sheet!")
+        return False
 
     print("\n" + "="*55)
-    print(f"🎬 GIAI ĐOẠN 2: LTX Image-to-Video | {LTX_WIDTH}x{LTX_HEIGHT} | Khóa cố định nhân vật")
+    print(f"🎬 GIAI ĐOẠN 2: Đọc Kịch Bản Scenes & Chạy Image-to-Video | {LTX_WIDTH}x{LTX_HEIGHT}")
     print("="*55)
 
-    pipe = load_ltx_pipe()
-    df = get_sheet_csv(GID_SCENES)
+    df_scenes = get_sheet_csv(GID_SCENES)
+    if df_scenes.empty:
+        print("❌ Không đọc được bảng kịch bản (Scenes) từ Google Sheet!")
+        return False
 
+    pipe = load_ltx_pipe()
     rendered = []
     t0 = time.time()
 
-    for idx, row in df.iterrows():
+    default_char_img = list(char_map.values())[0] # Lấy nhân vật mặc định đầu tiên nếu cảnh không chỉ định rõ
+
+    for idx, row in df_scenes.iterrows():
         scene_num = int(row["scene_index"]) if pd.notna(row.get("scene_index")) else idx + 1
         if scene_num > TOTAL_SCENES: break
 
-        img_path = f"{OUTPUT_DIR}/scene_{scene_num:03d}.png"
         raw_video = f"{VIDEO_DIR}/ltx_raw_{scene_num:03d}.mp4"
         upscaled = f"{VIDEO_DIR}/ltx_up_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
@@ -302,30 +310,30 @@ def step_2_ltx_render():
             rendered.append(final_scene)
             continue
 
-        if not (os.path.exists(img_path) and os.path.getsize(img_path) > 2000):
-            print(f"⚠️ [{scene_num}] Thiếu ảnh nhân vật gốc -> Bỏ qua")
-            continue
+        # Tìm ảnh nhân vật cho cảnh này (khớp tên nhân vật hoặc character_id trong kịch bản)
+        char_key = safe_get(row, "character_id", "character", "nhan_vat").lower()
+        img_path = char_map.get(char_key, default_char_img)
 
         prompt = get_video_prompt(row)
         dialogue = get_dialogue(row)
-        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] {prompt[:70]}...")
+        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] Nhân vật: {char_key or 'Default'} | Prompt: {prompt[:60]}...")
 
         try:
             t1 = time.time()
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-            # Load ảnh gốc làm Mỏ neo (Anchor) cố định gương mặt và trang phục
+            from diffusers.utils import load_image
+            from PIL import Image
+
             image = load_image(img_path).convert("RGB").resize((LTX_WIDTH, LTX_HEIGHT), Image.Resampling.LANCZOS)
-            
-            # Cố định Seed dựa theo Scene ID để đảm bảo tính ổn định qua các khung hình
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
             with torch.inference_mode():
                 res = pipe(
                     image=image,
                     prompt=prompt,
-                    negative_prompt=NEGATIVE_PROMPT_LOCK, # Áp dụng khóa Negative Prompt
+                    negative_prompt=NEGATIVE_PROMPT_LOCK,
                     height=LTX_HEIGHT, width=LTX_WIDTH,
                     num_frames=LTX_NUM_FRAMES,
                     num_inference_steps=LTX_STEPS,
@@ -338,7 +346,7 @@ def step_2_ltx_render():
             out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
 
             sz = os.path.getsize(out_file) if os.path.exists(out_file) else 0
-            print(f"✅ [{scene_num}] Render xong trong {time.time()-t1:.0f}s | {sz/1024:.0f}KB")
+            print(f"✅ [{scene_num}] Hoàn tất trong {time.time()-t1:.0f}s | {sz/1024:.0f}KB")
 
             if sz > 100000:
                 rendered.append(out_file)
@@ -383,8 +391,8 @@ if __name__ == "__main__":
         print("CUDA:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
     except: pass
 
-    if step_1_ensure_images():
-        step_2_ltx_render()
-        print("\n🎉 HOÀN TẤT PIPELINE!")
+    success = run_pipeline()
+    if success:
+        print("\n🎉 HOÀN TẤT PIPELINE THÀNH CÔNG!")
     else:
-        print("\n❌ Dừng pipeline: Không lấy được ảnh nhân vật từ Sheet")
+        print("\n❌ PIPELINE DỪNG DO LỖI.")
