@@ -1,4 +1,4 @@
-# ========== FULL PIPELINE 1 GPU T4: Multi-Tab Google Sheets (Characters + Scenes) → LTX Image-to-Video → TTS → Merge ==========
+# ========== FULL PIPELINE 1 GPU T4: Sheet Character URLs → LTX Image-to-Video → TTS → Drive Backup → Merge ==========
 import os
 import sys
 import json
@@ -62,6 +62,10 @@ os.makedirs(CHAR_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(LOCAL_LTX_DIR, exist_ok=True)
 
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
+CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
+REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
@@ -83,6 +87,55 @@ NEGATIVE_PROMPT_LOCK = (
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
+
+# ==========================================
+# GOOGLE OAUTH + DRIVE BACKUP UTILS
+# ==========================================
+def get_google_access_token():
+    if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
+        return None
+    try:
+        res = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "refresh_token": REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+            timeout=20,
+        ).json()
+        return res.get("access_token")
+    except Exception as e:
+        print(f"❌ OAuth: {e}")
+        return None
+
+def upload_file_to_drive(file_path: str):
+    token = get_google_access_token()
+    if not token or not DRIVE_FOLDER_ID:
+        return None
+    if not os.path.exists(file_path) or os.path.getsize(file_path) < 1000:
+        return None
+    file_name = os.path.basename(file_path)
+    metadata = {"name": file_name, "parents": [DRIVE_FOLDER_ID]}
+    headers = {"Authorization": f"Bearer {token}"}
+    print(f"🚀 Đang lưu/backup file {file_name} lên Google Drive...")
+    try:
+        with open(file_path, "rb") as f:
+            files = {
+                "data": ("metadata", json.dumps(metadata), "application/json; charset=UTF-8"),
+                "file": (file_name, f, "application/octet-stream"),
+            }
+            res = requests.post(
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+                headers=headers, files=files, timeout=600,
+            )
+        if res.status_code in (200, 201):
+            print(f"✅ Đã backup thành công lên Drive: {file_name}")
+            return res.json()
+    except Exception as e:
+        print(f"❌ Lỗi backup Drive: {e}")
+    return None
 
 # ==========================================
 # TỰ ĐỘNG TẢI DATASET LTX
@@ -345,6 +398,8 @@ def run_pipeline():
             print(f"✅ [{scene_num}] Hoàn tất trong {time.time()-t1:.0f}s | {sz/1024:.0f}KB")
 
             if sz > 100000:
+                # 🚀 Tự động upload file video của từng cảnh lên Google Drive ngay sau khi xong
+                upload_file_to_drive(out_file)
                 rendered.append(out_file)
 
             for tmp in [raw_video, upscaled]:
@@ -376,6 +431,8 @@ def run_pipeline():
 
     if os.path.exists(FINAL_VIDEO):
         print(f"🎉 Phim hoàn chỉnh: {FINAL_VIDEO} ({os.path.getsize(FINAL_VIDEO)/1024/1024:.1f} MB)")
+        # 🚀 Upload file phim tổng hợp cuối cùng lên Google Drive
+        upload_file_to_drive(FINAL_VIDEO)
         return True
     return False
 
