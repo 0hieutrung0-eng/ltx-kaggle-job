@@ -1,11 +1,11 @@
 # ========== FULL PIPELINE 1 GPU T4: Wan 2.2 Pure Text-to-Video (Người thật AI)
 # 3 giây/cảnh + Lồng tiếng Việt + Nhạc nền + Hiệu ứng âm thanh + Ghép phim ==========
+# Đã tối ưu: đọc từ Google Sheet + ép cố định nhân vật & môi trường
 import os
 import sys
 import json
 import time
 import gc
-import random
 import requests
 import subprocess
 import pandas as pd
@@ -68,10 +68,11 @@ FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
-# Negative mặc định (sẽ ưu tiên lấy từ Sheet nếu có)
 DEFAULT_NEGATIVE = (
     "worst quality, low quality, blurry, distorted face, deformed eyes, bad anatomy, "
-    "cartoon, anime, donghua, stylized, plastic skin, text, watermark, black screen, extra limbs"
+    "cartoon, anime, donghua, stylized, plastic skin, text, watermark, black screen, "
+    "extra limbs, different face, changed identity, inconsistent appearance, morphing face, "
+    "different outfit, different hair"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -144,30 +145,45 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 # ==========================================
-# XÂY PROMPT (giống style code test của bạn)
+# XÂY PROMPT (ép cố định nhân vật + môi trường)
 # ==========================================
 def build_prompt(row) -> str:
     """
-    Ưu tiên video_prompt từ Sheet (pure T2V).
-    Nếu video_prompt trống thì fallback sang image_prompt / scene_description.
+    Pure Text-to-Video.
+    Ưu tiên video_prompt từ Google Sheet.
+    Ép giữ nguyên nhân vật và môi trường.
     """
-    base = safe_get(row, "video_prompt", "image_prompt", "scene_description")
+    video_prompt = safe_get(row, "video_prompt")
+    image_prompt = safe_get(row, "image_prompt")
+    scene_desc   = safe_get(row, "scene_description")
+    location     = safe_get(row, "location")
 
-    if not base:
-        base = "A realistic young East Asian man standing in a cinematic scene"
+    base_action = video_prompt or image_prompt or scene_desc or "A realistic person in a cinematic scene"
 
-    # Thêm prefix giống code test để tăng chất lượng người thật
+    # Lệnh cố định nhân vật + môi trường
+    consistency = (
+        "Keep the exact same face, hairstyle, eye color, body type, clothing and identity throughout the scene. "
+        "Do not change the character appearance. "
+        "Maintain consistent environment, lighting and atmosphere. "
+        "Photorealistic, realistic human, natural skin texture, detailed eyes, cinematic lighting."
+    )
+
     prompt = (
         f"Masterpiece, best quality, highly detailed, photorealistic, realistic human, "
         f"cinematic lighting, natural skin texture, detailed eyes. "
-        f"{base}. "
+        f"{base_action}. "
+        f"{consistency} "
         f"Natural blinking, subtle breathing, smooth natural motion, ultra realistic."
     )
-    return prompt[:500]
+    return prompt[:520]
 
 def get_negative(row) -> str:
     neg = safe_get(row, "negative_prompt")
-    return neg if neg else DEFAULT_NEGATIVE
+    if not neg:
+        neg = DEFAULT_NEGATIVE
+    # Thêm chống thay đổi nhân vật
+    extra = ", different face, changed identity, inconsistent appearance, morphing face, different outfit, different hair"
+    return (neg + extra).strip(", ")
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:200]
@@ -176,7 +192,7 @@ def get_sfx_type(row) -> str:
     return safe_get(row, "sfx_type", default="none").lower()
 
 # ==========================================
-# TẠO / TẢI NHẠC NỀN + SFX
+# TẠO NHẠC NỀN + SFX
 # ==========================================
 def prepare_audio_assets():
     print("🎵 Chuẩn bị nhạc nền và hiệu ứng âm thanh...")
@@ -361,7 +377,7 @@ def run_pipeline():
         dialogue = get_dialogue(row)
         sfx_type = get_sfx_type(row)
 
-        print(f"\n🎥 [{scene_num}] {prompt[:80]}...")
+        print(f"\n🎥 [{scene_num}] {prompt[:85]}...")
 
         try:
             t1 = time.time()
