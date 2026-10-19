@@ -1,5 +1,6 @@
-# ========== FULL PIPELINE 1 GPU T4: Wan 2.2 TI2V-5B (Image-to-Video) → TTS → Drive → Merge ==========
-# Dùng ảnh nhân vật khóa mặt + Text điều khiển cảnh
+# ========== FULL PIPELINE 1 GPU T4: Wan 2.2 Pure Text-to-Video (Người thật AI) → TTS → Drive → Merge ==========
+# 3 giây / 25 bước / Photorealistic
+
 import os
 import sys
 import json
@@ -10,42 +11,39 @@ import subprocess
 import pandas as pd
 
 def install_all_deps():
-    print("📦 Đang cài dependency...")
+    print("📦 Đang kiểm tra dependency...")
     try:
         import ftfy
     except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "ftfy"], check=False)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ftfy"], check=False)
     try:
-        from diffusers import WanImageToVideoPipeline
+        from diffusers import WanPipeline
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"], check=False)
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
             "diffusers>=0.33.0", "transformers>=4.46.0", "accelerate>=1.1.0",
             "sentencepiece", "imageio", "imageio-ffmpeg", "edge-tts",
-            "safetensors", "huggingface_hub", "protobuf<6", "opencv-python-headless", "ftfy"
+            "safetensors", "huggingface_hub", "protobuf<6", "ftfy"
         ], check=False)
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except Exception:
+    except:
         subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg", shell=True, check=False)
 
 install_all_deps()
 
 import torch
-import ftfy
-from diffusers.utils import export_to_video, load_image
-from PIL import Image
+from diffusers import WanPipeline
+from diffusers.utils import export_to_video
+from huggingface_hub import scan_cache_dir
 
 # ==========================================
-# CẤU HÌNH - WAN 2.2 TI2V-5B TỐI ƯU T4
+# CẤU HÌNH
 # ==========================================
 TOTAL_SCENES = 100
-CHAR_DIR = "./character_images"
 VIDEO_DIR = "./output_videos"
 FINAL_VIDEO = "final_full_movie.mp4"
-
-os.makedirs(CHAR_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
@@ -56,11 +54,10 @@ SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af35
 GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
-# --- Wan 2.2 TI2V-5B ---
 WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 WAN_WIDTH = 832
 WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 81              # ≈ 5 giây @ 16fps
+WAN_NUM_FRAMES = 49          # ≈ 3 giây
 WAN_STEPS = 25
 WAN_FPS = 16
 FINAL_FPS = 24
@@ -68,9 +65,8 @@ FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
 NEGATIVE_PROMPT = (
-    "worst quality, low quality, blurry, jittery, distorted face, deformed eyes, "
-    "morphed limbs, extra limbs, bad anatomy, warped features, changing face shape, "
-    "duplicate heads, unstable character, black screen, static image"
+    "worst quality, low quality, blurry, distorted face, deformed eyes, bad anatomy, "
+    "cartoon, anime, donghua, stylized, plastic skin, text, watermark, black screen"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -141,69 +137,49 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
     except:
         return pd.DataFrame()
 
-def download_url(url: str, path: str) -> bool:
-    try:
-        r = requests.get(url, timeout=90)
-        if r.status_code == 200 and len(r.content) > 2000:
-            with open(path, "wb") as f:
-                f.write(r.content)
-            return True
-    except:
-        pass
-    return False
+# ==========================================
+# LOAD MÔ TẢ NHÂN VẬT TIẾNG ANH
+# ==========================================
+def load_character_descriptions():
+    print("🔍 Đang đọc mô tả nhân vật từ Tab Characters...")
+    df = get_sheet_csv(GID_CHARACTERS)
+    char_desc = {}
+    for _, row in df.iterrows():
+        name = safe_get(row, "character_name", "character_id").lower()
+        desc = safe_get(row, "design_detail", "appearance", "description", "design")
+        if name and desc:
+            char_desc[name] = desc
+    print(f"✅ Đã load {len(char_desc)} mô tả nhân vật")
+    return char_desc
 
 # ==========================================
-# TẢI ẢNH NHÂN VẬT
+# XÂY PROMPT PHOTOREALISTIC
 # ==========================================
-def load_character_images_map():
-    print("\n🔍 Đang tải ảnh nhân vật từ Tab Characters...")
-    df_char = get_sheet_csv(GID_CHARACTERS)
-    if df_char.empty:
-        print("❌ Không đọc được bảng Characters")
-        return {}
+def build_prompt(row, char_desc: dict) -> str:
+    char_key = safe_get(row, "character_name", "character_id", "character").lower()
+    character_detail = char_desc.get(char_key, "")
+    if not character_detail:
+        character_detail = safe_get(row, "design_detail", "appearance") or "handsome young East Asian man"
 
-    char_map = {}
-    for idx, row in df_char.iterrows():
-        char_id = safe_get(row, "character_id").lower()
-        char_name = safe_get(row, "character_name")
-        img_url = safe_get(row, "image_url", "url", "link_anh")
+    scene_action = safe_get(row, "video_prompt", "scene_description", "image_prompt", "action")
 
-        if not img_url or not img_url.startswith("http"):
-            continue
-
-        filename = f"{char_id or idx}_{char_name or 'char'}.png".replace(" ", "_").lower()
-        local_path = os.path.join(CHAR_DIR, filename)
-
-        if not (os.path.exists(local_path) and os.path.getsize(local_path) > 2000):
-            print(f"📥 Tải: {char_id or char_name}...")
-            download_url(img_url, local_path)
-
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 2000:
-            if char_id:
-                char_map[char_id] = local_path
-            if char_name:
-                char_map[char_name.lower()] = local_path
-
-    print(f"✅ Đã sẵn sàng {len(char_map)} ảnh nhân vật")
-    return char_map
-
-# ==========================================
-# HÀM HỖ TRỢ
-# ==========================================
-def get_video_prompt(row) -> str:
-    base = safe_get(row, "video_prompt", "scene_description", "action", "image_prompt")
-    lock = (
-        "Keep the exact same face, identity, hairstyle and clothing from the reference image. "
-        "No face morphing, no identity change, no deformation. "
-        "Natural smooth cinematic motion, high quality. "
+    prompt = (
+        f"Masterpiece, best quality, highly detailed, photorealistic, realistic human, "
+        f"cinematic lighting, natural skin texture, detailed eyes. "
+        f"Character: {character_detail}. "
+        f"Keep the exact same face, hairstyle, clothing and identity. "
+        f"Action: {scene_action}. "
+        f"Dynamic camera: slow push-in, gentle orbit, natural body movement, "
+        f"subtle breathing, smooth natural motion, ultra realistic, sharp focus."
     )
-    if base:
-        return (lock + base)[:350]
-    return lock + "Cinematic scene, detailed, smooth movement"
+    return prompt[:480]
 
 def get_dialogue(row) -> str:
-    return safe_get(row, "dialogue")[:180]
+    return safe_get(row, "dialogue")[:200]
 
+# ==========================================
+# TTS + XỬ LÝ VIDEO
+# ==========================================
 def make_tts(text: str, out_mp3: str) -> bool:
     if not text or len(text.strip()) < 2:
         text = "Cảnh tiếp theo."
@@ -222,7 +198,7 @@ def make_tts(text: str, out_mp3: str) -> bool:
 
 def mix_video_audio(video_in, audio_mp3, video_out):
     if not (os.path.exists(audio_mp3) and os.path.getsize(audio_mp3) > 400):
-        if video_in != video_out and os.path.exists(video_in):
+        if video_in != video_out:
             subprocess.run(f'cp -f "{video_in}" "{video_out}"', shell=True)
         return video_out if os.path.exists(video_out) else video_in
     cmd = f'ffmpeg -y -hide_banner -loglevel error -i "{video_in}" -i "{audio_mp3}" -c:v copy -c:a aac -b:a 96k -shortest -movflags +faststart "{video_out}"'
@@ -245,59 +221,61 @@ def post_process_video(raw_path, out_path):
         pass
     return raw_path
 
-def load_wan_pipe():
-    from diffusers import WanImageToVideoPipeline
-    from diffusers.utils import logging
-    logging.set_verbosity_error()
+# ==========================================
+# LOAD MODEL
+# ==========================================
+def load_pipe():
+    print(f"\n🧠 Load model: {WAN_MODEL}")
+    model_in_cache = False
+    try:
+        cache_info = scan_cache_dir()
+        for repo in cache_info.repos:
+            if "Wan2.2" in repo.repo_id or "Wan-AI" in repo.repo_id:
+                model_in_cache = True
+                break
+    except:
+        pass
 
-    print(f"🧠 Load Wan 2.2 TI2V-5B: {WAN_MODEL}")
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        WAN_MODEL,
-        torch_dtype=torch.float16,
-    )
+    if model_in_cache:
+        pipe = WanPipeline.from_pretrained(WAN_MODEL, torch_dtype=torch.float16, local_files_only=True)
+    else:
+        pipe = WanPipeline.from_pretrained(WAN_MODEL, torch_dtype=torch.float16)
 
     if torch.cuda.is_available():
-        # sequential_cpu_offload tiết kiệm VRAM nhất trên T4
-        pipe.enable_sequential_cpu_offload()
-        print("✅ sequential_cpu_offload")
+        pipe.enable_model_cpu_offload()
+        print("✅ model_cpu_offload")
         try:
             pipe.vae.enable_slicing()
-            print("✅ VAE slicing")
         except:
             pass
 
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("✅ Wan 2.2 TI2V-5B ready (T4 optimized)")
+    print("✅ Model sẵn sàng")
     return pipe
 
 # ==========================================
-# RENDER
+# MAIN
 # ==========================================
 def run_pipeline():
-    char_map = load_character_images_map()
-    if not char_map:
-        print("❌ Không có ảnh nhân vật")
-        return False
-
+    char_desc = load_character_descriptions()
     df_scenes = get_sheet_csv(GID_SCENES)
     if df_scenes.empty:
         print("❌ Sheet Scenes rỗng")
         return False
 
-    pipe = load_wan_pipe()
+    pipe = load_pipe()
     rendered = []
     t0 = time.time()
-    default_img = list(char_map.values())[0]
 
     for idx, row in df_scenes.iterrows():
         scene_num = int(row["scene_index"]) if pd.notna(row.get("scene_index")) else idx + 1
         if scene_num > TOTAL_SCENES:
             break
 
-        raw_video = f"{VIDEO_DIR}/wan_raw_{scene_num:03d}.mp4"
-        upscaled = f"{VIDEO_DIR}/wan_up_{scene_num:03d}.mp4"
+        raw_video = f"{VIDEO_DIR}/raw_{scene_num:03d}.mp4"
+        upscaled = f"{VIDEO_DIR}/up_{scene_num:03d}.mp4"
         voice_mp3 = f"{VIDEO_DIR}/voice_{scene_num:03d}.mp3"
         final_scene = f"{VIDEO_DIR}/scene_{scene_num:03d}.mp4"
 
@@ -306,14 +284,10 @@ def run_pipeline():
             rendered.append(final_scene)
             continue
 
-        char_key = safe_get(row, "character_id", "character", "nhan_vat").lower()
-        img_path = char_map.get(char_key, default_img)
-
-        prompt = get_video_prompt(row)
+        prompt = build_prompt(row, char_desc)
         dialogue = get_dialogue(row)
 
-        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] Nhân vật: {char_key or 'default'}")
-        print(f"   Prompt: {prompt[:70]}...")
+        print(f"\n🎥 [{scene_num}] {prompt[:80]}...")
 
         try:
             t1 = time.time()
@@ -321,15 +295,10 @@ def run_pipeline():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # Load ảnh nhân vật làm điều kiện identity
-            image = load_image(img_path).convert("RGB")
-            image = image.resize((WAN_WIDTH, WAN_HEIGHT), Image.Resampling.LANCZOS)
-
             generator = torch.Generator(device="cpu").manual_seed(42 + scene_num)
 
             with torch.inference_mode():
-                res = pipe(
-                    image=image,
+                result = pipe(
                     prompt=prompt,
                     negative_prompt=NEGATIVE_PROMPT,
                     height=WAN_HEIGHT,
@@ -339,7 +308,7 @@ def run_pipeline():
                     generator=generator,
                 )
 
-            export_to_video(res.frames[0], raw_video, fps=WAN_FPS)
+            export_to_video(result.frames[0], raw_video, fps=WAN_FPS)
             post_process_video(raw_video, upscaled)
             make_tts(dialogue, voice_mp3)
             out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
@@ -353,12 +322,10 @@ def run_pipeline():
 
             for tmp in [raw_video, upscaled]:
                 if os.path.exists(tmp) and tmp != out_file:
-                    try:
-                        os.remove(tmp)
-                    except:
-                        pass
+                    try: os.remove(tmp)
+                    except: pass
 
-            del res, image
+            del result
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -370,7 +337,6 @@ def run_pipeline():
                 torch.cuda.empty_cache()
 
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
-
     valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 80000]
     if not valid:
         print("❌ Không đủ video")
@@ -382,8 +348,7 @@ def run_pipeline():
 
     subprocess.run(
         f'ffmpeg -y -hide_banner -loglevel error -f concat -safe 0 -i concat_list.txt '
-        f'-c copy -movflags +faststart "{FINAL_VIDEO}"',
-        shell=True,
+        f'-c copy -movflags +faststart "{FINAL_VIDEO}"', shell=True
     )
 
     if os.path.exists(FINAL_VIDEO):
@@ -393,8 +358,5 @@ def run_pipeline():
     return False
 
 if __name__ == "__main__":
-    try:
-        print("CUDA:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
-    except:
-        pass
+    print("CUDA:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
     run_pipeline()
