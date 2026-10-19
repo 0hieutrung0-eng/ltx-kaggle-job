@@ -1,6 +1,5 @@
 # ========== FULL PIPELINE 1 GPU T4: Wan 2.2 Pure Text-to-Video (Người thật AI)
 # 3 giây/cảnh + Lồng tiếng Việt + Nhạc nền + Hiệu ứng âm thanh + Ghép phim ==========
-
 import os
 import sys
 import json
@@ -46,6 +45,7 @@ TOTAL_SCENES = 100
 VIDEO_DIR = "./output_videos"
 AUDIO_DIR = "./audio_assets"
 FINAL_VIDEO = "final_full_movie.mp4"
+
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
@@ -53,23 +53,25 @@ DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
 REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
+
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
-GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
 
 WAN_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 WAN_WIDTH = 832
 WAN_HEIGHT = 480
-WAN_NUM_FRAMES = 49          # ≈ 3 giây
+WAN_NUM_FRAMES = 49          # ≈ 3 giây @ 16fps
 WAN_STEPS = 25
 WAN_FPS = 16
+
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
-NEGATIVE_PROMPT = (
+# Negative mặc định (sẽ ưu tiên lấy từ Sheet nếu có)
+DEFAULT_NEGATIVE = (
     "worst quality, low quality, blurry, distorted face, deformed eyes, bad anatomy, "
-    "cartoon, anime, donghua, stylized, plastic skin, text, watermark, black screen"
+    "cartoon, anime, donghua, stylized, plastic skin, text, watermark, black screen, extra limbs"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -137,45 +139,35 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
         df = pd.read_csv(url)
         df.columns = df.columns.str.strip().str.lower()
         return df.dropna(how="all")
-    except:
+    except Exception as e:
+        print(f"❌ Lỗi đọc Sheet: {e}")
         return pd.DataFrame()
 
 # ==========================================
-# LOAD MÔ TẢ NHÂN VẬT
+# XÂY PROMPT (giống style code test của bạn)
 # ==========================================
-def load_character_descriptions():
-    print("🔍 Đang đọc mô tả nhân vật...")
-    df = get_sheet_csv(GID_CHARACTERS)
-    char_desc = {}
-    for _, row in df.iterrows():
-        name = safe_get(row, "character_name", "character_id").lower()
-        desc = safe_get(row, "design_detail", "appearance", "description", "design")
-        if name and desc:
-            char_desc[name] = desc
-    print(f"✅ Đã load {len(char_desc)} mô tả nhân vật")
-    return char_desc
+def build_prompt(row) -> str:
+    """
+    Ưu tiên video_prompt từ Sheet (pure T2V).
+    Nếu video_prompt trống thì fallback sang image_prompt / scene_description.
+    """
+    base = safe_get(row, "video_prompt", "image_prompt", "scene_description")
 
-# ==========================================
-# XÂY PROMPT
-# ==========================================
-def build_prompt(row, char_desc: dict) -> str:
-    char_key = safe_get(row, "character_name", "character_id", "character").lower()
-    character_detail = char_desc.get(char_key, "")
-    if not character_detail:
-        character_detail = safe_get(row, "design_detail", "appearance") or "handsome young East Asian man"
+    if not base:
+        base = "A realistic young East Asian man standing in a cinematic scene"
 
-    scene_action = safe_get(row, "video_prompt", "scene_description", "image_prompt", "action")
-
+    # Thêm prefix giống code test để tăng chất lượng người thật
     prompt = (
         f"Masterpiece, best quality, highly detailed, photorealistic, realistic human, "
         f"cinematic lighting, natural skin texture, detailed eyes. "
-        f"Character: {character_detail}. "
-        f"Keep the exact same face, hairstyle, clothing and identity. "
-        f"Action: {scene_action}. "
-        f"Dynamic camera: slow push-in, gentle orbit, natural body movement, "
-        f"subtle breathing, smooth natural motion, ultra realistic, sharp focus."
+        f"{base}. "
+        f"Natural blinking, subtle breathing, smooth natural motion, ultra realistic."
     )
-    return prompt[:480]
+    return prompt[:500]
+
+def get_negative(row) -> str:
+    neg = safe_get(row, "negative_prompt")
+    return neg if neg else DEFAULT_NEGATIVE
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:200]
@@ -187,13 +179,9 @@ def get_sfx_type(row) -> str:
 # TẠO / TẢI NHẠC NỀN + SFX
 # ==========================================
 def prepare_audio_assets():
-    """Tạo file nhạc nền và SFX đơn giản bằng ffmpeg (không cần tải ngoài)"""
     print("🎵 Chuẩn bị nhạc nền và hiệu ứng âm thanh...")
-
-    # Nhạc nền cinematic nhẹ (dùng sine + noise để tạo ambient)
     bgm_path = os.path.join(AUDIO_DIR, "bgm_cinematic.mp3")
     if not os.path.exists(bgm_path):
-        # Tạo nhạc nền ambient 60 giây
         cmd = (
             f'ffmpeg -y -f lavfi -i "sine=frequency=110:duration=60" '
             f'-f lavfi -i "anoisesrc=color=pink:duration=60:amplitude=0.02" '
@@ -202,7 +190,6 @@ def prepare_audio_assets():
         )
         subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Các SFX đơn giản
     sfx_list = {
         "footsteps": "sine=frequency=80:duration=0.3",
         "sword_clash": "sine=frequency=600:duration=0.2",
@@ -210,13 +197,11 @@ def prepare_audio_assets():
         "wind_whoosh": "anoisesrc=color=pink:duration=0.8:amplitude=0.1",
         "ocean_waves": "anoisesrc=color=brown:duration=1.5:amplitude=0.08",
     }
-
     for name, source in sfx_list.items():
         path = os.path.join(AUDIO_DIR, f"sfx_{name}.mp3")
         if not os.path.exists(path):
             cmd = f'ffmpeg -y -f lavfi -i "{source}" -c:a libmp3lame -q:a 5 "{path}"'
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
     print("✅ Audio assets sẵn sàng")
 
 # ==========================================
@@ -239,24 +224,20 @@ def make_tts(text: str, out_mp3: str) -> bool:
     return False
 
 def mix_full_audio(video_in, voice_mp3, sfx_type, video_out):
-    """Trộn: Video + Voice + SFX + Nhạc nền"""
     bgm = os.path.join(AUDIO_DIR, "bgm_cinematic.mp3")
     sfx = os.path.join(AUDIO_DIR, f"sfx_{sfx_type}.mp3") if sfx_type != "none" else None
 
-    # Tạo filter phức tạp
     inputs = f'-i "{video_in}"'
     filter_parts = []
     audio_inputs = 1
 
-    # Voice
     if os.path.exists(voice_mp3) and os.path.getsize(voice_mp3) > 400:
         inputs += f' -i "{voice_mp3}"'
         filter_parts.append(f"[{audio_inputs}:a]volume=1.0[voice]")
         audio_inputs += 1
     else:
-        filter_parts.append("[0:a]anull[voice]")  # fallback
+        filter_parts.append("[0:a]anull[voice]")
 
-    # SFX
     if sfx and os.path.exists(sfx):
         inputs += f' -i "{sfx}"'
         filter_parts.append(f"[{audio_inputs}:a]volume=0.6[sfx]")
@@ -264,7 +245,6 @@ def mix_full_audio(video_in, voice_mp3, sfx_type, video_out):
     else:
         filter_parts.append("anullsrc=r=44100:cl=stereo,atrim=0:0.1[sfx]")
 
-    # BGM
     if os.path.exists(bgm):
         inputs += f' -stream_loop -1 -i "{bgm}"'
         filter_parts.append(f"[{audio_inputs}:a]volume=0.18[bgm]")
@@ -287,7 +267,6 @@ def mix_full_audio(video_in, voice_mp3, sfx_type, video_out):
     except Exception as e:
         print(f"⚠️ Mix audio lỗi: {e}")
 
-    # Fallback: chỉ ghép voice
     if os.path.exists(voice_mp3):
         cmd = f'ffmpeg -y -hide_banner -loglevel error -i "{video_in}" -i "{voice_mp3}" -c:v copy -c:a aac -shortest "{video_out}"'
         subprocess.run(cmd, shell=True)
@@ -350,11 +329,13 @@ def load_pipe():
 # ==========================================
 def run_pipeline():
     prepare_audio_assets()
-    char_desc = load_character_descriptions()
+
     df_scenes = get_sheet_csv(GID_SCENES)
     if df_scenes.empty:
         print("❌ Sheet Scenes rỗng")
         return False
+
+    print(f"📄 Đã load {len(df_scenes)} cảnh từ Google Sheet")
 
     pipe = load_pipe()
     rendered = []
@@ -375,11 +356,12 @@ def run_pipeline():
             rendered.append(final_scene)
             continue
 
-        prompt = build_prompt(row, char_desc)
+        prompt = build_prompt(row)
+        negative = get_negative(row)
         dialogue = get_dialogue(row)
         sfx_type = get_sfx_type(row)
 
-        print(f"\n🎥 [{scene_num}] {prompt[:75]}...")
+        print(f"\n🎥 [{scene_num}] {prompt[:80]}...")
 
         try:
             t1 = time.time()
@@ -392,7 +374,7 @@ def run_pipeline():
             with torch.inference_mode():
                 result = pipe(
                     prompt=prompt,
-                    negative_prompt=NEGATIVE_PROMPT,
+                    negative_prompt=negative,
                     height=WAN_HEIGHT,
                     width=WAN_WIDTH,
                     num_frames=WAN_NUM_FRAMES,
@@ -414,8 +396,10 @@ def run_pipeline():
 
             for tmp in [raw_video, upscaled]:
                 if os.path.exists(tmp) and tmp != out_file:
-                    try: os.remove(tmp)
-                    except: pass
+                    try:
+                        os.remove(tmp)
+                    except:
+                        pass
 
             del result
             gc.collect()
