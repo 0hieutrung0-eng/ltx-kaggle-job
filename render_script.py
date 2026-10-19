@@ -1,4 +1,5 @@
 # ========== FULL PIPELINE 1 GPU T4: Text-to-Video ~5s (LTX) → TTS → Drive → Merge ==========
+# Đã sửa: Photorealistic người thật (bỏ donghua), khớp style code test
 import os
 import sys
 import json
@@ -47,6 +48,7 @@ DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
 REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
+
 SHEET_ID = os.environ.get("SHEET_ID", "1DmA-yuPwDl1riceSMGzWPXhuxrL4y987lOZ6Af351l8")
 GID_CHARACTERS = os.environ.get("GID_CHARACTERS", "1382939846")
 GID_SCENES = os.environ.get("GID_SCENES", "0")
@@ -59,14 +61,15 @@ LTX_HEIGHT = 512
 LTX_NUM_FRAMES = 81          # 81 frames
 LTX_FPS = 16                 # 81 / 16 ≈ 5.0 giây
 LTX_STEPS = 20               # Giảm steps để đỡ nặng VRAM
+
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
 NEGATIVE_PROMPT_LOCK = (
-    "black screen, blank video, static image, no motion, worst quality, low quality, "
-    "blurry, distorted face, deformed eyes, morphed limbs, extra limbs, bad anatomy, "
-    "2d, chibi, ugly, deformed"
+    "worst quality, low quality, blurry, distorted face, deformed eyes, bad anatomy, "
+    "cartoon, anime, donghua, stylized, 3d animation, unreal engine, cgi, plastic skin, "
+    "text, watermark, black screen, extra limbs, morphing, different face, changed identity"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -145,7 +148,7 @@ def load_character_profiles():
     for idx, row in df_char.iterrows():
         char_id = safe_get(row, "character_id").lower()
         char_name = safe_get(row, "character_name")
-        appearance = safe_get(row, "appearance", "design_detail", "costume")
+        appearance = safe_get(row, "appearance", "design_detail", "costume", "design")
         if char_id:
             char_prompts[char_id] = appearance
         if char_name:
@@ -153,17 +156,28 @@ def load_character_profiles():
     return char_prompts
 
 def build_pure_text_prompt(row, char_prompts) -> str:
-    scene_desc = safe_get(row, "video_prompt", "scene_description", "action")
-    char_key = safe_get(row, "character_id", "character", "nhan_vat").lower()
-    char_details = char_prompts.get(char_key, "handsome young chinese man, sharp face, detailed eyes, donghua style")
+    """
+    Xây prompt theo đúng style code test (photorealistic người thật).
+    """
+    scene_desc = safe_get(row, "video_prompt", "scene_description", "action", "image_prompt")
+    char_key = safe_get(row, "character_id", "character", "character_name", "nhan_vat").lower()
 
-    full_prompt = (
-        f"Masterpiece, best quality, highly detailed, 3d chinese donghua style, unreal engine 5, "
-        f"cinematic lighting, bright neon lights, volumetric light, sharp focus. "
-        f"Character: {char_details[:180]}. "
-        f"Scene: {scene_desc[:220]}, smooth natural motion, clear face, consistent character"
+    # Ưu tiên lấy design từ sheet Characters, nếu không có thì dùng mặc định người thật
+    char_details = char_prompts.get(char_key, "")
+    if not char_details:
+        char_details = "handsome young East Asian man, mid 20s, sharp jawline, detailed eyes, natural skin texture"
+
+    prompt = (
+        f"Masterpiece, best quality, highly detailed, photorealistic, realistic human, "
+        f"cinematic lighting, natural skin texture, detailed eyes. "
+        f"Character: {char_details[:160]}. "
+        f"Keep the exact same face, hairstyle, clothing and identity. "
+        f"Scene: {scene_desc[:200]}. "
+        f"Natural blinking, subtle breathing. "
+        f"Dynamic camera: slow push-in, gentle orbit, shallow depth of field, "
+        f"smooth natural motion, ultra realistic."
     )
-    return full_prompt[:400]
+    return prompt[:480]
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
@@ -213,10 +227,8 @@ def load_ltx_text_pipe():
     from diffusers import LTXPipeline
     from diffusers.utils import logging
     logging.set_verbosity_error()
-
     print(f"🧠 Load LTX Text-to-Video: {DEFAULT_MODEL_ID}")
     pipe = LTXPipeline.from_pretrained(DEFAULT_MODEL_ID, torch_dtype=torch.float16)
-
     if torch.cuda.is_available():
         pipe.enable_sequential_cpu_offload()
         print("✅ sequential_cpu_offload")
@@ -225,7 +237,6 @@ def load_ltx_text_pipe():
             print("✅ VAE slicing")
         except:
             pass
-
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -241,6 +252,8 @@ def run_pipeline():
     if df_scenes.empty:
         print("❌ Sheet rỗng")
         return False
+
+    print(f"📄 Đã load {len(df_scenes)} cảnh từ Google Sheet")
 
     pipe = load_ltx_text_pipe()
     rendered = []
@@ -265,7 +278,7 @@ def run_pipeline():
         dialogue = get_dialogue(row)
 
         print(f"🎥 [{scene_num}/{TOTAL_SCENES}] ~5s Text-to-Video...")
-        print(f"   Prompt: {text_prompt[:70]}...")
+        print(f"   Prompt: {text_prompt[:75]}...")
 
         try:
             t1 = time.time()
@@ -317,7 +330,6 @@ def run_pipeline():
                 torch.cuda.empty_cache()
 
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
-
     valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 50000]
     if not valid:
         print("❌ Không đủ video")
