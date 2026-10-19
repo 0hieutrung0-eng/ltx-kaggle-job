@@ -1,11 +1,12 @@
-# ========== FULL PIPELINE 1 GPU T4: Wan 2.2 Pure Text-to-Video (Người thật AI) → TTS → Drive → Merge ==========
-# 3 giây / 25 bước / Photorealistic
+# ========== FULL PIPELINE 1 GPU T4: Wan 2.2 Pure Text-to-Video (Người thật AI)
+# 3 giây/cảnh + Lồng tiếng Việt + Nhạc nền + Hiệu ứng âm thanh + Ghép phim ==========
 
 import os
 import sys
 import json
 import time
 import gc
+import random
 import requests
 import subprocess
 import pandas as pd
@@ -43,8 +44,10 @@ from huggingface_hub import scan_cache_dir
 # ==========================================
 TOTAL_SCENES = 100
 VIDEO_DIR = "./output_videos"
+AUDIO_DIR = "./audio_assets"
 FINAL_VIDEO = "final_full_movie.mp4"
 os.makedirs(VIDEO_DIR, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
@@ -138,10 +141,10 @@ def get_sheet_csv(gid: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 # ==========================================
-# LOAD MÔ TẢ NHÂN VẬT TIẾNG ANH
+# LOAD MÔ TẢ NHÂN VẬT
 # ==========================================
 def load_character_descriptions():
-    print("🔍 Đang đọc mô tả nhân vật từ Tab Characters...")
+    print("🔍 Đang đọc mô tả nhân vật...")
     df = get_sheet_csv(GID_CHARACTERS)
     char_desc = {}
     for _, row in df.iterrows():
@@ -153,7 +156,7 @@ def load_character_descriptions():
     return char_desc
 
 # ==========================================
-# XÂY PROMPT PHOTOREALISTIC
+# XÂY PROMPT
 # ==========================================
 def build_prompt(row, char_desc: dict) -> str:
     char_key = safe_get(row, "character_name", "character_id", "character").lower()
@@ -177,8 +180,47 @@ def build_prompt(row, char_desc: dict) -> str:
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:200]
 
+def get_sfx_type(row) -> str:
+    return safe_get(row, "sfx_type", default="none").lower()
+
 # ==========================================
-# TTS + XỬ LÝ VIDEO
+# TẠO / TẢI NHẠC NỀN + SFX
+# ==========================================
+def prepare_audio_assets():
+    """Tạo file nhạc nền và SFX đơn giản bằng ffmpeg (không cần tải ngoài)"""
+    print("🎵 Chuẩn bị nhạc nền và hiệu ứng âm thanh...")
+
+    # Nhạc nền cinematic nhẹ (dùng sine + noise để tạo ambient)
+    bgm_path = os.path.join(AUDIO_DIR, "bgm_cinematic.mp3")
+    if not os.path.exists(bgm_path):
+        # Tạo nhạc nền ambient 60 giây
+        cmd = (
+            f'ffmpeg -y -f lavfi -i "sine=frequency=110:duration=60" '
+            f'-f lavfi -i "anoisesrc=color=pink:duration=60:amplitude=0.02" '
+            f'-filter_complex "[0][1]amix=inputs=2:duration=first,volume=0.25" '
+            f'-c:a libmp3lame -q:a 4 "{bgm_path}"'
+        )
+        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Các SFX đơn giản
+    sfx_list = {
+        "footsteps": "sine=frequency=80:duration=0.3",
+        "sword_clash": "sine=frequency=600:duration=0.2",
+        "magic_blast": "sine=frequency=300:duration=0.5",
+        "wind_whoosh": "anoisesrc=color=pink:duration=0.8:amplitude=0.1",
+        "ocean_waves": "anoisesrc=color=brown:duration=1.5:amplitude=0.08",
+    }
+
+    for name, source in sfx_list.items():
+        path = os.path.join(AUDIO_DIR, f"sfx_{name}.mp3")
+        if not os.path.exists(path):
+            cmd = f'ffmpeg -y -f lavfi -i "{source}" -c:a libmp3lame -q:a 5 "{path}"'
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print("✅ Audio assets sẵn sàng")
+
+# ==========================================
+# TTS + MIX ÂM THANH
 # ==========================================
 def make_tts(text: str, out_mp3: str) -> bool:
     if not text or len(text.strip()) < 2:
@@ -196,14 +238,62 @@ def make_tts(text: str, out_mp3: str) -> bool:
             continue
     return False
 
-def mix_video_audio(video_in, audio_mp3, video_out):
-    if not (os.path.exists(audio_mp3) and os.path.getsize(audio_mp3) > 400):
-        if video_in != video_out:
-            subprocess.run(f'cp -f "{video_in}" "{video_out}"', shell=True)
-        return video_out if os.path.exists(video_out) else video_in
-    cmd = f'ffmpeg -y -hide_banner -loglevel error -i "{video_in}" -i "{audio_mp3}" -c:v copy -c:a aac -b:a 96k -shortest -movflags +faststart "{video_out}"'
-    subprocess.run(cmd, shell=True)
-    return video_out if os.path.exists(video_out) and os.path.getsize(video_out) > 5000 else video_in
+def mix_full_audio(video_in, voice_mp3, sfx_type, video_out):
+    """Trộn: Video + Voice + SFX + Nhạc nền"""
+    bgm = os.path.join(AUDIO_DIR, "bgm_cinematic.mp3")
+    sfx = os.path.join(AUDIO_DIR, f"sfx_{sfx_type}.mp3") if sfx_type != "none" else None
+
+    # Tạo filter phức tạp
+    inputs = f'-i "{video_in}"'
+    filter_parts = []
+    audio_inputs = 1
+
+    # Voice
+    if os.path.exists(voice_mp3) and os.path.getsize(voice_mp3) > 400:
+        inputs += f' -i "{voice_mp3}"'
+        filter_parts.append(f"[{audio_inputs}:a]volume=1.0[voice]")
+        audio_inputs += 1
+    else:
+        filter_parts.append("[0:a]anull[voice]")  # fallback
+
+    # SFX
+    if sfx and os.path.exists(sfx):
+        inputs += f' -i "{sfx}"'
+        filter_parts.append(f"[{audio_inputs}:a]volume=0.6[sfx]")
+        audio_inputs += 1
+    else:
+        filter_parts.append("anullsrc=r=44100:cl=stereo,atrim=0:0.1[sfx]")
+
+    # BGM
+    if os.path.exists(bgm):
+        inputs += f' -stream_loop -1 -i "{bgm}"'
+        filter_parts.append(f"[{audio_inputs}:a]volume=0.18[bgm]")
+    else:
+        filter_parts.append("anullsrc=r=44100:cl=stereo,atrim=0:3[bgm]")
+
+    filter_complex = ";".join(filter_parts)
+    filter_complex += ";[voice][sfx][bgm]amix=inputs=3:duration=first:dropout_transition=0[aout]"
+
+    cmd = (
+        f'ffmpeg -y -hide_banner -loglevel error {inputs} '
+        f'-filter_complex "{filter_complex}" '
+        f'-map 0:v -map "[aout]" -c:v copy -c:a aac -b:a 128k -shortest '
+        f'-movflags +faststart "{video_out}"'
+    )
+    try:
+        subprocess.run(cmd, shell=True, timeout=120)
+        if os.path.exists(video_out) and os.path.getsize(video_out) > 5000:
+            return video_out
+    except Exception as e:
+        print(f"⚠️ Mix audio lỗi: {e}")
+
+    # Fallback: chỉ ghép voice
+    if os.path.exists(voice_mp3):
+        cmd = f'ffmpeg -y -hide_banner -loglevel error -i "{video_in}" -i "{voice_mp3}" -c:v copy -c:a aac -shortest "{video_out}"'
+        subprocess.run(cmd, shell=True)
+        if os.path.exists(video_out):
+            return video_out
+    return video_in
 
 def post_process_video(raw_path, out_path):
     if not os.path.exists(raw_path):
@@ -256,9 +346,10 @@ def load_pipe():
     return pipe
 
 # ==========================================
-# MAIN
+# MAIN PIPELINE
 # ==========================================
 def run_pipeline():
+    prepare_audio_assets()
     char_desc = load_character_descriptions()
     df_scenes = get_sheet_csv(GID_SCENES)
     if df_scenes.empty:
@@ -286,8 +377,9 @@ def run_pipeline():
 
         prompt = build_prompt(row, char_desc)
         dialogue = get_dialogue(row)
+        sfx_type = get_sfx_type(row)
 
-        print(f"\n🎥 [{scene_num}] {prompt[:80]}...")
+        print(f"\n🎥 [{scene_num}] {prompt[:75]}...")
 
         try:
             t1 = time.time()
@@ -311,10 +403,10 @@ def run_pipeline():
             export_to_video(result.frames[0], raw_video, fps=WAN_FPS)
             post_process_video(raw_video, upscaled)
             make_tts(dialogue, voice_mp3)
-            out_file = mix_video_audio(upscaled, voice_mp3, final_scene)
+            out_file = mix_full_audio(upscaled, voice_mp3, sfx_type, final_scene)
 
             sz = os.path.getsize(out_file) if os.path.exists(out_file) else 0
-            print(f"✅ [{scene_num}] {time.time()-t1:.0f}s | {sz/1024:.0f} KB")
+            print(f"✅ [{scene_num}] {time.time()-t1:.0f}s | {sz/1024:.0f} KB | SFX: {sfx_type}")
 
             if sz > 80000:
                 upload_file_to_drive(out_file)
@@ -336,6 +428,7 @@ def run_pipeline():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+    # Ghép tất cả cảnh
     print(f"\nRender xong {len(rendered)} cảnh / {(time.time()-t0)/60:.1f} phút")
     valid = [v for v in sorted(rendered) if os.path.exists(v) and os.path.getsize(v) > 80000]
     if not valid:
