@@ -1,5 +1,5 @@
 # ========== FULL PIPELINE 1 GPU T4: Text-to-Video ~5s (LTX) → TTS → Drive → Merge ==========
-# Đã sửa: Photorealistic người thật (bỏ donghua), khớp style code test
+# Đã sửa: Photorealistic + Medium shot + Ít méo mặt + Chuyển động tự nhiên hơn
 import os
 import sys
 import json
@@ -55,12 +55,12 @@ GID_SCENES = os.environ.get("GID_SCENES", "0")
 
 DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
 
-# --- Cấu hình để ra ~5 giây trên T4 ---
-LTX_WIDTH = 512
-LTX_HEIGHT = 512
-LTX_NUM_FRAMES = 81          # 81 frames
-LTX_FPS = 16                 # 81 / 16 ≈ 5.0 giây
-LTX_STEPS = 20               # Giảm steps để đỡ nặng VRAM
+# --- Cấu hình tối ưu hơn cho chất lượng + ít méo ---
+LTX_WIDTH = 576
+LTX_HEIGHT = 576
+LTX_NUM_FRAMES = 65          # ~4 giây
+LTX_FPS = 16
+LTX_STEPS = 28               # Tăng steps → mượt hơn, ít méo mặt
 
 FINAL_FPS = 24
 FINAL_WIDTH = 768
@@ -69,7 +69,8 @@ FINAL_HEIGHT = 512
 NEGATIVE_PROMPT_LOCK = (
     "worst quality, low quality, blurry, distorted face, deformed eyes, bad anatomy, "
     "cartoon, anime, donghua, stylized, 3d animation, unreal engine, cgi, plastic skin, "
-    "text, watermark, black screen, extra limbs, morphing, different face, changed identity"
+    "text, watermark, black screen, extra limbs, morphing, face warp, melting face, "
+    "inconsistent face, changed identity, slow motion, stiff pose, frozen, close-up only"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -157,12 +158,12 @@ def load_character_profiles():
 
 def build_pure_text_prompt(row, char_prompts) -> str:
     """
-    Xây prompt theo đúng style code test (photorealistic người thật).
+    Prompt tối ưu: Medium shot + photorealistic + ít méo + chuyển động tự nhiên
     """
     scene_desc = safe_get(row, "video_prompt", "scene_description", "action", "image_prompt")
     char_key = safe_get(row, "character_id", "character", "character_name", "nhan_vat").lower()
+    location = safe_get(row, "location")
 
-    # Ưu tiên lấy design từ sheet Characters, nếu không có thì dùng mặc định người thật
     char_details = char_prompts.get(char_key, "")
     if not char_details:
         char_details = "handsome young East Asian man, mid 20s, sharp jawline, detailed eyes, natural skin texture"
@@ -170,14 +171,16 @@ def build_pure_text_prompt(row, char_prompts) -> str:
     prompt = (
         f"Masterpiece, best quality, highly detailed, photorealistic, realistic human, "
         f"cinematic lighting, natural skin texture, detailed eyes. "
-        f"Character: {char_details[:160]}. "
+        f"Medium shot, full upper body visible, not extreme close-up. "
+        f"Character: {char_details[:140]}. "
         f"Keep the exact same face, hairstyle, clothing and identity. "
-        f"Scene: {scene_desc[:200]}. "
-        f"Natural blinking, subtle breathing. "
-        f"Dynamic camera: slow push-in, gentle orbit, shallow depth of field, "
-        f"smooth natural motion, ultra realistic."
+        f"Scene: {scene_desc[:180]}. "
+        f"Location: {location}. "
+        f"Natural body movement, natural blinking, subtle breathing, realistic gestures. "
+        f"Dynamic camera: medium shot, slow push-in, gentle orbit, shallow depth of field, "
+        f"smooth natural motion, ultra realistic, film grain."
     )
-    return prompt[:480]
+    return prompt[:500]
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
@@ -240,7 +243,7 @@ def load_ltx_text_pipe():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("✅ LTX ready (tối ưu T4 - ~5s)")
+    print("✅ LTX ready (tối ưu T4)")
     return pipe
 
 # ==========================================
@@ -277,8 +280,8 @@ def run_pipeline():
         text_prompt = build_pure_text_prompt(row, char_prompts)
         dialogue = get_dialogue(row)
 
-        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] ~5s Text-to-Video...")
-        print(f"   Prompt: {text_prompt[:75]}...")
+        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] ~4-5s Text-to-Video...")
+        print(f"   Prompt: {text_prompt[:80]}...")
 
         try:
             t1 = time.time()
