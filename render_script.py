@@ -1,5 +1,5 @@
-# ========== FULL PIPELINE 1 GPU T4: Text-to-Video ~5s (LTX) → TTS → Drive → Merge ==========
-# Đã sửa: Photorealistic + Medium shot + Ít méo mặt + Chuyển động tự nhiên hơn
+# ========== FULL PIPELINE 1 GPU T4: Text-to-Video ~4-5s (LTX) → TTS → Drive → Merge ==========
+# Phiên bản tối ưu: 90 cảnh + Photorealistic + Medium/Wide shot + Bối cảnh rõ + Ít nhảy mặt
 import os
 import sys
 import json
@@ -37,9 +37,9 @@ import ftfy
 from diffusers.utils import export_to_video
 
 # ==========================================
-# CẤU HÌNH TỐI ƯU CHO T4 + VIDEO ~5 GIÂY
+# CẤU HÌNH
 # ==========================================
-TOTAL_SCENES = 100
+TOTAL_SCENES = 90
 VIDEO_DIR = "./output_videos"
 FINAL_VIDEO = "final_full_movie.mp4"
 os.makedirs(VIDEO_DIR, exist_ok=True)
@@ -55,22 +55,23 @@ GID_SCENES = os.environ.get("GID_SCENES", "0")
 
 DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
 
-# --- Cấu hình tối ưu hơn cho chất lượng + ít méo ---
+# Cấu hình tối ưu T4
 LTX_WIDTH = 576
 LTX_HEIGHT = 576
 LTX_NUM_FRAMES = 65          # ~4 giây
 LTX_FPS = 16
-LTX_STEPS = 28               # Tăng steps → mượt hơn, ít méo mặt
+LTX_STEPS = 32
 
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
 NEGATIVE_PROMPT_LOCK = (
+    "extreme close-up, face only, headshot, portrait only, "
     "worst quality, low quality, blurry, distorted face, deformed eyes, bad anatomy, "
     "cartoon, anime, donghua, stylized, 3d animation, unreal engine, cgi, plastic skin, "
     "text, watermark, black screen, extra limbs, morphing, face warp, melting face, "
-    "inconsistent face, changed identity, slow motion, stiff pose, frozen, close-up only"
+    "inconsistent face, different person, changed identity, slow motion, stiff pose, frozen"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -123,7 +124,7 @@ def upload_file_to_drive(file_path: str):
     return None
 
 # ==========================================
-# SHEET
+# SHEET UTILS
 # ==========================================
 def safe_get(row, *keys, default=""):
     for key in keys:
@@ -156,35 +157,63 @@ def load_character_profiles():
             char_prompts[char_name.lower()] = appearance
     return char_prompts
 
+# ==========================================
+# XÂY PROMPT MẠNH (ưu tiên video_prompt từ Sheet + ép bối cảnh)
+# ==========================================
 def build_pure_text_prompt(row, char_prompts) -> str:
     """
-    Prompt tối ưu: Medium shot + photorealistic + ít méo + chuyển động tự nhiên
+    Ưu tiên dùng video_prompt đã được Gemini viết tốt từ Sheet.
+    Nếu thiếu thì mới ghép thêm.
+    Ép Medium/Wide shot + môi trường rõ ràng.
     """
-    scene_desc = safe_get(row, "video_prompt", "scene_description", "action", "image_prompt")
-    char_key = safe_get(row, "character_id", "character", "character_name", "nhan_vat").lower()
-    location = safe_get(row, "location")
+    video_prompt = safe_get(row, "video_prompt")
+    image_prompt = safe_get(row, "image_prompt")
+    scene_desc   = safe_get(row, "scene_description")
+    location     = safe_get(row, "location") or "detailed cinematic environment"
+    char_key     = safe_get(row, "character_name", "character_id", "character", "nhan_vat").lower()
 
+    # Lấy design nhân vật nếu có
     char_details = char_prompts.get(char_key, "")
     if not char_details:
+        # fallback nhẹ
         char_details = "handsome young East Asian man, mid 20s, sharp jawline, detailed eyes, natural skin texture"
+
+    # Nếu video_prompt từ Sheet đã tốt (dài và có "Masterpiece") thì dùng trực tiếp + bổ sung
+    if video_prompt and len(video_prompt) > 80 and "photorealistic" in video_prompt.lower():
+        base = video_prompt
+    else:
+        base = video_prompt or image_prompt or scene_desc or "A realistic person in a cinematic scene"
 
     prompt = (
         f"Masterpiece, best quality, highly detailed, photorealistic, realistic human, "
-        f"cinematic lighting, natural skin texture, detailed eyes. "
-        f"Medium shot, full upper body visible, not extreme close-up. "
-        f"Character: {char_details[:140]}. "
-        f"Keep the exact same face, hairstyle, clothing and identity. "
-        f"Scene: {scene_desc[:180]}. "
-        f"Location: {location}. "
-        f"Natural body movement, natural blinking, subtle breathing, realistic gestures. "
-        f"Dynamic camera: medium shot, slow push-in, gentle orbit, shallow depth of field, "
+        f"cinematic lighting, natural skin texture, detailed eyes, 8k. "
+        f"Medium shot to wide shot, full upper body and environment clearly visible, "
+        f"NOT extreme close-up of face. "
+        f"Character: {char_details[:120]}. "
+        f"Keep the exact same face, hairstyle, clothing, body type and identity. "
+        f"Scene: {base[:200]}. "
+        f"Location and background: {location}, detailed environment, depth of field. "
+        f"Natural body language, natural blinking, subtle breathing, realistic gestures. "
+        f"Dynamic camera: medium shot, slow push-in or gentle tracking, shallow depth of field, "
         f"smooth natural motion, ultra realistic, film grain."
     )
-    return prompt[:500]
+    return prompt[:520]
+
+def get_negative(row) -> str:
+    neg = safe_get(row, "negative_prompt")
+    if neg and len(neg) > 20:
+        return neg + ", extreme close-up, face only, different face, changed identity"
+    return NEGATIVE_PROMPT_LOCK
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
 
+def get_sfx_type(row) -> str:
+    return safe_get(row, "sfx_type", default="none").lower()
+
+# ==========================================
+# TTS + MIX
+# ==========================================
 def make_tts(text: str, out_mp3: str) -> bool:
     if not text or len(text.strip()) < 2:
         text = "Cảnh tiếp theo."
@@ -247,7 +276,7 @@ def load_ltx_text_pipe():
     return pipe
 
 # ==========================================
-# MAIN RENDER
+# MAIN PIPELINE
 # ==========================================
 def run_pipeline():
     char_prompts = load_character_profiles()
@@ -278,10 +307,11 @@ def run_pipeline():
             continue
 
         text_prompt = build_pure_text_prompt(row, char_prompts)
+        negative = get_negative(row)
         dialogue = get_dialogue(row)
 
-        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] ~4-5s Text-to-Video...")
-        print(f"   Prompt: {text_prompt[:80]}...")
+        print(f"🎥 [{scene_num}/{TOTAL_SCENES}] ~4s Text-to-Video...")
+        print(f"   Prompt: {text_prompt[:85]}...")
 
         try:
             t1 = time.time()
@@ -294,7 +324,7 @@ def run_pipeline():
             with torch.inference_mode():
                 res = pipe(
                     prompt=text_prompt,
-                    negative_prompt=NEGATIVE_PROMPT_LOCK,
+                    negative_prompt=negative,
                     height=LTX_HEIGHT,
                     width=LTX_WIDTH,
                     num_frames=LTX_NUM_FRAMES,
