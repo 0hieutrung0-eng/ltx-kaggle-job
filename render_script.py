@@ -1,5 +1,5 @@
 # ========== FULL PIPELINE 1 GPU T4: Text-to-Video ~4-5s (LTX) → TTS → Drive → Merge ==========
-# Phiên bản tối ưu: 90 cảnh + Photorealistic + Medium/Wide shot + Bối cảnh rõ + Ít nhảy mặt
+# Phiên bản siết chặt: Chỉ người thật photorealistic, chống hoạt hình / 3D / méo mó
 import os
 import sys
 import json
@@ -58,20 +58,24 @@ DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
 # Cấu hình tối ưu T4
 LTX_WIDTH = 576
 LTX_HEIGHT = 576
-LTX_NUM_FRAMES = 65          # ~4 giây
+LTX_NUM_FRAMES = 65
 LTX_FPS = 16
-LTX_STEPS = 32
+LTX_STEPS = 35
 
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
+# Negative mạnh hơn để chặn hoạt hình / 3D / méo mó
 NEGATIVE_PROMPT_LOCK = (
+    "cartoon, anime, donghua, 3d animation, cgi, unreal engine, stylized, "
+    "pixar, disney, illustration, painting, drawing, comic, manga, "
+    "plastic skin, doll-like, artificial, exaggerated features, "
     "extreme close-up, face only, headshot, portrait only, "
-    "worst quality, low quality, blurry, distorted face, deformed eyes, bad anatomy, "
-    "cartoon, anime, donghua, stylized, 3d animation, unreal engine, cgi, plastic skin, "
-    "text, watermark, black screen, extra limbs, morphing, face warp, melting face, "
-    "inconsistent face, different person, changed identity, slow motion, stiff pose, frozen"
+    "worst quality, low quality, blurry, distorted face, deformed eyes, "
+    "bad anatomy, extra limbs, missing limbs, morphing, face warp, melting face, "
+    "inconsistent face, different person, changed identity, "
+    "slow motion, stiff pose, frozen, black screen, text, watermark"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -158,58 +162,54 @@ def load_character_profiles():
     return char_prompts
 
 # ==========================================
-# XÂY PROMPT MẠNH (ưu tiên video_prompt từ Sheet + ép bối cảnh)
+# XÂY PROMPT ÉP NGƯỜI THẬT (chống hoạt hình)
 # ==========================================
 def build_pure_text_prompt(row, char_prompts) -> str:
-    """
-    Ưu tiên dùng video_prompt đã được Gemini viết tốt từ Sheet.
-    Nếu thiếu thì mới ghép thêm.
-    Ép Medium/Wide shot + môi trường rõ ràng.
-    """
     video_prompt = safe_get(row, "video_prompt")
     image_prompt = safe_get(row, "image_prompt")
     scene_desc   = safe_get(row, "scene_description")
-    location     = safe_get(row, "location") or "detailed cinematic environment"
+    location     = safe_get(row, "location") or "detailed cinematic real-world environment"
     char_key     = safe_get(row, "character_name", "character_id", "character", "nhan_vat").lower()
 
-    # Lấy design nhân vật nếu có
     char_details = char_prompts.get(char_key, "")
     if not char_details:
-        # fallback nhẹ
-        char_details = "handsome young East Asian man, mid 20s, sharp jawline, detailed eyes, natural skin texture"
+        char_details = "handsome young East Asian man, mid 20s, sharp jawline, detailed eyes, natural real skin texture"
 
-    # Nếu video_prompt từ Sheet đã tốt (dài và có "Masterpiece") thì dùng trực tiếp + bổ sung
     if video_prompt and len(video_prompt) > 80 and "photorealistic" in video_prompt.lower():
         base = video_prompt
     else:
-        base = video_prompt or image_prompt or scene_desc or "A realistic person in a cinematic scene"
+        base = video_prompt or image_prompt or scene_desc or "A real person in a cinematic scene"
 
+    # Ép mạnh style người thật ngay đầu prompt
     prompt = (
-        f"Masterpiece, best quality, highly detailed, photorealistic, realistic human, "
-        f"cinematic lighting, natural skin texture, detailed eyes, 8k. "
-        f"Medium shot to wide shot, full upper body and environment clearly visible, "
+        f"Photorealistic real human, realistic live-action film, real skin texture, real pores, "
+        f"natural lighting, cinematic photography, highly detailed, 8k, masterpiece. "
+        f"NOT cartoon, NOT anime, NOT 3D animation, NOT cgi, NOT stylized. "
+        f"Medium shot to wide shot, full upper body and real environment clearly visible, "
         f"NOT extreme close-up of face. "
-        f"Character: {char_details[:120]}. "
-        f"Keep the exact same face, hairstyle, clothing, body type and identity. "
-        f"Scene: {base[:200]}. "
-        f"Location and background: {location}, detailed environment, depth of field. "
-        f"Natural body language, natural blinking, subtle breathing, realistic gestures. "
+        f"Character: {char_details[:110]}. "
+        f"Keep the exact same real human face, hairstyle, clothing, body type and identity. "
+        f"Scene: {base[:190]}. "
+        f"Location and background: {location}, real detailed environment, natural depth of field. "
+        f"Natural real body language, natural blinking, subtle breathing, realistic gestures. "
         f"Dynamic camera: medium shot, slow push-in or gentle tracking, shallow depth of field, "
-        f"smooth natural motion, ultra realistic, film grain."
+        f"smooth natural motion, ultra realistic live-action look."
     )
-    return prompt[:520]
+    return prompt[:540]
 
 def get_negative(row) -> str:
     neg = safe_get(row, "negative_prompt")
+    extra = (
+        ", cartoon, anime, donghua, 3d animation, cgi, unreal engine, stylized, "
+        "pixar, disney, plastic skin, doll face, extreme close-up, face only, "
+        "different face, changed identity, deformed hands, extra fingers"
+    )
     if neg and len(neg) > 20:
-        return neg + ", extreme close-up, face only, different face, changed identity"
+        return neg + extra
     return NEGATIVE_PROMPT_LOCK
 
 def get_dialogue(row) -> str:
     return safe_get(row, "dialogue")[:180]
-
-def get_sfx_type(row) -> str:
-    return safe_get(row, "sfx_type", default="none").lower()
 
 # ==========================================
 # TTS + MIX
@@ -311,7 +311,7 @@ def run_pipeline():
         dialogue = get_dialogue(row)
 
         print(f"🎥 [{scene_num}/{TOTAL_SCENES}] ~4s Text-to-Video...")
-        print(f"   Prompt: {text_prompt[:85]}...")
+        print(f"   Prompt: {text_prompt[:90]}...")
 
         try:
             t1 = time.time()
