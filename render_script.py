@@ -1,5 +1,5 @@
 # ========== FULL PIPELINE 1 GPU T4: Text-to-Video ~4-5s (LTX) → TTS → Drive → Merge ==========
-# Phiên bản siết chặt: Chỉ người thật photorealistic, chống hoạt hình / 3D / méo mó
+# Bản sửa: Prompt ngắn (<128 token) + ép người thật + Medium shot + chống hoạt hình
 import os
 import sys
 import json
@@ -55,27 +55,21 @@ GID_SCENES = os.environ.get("GID_SCENES", "0")
 
 DEFAULT_MODEL_ID = "Lightricks/LTX-Video"
 
-# Cấu hình tối ưu T4
 LTX_WIDTH = 576
 LTX_HEIGHT = 576
 LTX_NUM_FRAMES = 65
-LTX_FPS = 16
-LTX_STEPS = 35
+LTX_FPS = 24
+LTX_STEPS = 49
 
 FINAL_FPS = 24
 FINAL_WIDTH = 768
 FINAL_HEIGHT = 512
 
-# Negative mạnh hơn để chặn hoạt hình / 3D / méo mó
 NEGATIVE_PROMPT_LOCK = (
-    "cartoon, anime, donghua, 3d animation, cgi, unreal engine, stylized, "
-    "pixar, disney, illustration, painting, drawing, comic, manga, "
-    "plastic skin, doll-like, artificial, exaggerated features, "
-    "extreme close-up, face only, headshot, portrait only, "
-    "worst quality, low quality, blurry, distorted face, deformed eyes, "
-    "bad anatomy, extra limbs, missing limbs, morphing, face warp, melting face, "
-    "inconsistent face, different person, changed identity, "
-    "slow motion, stiff pose, frozen, black screen, text, watermark"
+    "cartoon, anime, donghua, 3d, cgi, stylized, plastic skin, doll face, "
+    "extreme close-up, face only, headshot, "
+    "worst quality, blurry, distorted face, deformed eyes, bad anatomy, "
+    "extra limbs, different face, changed identity, text, watermark"
 )
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
@@ -162,50 +156,49 @@ def load_character_profiles():
     return char_prompts
 
 # ==========================================
-# XÂY PROMPT ÉP NGƯỜI THẬT (chống hoạt hình)
+# PROMPT NGẮN (<128 token) + ÉP NGƯỜI THẬT + MEDIUM SHOT
 # ==========================================
 def build_pure_text_prompt(row, char_prompts) -> str:
     video_prompt = safe_get(row, "video_prompt")
     image_prompt = safe_get(row, "image_prompt")
     scene_desc   = safe_get(row, "scene_description")
-    location     = safe_get(row, "location") or "detailed cinematic real-world environment"
+    location     = safe_get(row, "location") or "cinematic environment"
     char_key     = safe_get(row, "character_name", "character_id", "character", "nhan_vat").lower()
 
     char_details = char_prompts.get(char_key, "")
     if not char_details:
-        char_details = "handsome young East Asian man, mid 20s, sharp jawline, detailed eyes, natural real skin texture"
+        char_details = "young East Asian man, sharp jawline, natural skin"
 
-    if video_prompt and len(video_prompt) > 80 and "photorealistic" in video_prompt.lower():
+    # Lấy nội dung chính và cắt ngắn
+    if video_prompt and len(video_prompt) > 40:
         base = video_prompt
+        # Bỏ phần Masterpiece trùng lặp nếu có
+        if "Masterpiece" in base:
+            if "Character:" in base:
+                base = base.split("Character:")[-1]
+            if "Dynamic camera" in base:
+                base = base.split("Dynamic camera")[0]
+        base = base.strip()[:120]
     else:
-        base = video_prompt or image_prompt or scene_desc or "A real person in a cinematic scene"
+        base = (video_prompt or image_prompt or scene_desc or "realistic person in scene")[:120]
 
-    # Ép mạnh style người thật ngay đầu prompt
+    # Prompt cuối cùng ngắn + mạnh (dưới 400 ký tự ≈ <120 token)
     prompt = (
-        f"Photorealistic real human, realistic live-action film, real skin texture, real pores, "
-        f"natural lighting, cinematic photography, highly detailed, 8k, masterpiece. "
-        f"NOT cartoon, NOT anime, NOT 3D animation, NOT cgi, NOT stylized. "
-        f"Medium shot to wide shot, full upper body and real environment clearly visible, "
-        f"NOT extreme close-up of face. "
-        f"Character: {char_details[:110]}. "
-        f"Keep the exact same real human face, hairstyle, clothing, body type and identity. "
-        f"Scene: {base[:190]}. "
-        f"Location and background: {location}, real detailed environment, natural depth of field. "
-        f"Natural real body language, natural blinking, subtle breathing, realistic gestures. "
-        f"Dynamic camera: medium shot, slow push-in or gentle tracking, shallow depth of field, "
-        f"smooth natural motion, ultra realistic live-action look."
+        f"Photorealistic real human, live-action, natural skin, cinematic lighting. "
+        f"Medium shot, upper body and environment visible, not close-up. "
+        f"Character: {char_details[:65]}. "
+        f"Keep exact same face and identity. "
+        f"{base}. "
+        f"Location: {location[:30]}. "
+        f"Natural motion, realistic gestures."
     )
-    return prompt[:540]
+    return prompt[:390]
 
 def get_negative(row) -> str:
     neg = safe_get(row, "negative_prompt")
-    extra = (
-        ", cartoon, anime, donghua, 3d animation, cgi, unreal engine, stylized, "
-        "pixar, disney, plastic skin, doll face, extreme close-up, face only, "
-        "different face, changed identity, deformed hands, extra fingers"
-    )
-    if neg and len(neg) > 20:
-        return neg + extra
+    extra = ", cartoon, anime, 3d, cgi, extreme close-up, face only, different face, deformed hands"
+    if neg and len(neg) > 15:
+        return (neg + extra)[:300]
     return NEGATIVE_PROMPT_LOCK
 
 def get_dialogue(row) -> str:
@@ -311,7 +304,7 @@ def run_pipeline():
         dialogue = get_dialogue(row)
 
         print(f"🎥 [{scene_num}/{TOTAL_SCENES}] ~4s Text-to-Video...")
-        print(f"   Prompt: {text_prompt[:90]}...")
+        print(f"   Prompt ({len(text_prompt)} chars): {text_prompt[:80]}...")
 
         try:
             t1 = time.time()
